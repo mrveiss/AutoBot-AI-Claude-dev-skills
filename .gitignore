@@ -1,0 +1,5 @@
+# WSL / Windows download marks and local backups
+*:Zone.Identifier
+*.skill
+*.bak
+*.bak.*

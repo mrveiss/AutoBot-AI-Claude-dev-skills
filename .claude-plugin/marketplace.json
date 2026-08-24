@@ -1,0 +1,19 @@
+{
+  "name": "autobot-ai-claude-dev-skills",
+  "owner": {
+    "name": "mrveiss",
+    "url": "https://github.com/mrveiss"
+  },
+  "metadata": {
+    "description": "AutoBot-AI-specific Claude Code development skills — issue implementation, PR mechanics, full-stack debugging, and codebase auditing tuned to the AutoBot-AI platform.",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "autobot-dev-skills",
+      "source": "./plugins/autobot-dev-skills",
+      "description": "The AutoBot-AI development workflow as 11 installable skills: implement, pr, pre-merge-validate, github-cli, debug-autobot, api-wiring-audit, dead-code-audit, review-fleet, review, session-lifecycle, drain.",
+      "version": "1.0.0"
+    }
+  ]
+}
