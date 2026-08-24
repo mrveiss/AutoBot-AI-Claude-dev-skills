@@ -12,7 +12,7 @@
     {
       "name": "autobot-dev-skills",
       "source": "./plugins/autobot-dev-skills",
-      "description": "The AutoBot-AI development workflow as 11 installable skills: implement, pr, pre-merge-validate, github-cli, debug-autobot, api-wiring-audit, dead-code-audit, review-fleet, review, session-lifecycle, drain.",
+      "description": "The AutoBot-AI development workflow as 12 installable skills: implement, pr, pre-merge-validate, github-cli, debug-autobot, api-wiring-audit, dead-code-audit, review-fleet, review, session-lifecycle, drain.",
       "version": "1.0.0"
     }
   ]

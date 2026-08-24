@@ -39,6 +39,7 @@ this repo. On a new machine, they restore the whole workflow.
 
 ### Issue → merge
 
+- **`batch-implement`** — Full implement→review→merge→close→discover loop for a list of GitHub issues, with self-healing retry and per-issue verification.
 - **`implement`** — End-to-end GitHub issue implementation — umbrella gate, worktree, design, code, verify, PR, CI, and the three-gate closure check
 - **`pr`** — Create a pull request with pre-flight branch checks, targeting Dev_new_gui by default
 - **`pre-merge-validate`** — Validate code before merging — syntax, imports, call-site impact, tests, types, and linting
