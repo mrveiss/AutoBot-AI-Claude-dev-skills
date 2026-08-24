@@ -9,7 +9,7 @@ the deploy path, the required PR-body headings). They are the project-specific c
 general, reusable-anywhere skills in
 [Claude-Dev-Skills](https://github.com/mrveiss/Claude-Dev-Skills).
 
-> **Requires an AutoBot-AI checkout.** These skills reference the platform's paths and conventions;
+> **Requires an [AutoBot-AI](https://github.com/mrveiss/AutoBot-AI) checkout.** These skills reference the platform's paths and conventions;
 > they are not meant to run against an unrelated codebase.
 
 Copyright © 2026 mrveiss · Apache-2.0.
