@@ -57,7 +57,9 @@ cd .worktrees/issue-<n> && git branch --unset-upstream
 Track state per issue: `PENDING | IN_FLIGHT | SUCCESS | SUCCESS_TESTS_FAILING | RETRY_QUEUED | ESCALATED | SKIPPED`
 
 Each agent must:
-1. `gh issue view <n>` — read the issue.
+1. `gh issue view <n> --comments` — read the issue AND every comment. Bare
+   `gh issue view` omits them, and they routinely carry the decisive context:
+   criteria agreed after filing, a blocker found later, a prior attempt parked.
 2. Implement the fix inside the worktree.
 3. `git commit -m "<type>(<scope>): <desc> (#<n>)"` — commit only, no push.
 4. Report: `RESULT: SUCCESS|FAILURE | COMMIT_SHA: <sha> | TESTS: PASS|FAIL | ERROR: <if any>`
