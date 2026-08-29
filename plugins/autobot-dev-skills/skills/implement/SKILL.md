@@ -13,6 +13,10 @@ Read your assigned step from the umbrella issue before proceeding.
 
 ## Step 1 — Verify the issue is real and unclaimed
 - `gh issue view <n> --json state` — closed or missing → STOP.
+- `gh issue view <n> --comments` — read the body AND every comment before planning.
+  Bare `gh issue view` omits comments, and the decisive context is routinely
+  there: criteria agreed after filing, a blocker found later, a prior attempt
+  parked, a scope call already made. Acting on the body alone redoes settled work.
 - `gh pr list --search "<n>"` and `git branch -a | grep -i "<n>"` — no existing PR or branch.
 - **No PR-count gate.** There is no open-PR limit; dispatch gates on review capacity. PRs piling up means review is the bottleneck — review, don't defer.
 

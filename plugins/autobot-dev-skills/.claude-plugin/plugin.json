@@ -1,7 +1,7 @@
 {
   "name": "autobot-dev-skills",
   "description": "AutoBot-AI-specific development skills for Claude Code — the issue-to-merge workflow, full-stack debugging, and codebase auditing tuned to the AutoBot-AI platform. Requires an AutoBot-AI checkout; the skills reference its conventions.",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "author": { "name": "mrveiss", "url": "https://github.com/mrveiss" },
   "license": "Apache-2.0"
 }
