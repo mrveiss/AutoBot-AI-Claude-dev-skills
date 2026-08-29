@@ -6,14 +6,14 @@
   },
   "metadata": {
     "description": "AutoBot-AI-specific Claude Code development skills — issue implementation, PR mechanics, full-stack debugging, and codebase auditing tuned to the AutoBot-AI platform.",
-    "version": "1.0.0"
+    "version": "1.0.3"
   },
   "plugins": [
     {
       "name": "autobot-dev-skills",
       "source": "./plugins/autobot-dev-skills",
       "description": "The AutoBot-AI development workflow as 12 installable skills: implement, batch-implement, pr, pre-merge-validate, github-cli, debug-autobot, api-wiring-audit, dead-code-audit, review-fleet, review, session-lifecycle, drain.",
-      "version": "1.0.2"
+      "version": "1.0.3"
     }
   ]
 }

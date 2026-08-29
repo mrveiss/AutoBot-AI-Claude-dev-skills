@@ -57,9 +57,14 @@ cd .worktrees/issue-<n> && git branch --unset-upstream
 Track state per issue: `PENDING | IN_FLIGHT | SUCCESS | SUCCESS_TESTS_FAILING | RETRY_QUEUED | ESCALATED | SKIPPED`
 
 Each agent must:
-1. `gh issue view <n> --comments` — read the issue AND every comment. Bare
-   `gh issue view` omits them, and they routinely carry the decisive context:
-   criteria agreed after filing, a blocker found later, a prior attempt parked.
+1. Read the issue AND every comment — they routinely carry the decisive
+   context: criteria agreed after filing, a blocker found later, a prior attempt
+   parked. Use the `--json` form; bare `gh issue view` and `--comments` exit 1 on
+   an older `gh` (retired `projectCards` field in their render query).
+   ```bash
+   gh issue view <n> --json title,body,comments \
+  -q '"# \(.title)\n\n\(.body)\n\n--- comments ---\n" + ([.comments[]|"@\(.author.login): \(.body)"]|join("\n\n"))'
+   ```
 2. Implement the fix inside the worktree.
 3. `git commit -m "<type>(<scope>): <desc> (#<n>)"` — commit only, no push.
 4. Report: `RESULT: SUCCESS|FAILURE | COMMIT_SHA: <sha> | TESTS: PASS|FAIL | ERROR: <if any>`

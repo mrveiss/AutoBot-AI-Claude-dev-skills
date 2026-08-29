@@ -11,7 +11,7 @@ Use `gh` for all GitHub operations. Never use browser automation or GitHub MCP t
 
 ```bash
 # View / list
-gh issue view <number>
+gh issue view <number> --json title,body,comments   # NOT bare: see note below
 gh issue list --state open --label "bug,backend"
 gh issue list --assignee @me
 
@@ -69,7 +69,7 @@ gh pr review <number> --comment --body "..."
 
 | Task | Command |
 |------|---------|
-| View issue | `gh issue view <n>` |
+| View issue | `gh issue view <n> --json title,body,comments` |
 | Create issue | `gh issue create --title "..." --label "..."` |
 | Close issue | `gh issue close <n>` |
 | Create PR | `gh pr create --base Dev_new_gui ...` |
@@ -98,3 +98,13 @@ gh pr review <number> --comment --body "..."
 - Assuming `Closes #NNN` in PR body auto-closes the issue (it doesn't for `Dev_new_gui`)
 - Merging a PR without immediately closing the linked GH issue — issues stay open forever otherwise
 - Using Playwright/browser for GitHub when `gh` handles it in one command
+
+## `gh issue view` without `--json` is broken here
+
+Bare `gh issue view <n>` and `gh issue view <n> --comments` both render through a
+GraphQL query that still requests the retired `projectCards` field. On an older
+`gh` (this environment ships 2.4.0) GitHub rejects it and the command exits 1
+with no output at all — not degraded output, none.
+
+Always read issues through `--json`. Field queries (`--json state`, `--json
+body,comments`) use a different code path and work.
