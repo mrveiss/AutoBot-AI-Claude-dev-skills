@@ -12,18 +12,27 @@ only the owner can give. This selects work that is finishable now.
 Selection only. Execution belongs to `batch-implement`; PR mechanics to
 `ci-pipelining.md`. Do not reimplement either here.
 
-## 1. Drain the PR queue first
+## 1. Land what is already finished, before starting anything
 
-In-flight PRs before new work, every time:
+Two queues hold finished work, and the open-PR list is only the visible one.
+Work that never reached a PR is invisible to `gh pr list` and is the larger pile:
+measured at 120 commits on 22 branches, 83 of them on branches with no PR ever
+opened, against 1-2 open PRs at the time.
 
 ```bash
 gh pr list --state open --json number,title --jq '.[]|"\(.number) \(.title)"'
+~/.claude/scripts/drain-parked.sh                # branches whose commits never landed
+~/.claude/scripts/worktree-cap.sh status         # headroom before a new worktree is refused
 ~/.claude/scripts/backlog-governor.sh status     # advisory signal only
 ```
 
 Sweep → review → merge green → close with evidence → remove worktree/branch.
-A merged PR closes an issue; a new issue closes nothing. If PRs are stacked up,
-draining them IS the tick.
+A merged PR closes an issue; a new issue closes nothing.
+
+**If either queue is non-empty, draining it IS the tick.** Land the top row of
+`drain-parked.sh` before selecting new work — it is the cheapest already-paid-for
+work still returning nothing. A worktree ceiling of zero headroom means this step
+is not optional: the next `git worktree add` is refused until something lands.
 
 ## 2. Select
 
