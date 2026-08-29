@@ -14,10 +14,8 @@ Selection only. Execution belongs to `batch-implement`; PR mechanics to
 
 ## 1. Land what is already finished, before starting anything
 
-Two queues hold finished work, and the open-PR list is only the visible one.
-Work that never reached a PR is invisible to `gh pr list` and is the larger pile:
-measured at 120 commits on 22 branches, 83 of them on branches with no PR ever
-opened, against 1-2 open PRs at the time.
+Two queues hold finished work. `gh pr list` shows one; branches that never
+reached a PR are invisible to it and are usually the larger pile.
 
 ```bash
 gh pr list --state open --json number,title --jq '.[]|"\(.number) \(.title)"'
@@ -29,10 +27,9 @@ gh pr list --state open --json number,title --jq '.[]|"\(.number) \(.title)"'
 Sweep → review → merge green → close with evidence → remove worktree/branch.
 A merged PR closes an issue; a new issue closes nothing.
 
-**If either queue is non-empty, draining it IS the tick.** Land the top row of
-`drain-parked.sh` before selecting new work — it is the cheapest already-paid-for
-work still returning nothing. A worktree ceiling of zero headroom means this step
-is not optional: the next `git worktree add` is refused until something lands.
+**Either queue non-empty → draining it IS the tick.** Land the top row of
+`drain-parked.sh` before selecting new work. Zero worktree headroom makes this
+mandatory: the next `git worktree add` is refused until something lands.
 
 ## 2. Select
 
