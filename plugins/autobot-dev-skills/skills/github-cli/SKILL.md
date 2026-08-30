@@ -99,12 +99,17 @@ gh pr review <number> --comment --body "..."
 - Merging a PR without immediately closing the linked GH issue — issues stay open forever otherwise
 - Using Playwright/browser for GitHub when `gh` handles it in one command
 
-## `gh issue view` without `--json` is broken here
+## Prefer `--json` for issue reads
 
-Bare `gh issue view <n>` and `gh issue view <n> --comments` both render through a
-GraphQL query that still requests the retired `projectCards` field. On an older
-`gh` (this environment ships 2.4.0) GitHub rejects it and the command exits 1
-with no output at all — not degraded output, none.
+`gh issue view <n> --json title,body,comments` is the form to use when an agent
+reads an issue to act on it. Not because the plain form is broken -- it works on
+`gh` 2.98.0 -- but because the JSON form is parseable, lets you select fields,
+and makes "read the comments too" explicit rather than incidental.
 
-Always read issues through `--json`. Field queries (`--json state`, `--json
-body,comments`) use a different code path and work.
+History worth keeping: this environment shipped `gh` 2.4.0 (2022) until
+2026-08-30, whose text renderers still requested the retired `projectCards`
+GraphQL field. Bare `gh issue view` and `--comments` exited 1 with **no output
+at all**, as did `gh pr edit`; `gh run list --branch` and `gh run rerun --failed`
+did not exist. Only `--json` paths worked. Resolved by upgrading to 2.98.0
+(#15305). If a `gh` subcommand ever fails with a `projectCards` GraphQL error
+again, check the client version first.
