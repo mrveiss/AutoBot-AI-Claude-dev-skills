@@ -413,6 +413,7 @@ Labels: not-wired, tech-debt
 **Filing loop:**
 ```bash
 for finding in <READY_TO_FILE>; do
+  # attach each filed issue to the audit umbrella (native sub-issue, not just a checkbox)
   gh issue create \
     --title "<title>" \
     --body "<body>" \

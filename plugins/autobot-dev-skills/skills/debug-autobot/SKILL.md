@@ -274,6 +274,7 @@ Backend → NPU Worker ← Model not loaded
 ### 5. Create Fix Issue & Implement
 
 ```bash
+# file the fix issue, then attach it to its umbrella as a native sub-issue
 gh issue create --title "Fix: <root cause>" \
   --body "**Symptom:** <original bug>
 

@@ -21,6 +21,7 @@ description: Full implement→review→merge→close→discover loop for GitHub 
 - Ensure a GitHub umbrella issue exists with a task checklist (one checkbox per batch item).
 - As each item lands (PR merged + issue closed), check it off on the umbrella issue.
 - Create the umbrella if missing: `gh issue create --title "Batch: <label/description>" --body "- [ ] #N ..."`
+- Attach every batch item to the umbrella as a native sub-issue, not just a checkbox: `gh api -X POST repos/$REPO/issues/$PARENT/sub_issues -F sub_issue_id=$(gh api repos/$REPO/issues/$CHILD -q .id)`
 
 ---
 
@@ -149,6 +150,8 @@ Check off the item on the umbrella issue.
 
 ```bash
 gh issue create --title "discovery(<area>): <gap found>" --body "<file:line, what's missing>" --label "tech-debt"
+# then attach it to the umbrella it was discovered under
+gh api -X POST repos/$REPO/issues/$PARENT/sub_issues -F sub_issue_id=$(gh api repos/$REPO/issues/$CHILD -q .id)
 ```
 
 File before cleanup. Include in closure comment.
