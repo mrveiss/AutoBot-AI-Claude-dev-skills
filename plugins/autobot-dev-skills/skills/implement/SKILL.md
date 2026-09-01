@@ -10,6 +10,8 @@ Read your assigned step from the umbrella issue before proceeding.
 ## Step 0 — Umbrella gate (MANDATORY)
 - The task must hang off a GitHub umbrella issue with a task/subtask breakdown. Missing → create it first.
 - Add this issue as a subtask checklist item on the umbrella before coding.
+- Attach it natively too — a checklist item is not a relationship: `gh api -X POST repos/$REPO/issues/$PARENT/sub_issues -F sub_issue_id=$(gh api repos/$REPO/issues/$CHILD -q .id)`
+- Every `Depends on: #N` gets a native edge: `gh api -X POST repos/$REPO/issues/$THIS/dependencies/blocked_by -F issue_id=$(gh api repos/$REPO/issues/$N -q .id)`
 
 ## Step 1 — Verify the issue is real and unclaimed
 - `gh issue view <n> --json state` — closed or missing → STOP.
@@ -120,6 +122,7 @@ gh issue view <n> --json state            # confirm
 
 ## Success checklist
 - [ ] Umbrella issue with step breakdown exists; issue verified open, no duplicate PR/branch
+- [ ] Issue attached to the umbrella as a native sub-issue, and every blocker as a `blocked_by` edge
 - [ ] Work done in a worktree off `origin/Dev_new_gui`, committed incrementally
 - [ ] Tests + lint + mypy pass; no `print(`/`console.` violations; formatted
 - [ ] Commit format correct, no trailers, no `--no-verify`
