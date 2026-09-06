@@ -21,6 +21,15 @@ Base branch: `Dev_new_gui` (adjust if the dispatch says otherwise).
    git worktree list           # read-only inventory
    ```
 
+   **A worktree may be retired automatically, and that is not a lost session.**
+   An hourly reaper removes any workspace that is clean, fully pushed, unoccupied
+   and idle past a threshold — including ones you did not create. Nothing is lost
+   when it does: the branch is the record and the workspace is recreatable with
+   `git worktree add .worktrees/<name> <branch>`. A worktree holding uncommitted
+   or unpushed work is never reaped, and past 72h idle it is escalated to a
+   tracked issue instead. So the way to keep your work is to push it, not to keep
+   the directory.
+
    **Never delete a worktree or branch you did not create.** Other sessions run
    concurrently, and a worktree that is clean with zero commits ahead is
    indistinguishable from a finished one — it is usually a session that has just
