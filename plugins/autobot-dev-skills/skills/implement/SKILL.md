@@ -93,7 +93,8 @@ gh pr create --base Dev_new_gui --title "<type>(scope): <title> (#<n>)" --body-f
 - `gh pr checks <PR>` — repeat until nothing is PENDING; `smoke-test` must be SUCCESS.
 - Dedupe check-runs to the latest push; sort by `startedAt` — rollup order is not chronological.
 - **Red CI never merges.** Root-cause it; a tracking issue is not a substitute. Never `--admin` past a failing check.
-- **A green PR still reads `BLOCKED`.** The base ruleset requires an approving review that no session can give — GitHub forbids self-approval and every session is the same account, so `--auto` waits forever. With every check green, `--admin` is how a PR lands here; it bypasses the unsatisfiable approval gate, never a failure signal.
+- **A green PR still reads `BLOCKED`, and that is its normal resting state.** The ruleset's 1-approval rule targets external contributors; the owner merging past it is the designed path, not an exception to flag or ask about each time. No session can satisfy it anyway — GitHub forbids self-approval and every session is the same account, so `--auto` waits forever. Merge with `--admin` once every required check is green, no threads are unresolved, and the branch is not behind.
+- **Read the ruleset, not classic protection.** `branches/<b>/protection` reports `required_pull_request_reviews: none` here while `rules/branches/<b>` carries the rule that actually blocks. Two systems, different answers, both return success.
 - Never merge a branch behind base — a green run describes a merge base that may have moved.
 
 ## Step 10 — Merge or hand off
