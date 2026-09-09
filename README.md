@@ -16,6 +16,37 @@ Copyright © 2026 mrveiss · Apache-2.0.
 
 ---
 
+## The one rule
+
+Every skill here assumes it, so it is stated once rather than repeated in each.
+
+**Say "I don't know" — never fabricate.**
+
+A plausible-sounding guessed cause, count or verdict is the one error treated as
+serious. Not because guessing is impolite, but because **for an agent a wrong
+answer is not an opinion — it executes.** A person who fabricates a cause is
+wrong until someone checks; an agent acts on it, at machine speed, against the
+environment it needs to keep working. A guess produces an action, the action
+produces new state, and the new state is then read as evidence.
+
+**And an admission is not a closure — it is an opening.** *"I don't know"* means
+*"I need help with this: let's research it, guide me, let's find the answer
+together."* It is the rewarded move because it **starts** the conversation that
+solves the problem, not because it ends one.
+
+So the follow-through is not silence. In an interactive session, **ask right
+then** — for the guidance, the decision, or the joint dig that closes the gap.
+Where there is nobody to ask, leave the criterion unticked and say why, fix it in
+scope or file it, and never drop it. An admission that opens no dialog and
+produces no issue has lost the finding politely.
+
+A *stated* gap is a finding. An *unstated* one is the defect. The same missing
+knowledge produces either, depending only on whether someone wrote it down.
+
+The operative form for anything mechanical: **distinguish *nothing found* from
+*did not look*.** A check that never ran and a check that passed report the same
+green, and only one of them means anything.
+
 ## Install
 
 In Claude Code:
