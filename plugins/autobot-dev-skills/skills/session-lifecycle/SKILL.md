@@ -57,11 +57,15 @@ Base branch: `main` (adjust if the dispatch says otherwise).
 2. **Create YOUR isolated worktree**, then claim it so a concurrent sweep cannot
    take it (never work in a shared checkout; never two sessions in one directory):
    ```bash
-   git worktree add ../wt-<short-task-name> -b <type>/<task-name> origin/main
-   cd ../wt-<short-task-name>
-   git worktree lock . --reason "in use: <task> (session started $(date -u +%FT%TZ))"
-   git commit --allow-empty -m "chore: claim worktree for <task>"
+   # from the main checkout's root; <name> is issue-<n> when there is an issue
+   git worktree add .worktrees/<name> -b <name> origin/main
+   git worktree lock --reason "in use: <task> (session started $(date -u +%FT%TZ))" .worktrees/<name>
+   git -C .worktrees/<name> commit --allow-empty -m "chore: claim worktree for <task>"
    ```
+   Address the worktree by path (`git -C`), never through an earlier `cd`: agent
+   shells often drop `cwd` between calls, and a claim commit after a lost `cd`
+   lands on the caller's branch, usually the shared checkout's `main` (#14).
+   A wrong path makes `git -C` fail instead of committing somewhere else.
    `lock` makes `git worktree remove --force` fail outright (it demands `-f -f`),
    and the claim commit stops "no unique commits" heuristics from classifying the
    worktree as finished. Unlock at the end: `git worktree unlock <path>`.
@@ -109,7 +113,7 @@ Base branch: `main` (adjust if the dispatch says otherwise).
    needs_rebase_before_merge: yes|no
    remaining: <bullet list, empty if complete>
    blocked_on: <only if status=blocked — be precise>
-   worktree: ../wt-<name>  (safe to remove after merge)
+   worktree: .worktrees/<name>  (safe to remove after merge)
    ```
 5. **Write the mission report** (`*_REPORT.md` per the dispatch prompt) — the
    handoff is for machines/next sessions; the report is for the human.
