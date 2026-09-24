@@ -40,9 +40,9 @@ Read your assigned step from the umbrella issue before proceeding.
 
 ## Step 3 — Worktree (MANDATORY, never edit the main tree)
 ```bash
-git worktree add ../worktrees/issue-<n> -b issue-<n> origin/main
+git worktree add .worktrees/issue-<n> -b issue-<n> origin/main
 ```
-- Branch off the PR base branch, never the GitHub default. Never touch another session's worktree.
+- Branch off the PR base branch, `origin/main`, never `release`. Never touch another session's worktree.
 - Commit incrementally inside the worktree — never `git stash` (it is shared repo-wide).
 
 ## Step 4 — Implement
