@@ -10,7 +10,7 @@ never clean up after its own merge. This protocol inverts responsibility —
 **every session cleans up after its predecessors at start, and leaves a
 machine-readable handoff at end.**
 
-Base branch: `Dev_new_gui` (adjust if the dispatch says otherwise).
+Base branch: `main` (adjust if the dispatch says otherwise).
 
 ## SESSION START (do this before any task work)
 
@@ -57,7 +57,7 @@ Base branch: `Dev_new_gui` (adjust if the dispatch says otherwise).
 2. **Create YOUR isolated worktree**, then claim it so a concurrent sweep cannot
    take it (never work in a shared checkout; never two sessions in one directory):
    ```bash
-   git worktree add ../wt-<short-task-name> -b <type>/<task-name> origin/Dev_new_gui
+   git worktree add ../wt-<short-task-name> -b <type>/<task-name> origin/main
    cd ../wt-<short-task-name>
    git worktree lock . --reason "in use: <task> (session started $(date -u +%FT%TZ))"
    git commit --allow-empty -m "chore: claim worktree for <task>"
@@ -89,7 +89,7 @@ Base branch: `Dev_new_gui` (adjust if the dispatch says otherwise).
    and explained in the handoff — never left dangling in the worktree.
 2. **Rebase onto latest base, re-run gates:**
    ```bash
-   git fetch origin && git rebase origin/Dev_new_gui
+   git fetch origin && git rebase origin/main
    # re-run: wiring audit, duplication guard, relevant tests
    ```
    If the rebase conflicts and resolution is non-trivial, STOP — resolve only
@@ -104,7 +104,7 @@ Base branch: `Dev_new_gui` (adjust if the dispatch says otherwise).
    # Handoff: <branch>
    status: complete | blocked | partial
    pr: #NNNN
-   base_at_push: <sha of origin/Dev_new_gui you rebased onto>
+   base_at_push: <sha of origin/main you rebased onto>
    gates: wiring=PASS duplication=PASS tests=PASS|details
    needs_rebase_before_merge: yes|no
    remaining: <bullet list, empty if complete>

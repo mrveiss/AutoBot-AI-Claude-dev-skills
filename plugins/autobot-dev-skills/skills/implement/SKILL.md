@@ -40,7 +40,7 @@ Read your assigned step from the umbrella issue before proceeding.
 
 ## Step 3 — Worktree (MANDATORY, never edit the main tree)
 ```bash
-git worktree add ../worktrees/issue-<n> -b issue-<n> origin/Dev_new_gui
+git worktree add ../worktrees/issue-<n> -b issue-<n> origin/main
 ```
 - Branch off the PR base branch, never the GitHub default. Never touch another session's worktree.
 - Commit incrementally inside the worktree — never `git stash` (it is shared repo-wide).
@@ -82,9 +82,9 @@ git add -u && git diff --cached --quiet || git commit -m "style(format): auto-fo
 ## Step 8 — Push and open the PR
 ```bash
 git push -u origin issue-<n>
-gh pr create --base Dev_new_gui --title "<type>(scope): <title> (#<n>)" --body-file <file>
+gh pr create --base main --title "<type>(scope): <title> (#<n>)" --body-file <file>
 ```
-- Target `Dev_new_gui`. `main`/`master` are blocked by the pre-commit hook.
+- Target `main`. Direct commits on `release`/`master` are blocked by the pre-commit hook.
 - PR body uses these exact headings — never Summary/Test Plan:
   `## Thinking Path` · `## What Changed` · `## Verification` · `## Model Used`
 - Use `--body-file`, never an inline `--body`: backticks inside it execute as shell commands.
@@ -125,9 +125,9 @@ gh issue view <n> --json state            # confirm
 ## Success checklist
 - [ ] Umbrella issue with step breakdown exists; issue verified open, no duplicate PR/branch
 - [ ] Issue attached to the umbrella as a native sub-issue, and every blocker as a `blocked_by` edge
-- [ ] Work done in a worktree off `origin/Dev_new_gui`, committed incrementally
+- [ ] Work done in a worktree off `origin/main`, committed incrementally
 - [ ] Tests + lint + mypy pass; no `print(`/`console.` violations; formatted
 - [ ] Commit format correct, no trailers, no `--no-verify`
-- [ ] PR targets `Dev_new_gui` with the four required headings; smoke-test green; not behind base
+- [ ] PR targets `main` with the four required headings; smoke-test green; not behind base
 - [ ] Every new module has ≥1 caller, or a wire-in issue is filed and referenced
 - [ ] All three closure gates run; issue closed by hand and confirmed

@@ -9,26 +9,26 @@ description: Validate code before merging — syntax, imports, call-site impact,
 ```
 /pre-merge-validate <PR-number>     # resolve branch via gh pr view
 /pre-merge-validate issue-<branch>  # use branch name directly
-/pre-merge-validate                 # validate current branch vs Dev_new_gui
+/pre-merge-validate                 # validate current branch vs main
 ```
 
 ## Gates
 
 **Setup**
 1. Resolve branch: `gh pr view <number> --json headRefName -q '.headRefName'`
-2. Fetch and verify: `git fetch origin Dev_new_gui && git rev-parse origin/Dev_new_gui origin/$BRANCH`
+2. Fetch and verify: `git fetch origin main && git rev-parse origin/main origin/$BRANCH`
 
 **Gate 0 — Squash-Duplicate Detection**
 3. Count total vs truly-new commits:
    ```bash
-   TOTAL=$(git log origin/Dev_new_gui...$BRANCH --oneline | wc -l)
-   NEW=$(git log --cherry-pick --right-only origin/Dev_new_gui...$BRANCH --oneline | wc -l)
+   TOTAL=$(git log origin/main...$BRANCH --oneline | wc -l)
+   NEW=$(git log --cherry-pick --right-only origin/main...$BRANCH --oneline | wc -l)
    ```
    - Block if `NEW -eq 0` (all already merged — close the PR)
    - Warn if `DUPES -gt 0 && NEW -gt 0` (partial duplicate — don't block)
 
 **Gate 1 — Python Syntax + Imports**
-4. Get changed files: `git diff origin/Dev_new_gui...$BRANCH --name-only -- '*.py' | grep -E '^autobot-backend|^autobot-shared'`
+4. Get changed files: `git diff origin/main...$BRANCH --name-only -- '*.py' | grep -E '^autobot-backend|^autobot-shared'`
 5. Per file — syntax: `python -c "import ast; ast.parse(open('$file').read())"`
 6. Per file — imports: `python -m py_compile "$file"`
 7. For `api/schemas_*.py` — runtime import: `(cd autobot-backend && python3 -c "from api import $SCHEMA_MOD")`
@@ -37,7 +37,7 @@ description: Validate code before merging — syntax, imports, call-site impact,
 **Gate 2 — Call-Site Impact Analysis**
 8. Find removed symbols:
    ```bash
-   git diff origin/Dev_new_gui...$BRANCH -- '*.py' | grep '^-def \|^-    def \|^-class ' | sed 's/^-//;s/(.*//;s/^[[:space:]]*//' | sort -u
+   git diff origin/main...$BRANCH -- '*.py' | grep '^-def \|^-    def \|^-class ' | sed 's/^-//;s/(.*//;s/^[[:space:]]*//' | sort -u
    ```
 9. Per symbol — find callers outside changed files:
    ```bash
@@ -52,7 +52,7 @@ description: Validate code before merging — syntax, imports, call-site impact,
     - Block on test failure; Skip if no matching test files found
 
 **Gate 4 — Frontend Type Check (conditional)**
-13. Check: `git diff origin/Dev_new_gui...$BRANCH --name-only | grep -c "^autobot-frontend"`
+13. Check: `git diff origin/main...$BRANCH --name-only | grep -c "^autobot-frontend"`
 14. If changed: `cd autobot-frontend && npm run type-check`
     - Block on TypeScript errors; Skip if no frontend changes
 

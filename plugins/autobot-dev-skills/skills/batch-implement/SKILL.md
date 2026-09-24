@@ -27,10 +27,10 @@ description: Full implement→review→merge→close→discover loop for GitHub 
 
 ## Step 1: Pre-Flight
 
-1. `git branch --show-current` — must be `Dev_new_gui`. STOP if not.
+1. `git branch --show-current` — must be `main`. STOP if not.
 2. `git status --porcelain` — must be empty. STOP if not.
 3. Resolve issue list: `gh issue list --label <label> --state open --json number -q '.[].number'`
-4. Skip if already in Dev_new_gui: `git log origin/Dev_new_gui --oneline --grep="#<n>" | head -1`
+4. Skip if already in main: `git log origin/main --oneline --grep="#<n>" | head -1`
 5. Skip if already closed: `gh issue view <n> --json state -q '.state'`
 6. Clean stale worktrees: `git worktree remove .worktrees/issue-<n> --force && git branch -D issue-<n>`
 
@@ -44,7 +44,7 @@ Pre-flight: To implement: #N, #M | Skipped: #K | Cleaned: N worktrees
 ## Step 2: Worktree Setup (per issue)
 
 ```bash
-git worktree add .worktrees/issue-<n> -b issue-<n> origin/Dev_new_gui
+git worktree add .worktrees/issue-<n> -b issue-<n> origin/main
 cd .worktrees/issue-<n> && git branch --unset-upstream
 ```
 
@@ -77,7 +77,7 @@ Self-healing failure table:
 | Failure type | Auto-heal |
 |---|---|
 | API 529 overload | Wait 60s, retry (max 3×) |
-| Merge conflict at push | Rebase onto latest Dev_new_gui, retry |
+| Merge conflict at push | Rebase onto latest main, retry |
 | Already resolved | Mark SKIPPED, close worktree |
 | Agent crash / timeout | Retry (max 3×) |
 | Tests failing | Mark SUCCESS_TESTS_FAILING — manual review |
@@ -91,7 +91,7 @@ Repeat batches until all issues are `SUCCESS`, `SKIPPED`, or `ESCALATED`.
 
 ```bash
 # Re-fetch and abort if issue already closed during session
-git fetch origin Dev_new_gui -q
+git fetch origin main -q
 gh issue view <n> --json state -q '.state'   # CLOSED → abort
 
 # Type-check (frontend)
@@ -112,7 +112,7 @@ Push only after all checks pass: `git push -u origin issue-<n>`
 ## Step 5: Create & Review PR
 
 ```bash
-gh pr create --base Dev_new_gui --head issue-<n> --title "..." --body "..."
+gh pr create --base main --head issue-<n> --title "..." --body "..."
 ```
 
 - Syntax/imports: `python -m py_compile <file>` for Python; `vue-tsc` for TS/Vue.
@@ -128,7 +128,7 @@ Fix inline and re-push if validation fails. Never merge a failing PR.
 
 ```bash
 gh pr merge <pr> --squash --delete-branch
-git fetch origin && git log origin/Dev_new_gui --oneline --grep="#<n>" | head -1  # confirm
+git fetch origin && git log origin/main --oneline --grep="#<n>" | head -1  # confirm
 ```
 
 Merge one at a time. Verify before moving to next.
@@ -139,7 +139,7 @@ Merge one at a time. Verify before moving to next.
 
 ```bash
 gh issue close <n>
-gh issue comment <n> --body "Closed — merged to Dev_new_gui. Commit: <sha>. Criteria met: <evidence>. Discoveries: <#N or none>"
+gh issue comment <n> --body "Closed — merged to main. Commit: <sha>. Criteria met: <evidence>. Discoveries: <#N or none>"
 ```
 
 Check off the item on the umbrella issue.
@@ -179,7 +179,7 @@ Escalated: preserve worktree, print manual rebase steps for the user.
 
 ## Invariants
 
-- Main session stays on `Dev_new_gui` — never switches branches.
+- Main session stays on `main` — never switches branches.
 - Agents commit only — main session pushes.
 - Never merge without review; never close without proof (commit hash + criteria).
 - Never leave PRs open overnight; never leave discoveries untracked.

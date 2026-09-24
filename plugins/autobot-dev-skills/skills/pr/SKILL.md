@@ -1,11 +1,11 @@
 ---
 name: pr
-description: Create a pull request with pre-flight branch checks, targeting Dev_new_gui by default
+description: Create a pull request with pre-flight branch checks, targeting main by default
 ---
 
 # /pr - Create Pull Request
 
-Target: `Dev_new_gui` (never `main`). PR_LIMIT=10.
+Target: `main` (the default branch; never `release`, the stable branch). PR_LIMIT=10.
 
 ## Step 0 — PR Queue Gate (MANDATORY)
 
@@ -29,9 +29,9 @@ gh pr merge <number> --squash --delete-branch
 ## Step 1 — Pre-Flight Checks
 
 ```bash
-git branch --show-current          # must NOT be Dev_new_gui or main
+git branch --show-current          # must NOT be main or release
 git status && git diff             # must be clean; if not, run /commit first
-git log --oneline origin/Dev_new_gui..HEAD
+git log --oneline origin/main..HEAD
 ```
 
 ## Step 1.5 — Pre-Push Quality Check (MANDATORY)
@@ -55,7 +55,7 @@ git add -u && git diff --cached --quiet || git commit -m "style: auto-format cod
 
 ```bash
 git push -u origin <current-branch>
-# Rejected? git pull --rebase origin Dev_new_gui && git push
+# Rejected? git pull --rebase origin main && git push
 ```
 
 ## Step 3 — Create PR
@@ -63,7 +63,7 @@ git push -u origin <current-branch>
 PR body must include these four headings: **Thinking Path · What Changed · Verification · Model Used**
 
 ```bash
-gh pr create --base Dev_new_gui \
+gh pr create --base main \
   --title "<type>(scope): <description> (#issue-number)" \
   --body "$(cat <<'EOF'
 ## Thinking Path
@@ -93,11 +93,12 @@ gh pr checks $PR
 
 ## Step 5 — Close Issue After Merge
 
-`Closes #NNN` does NOT auto-close when targeting `Dev_new_gui`. Close manually after merge:
+`main` is the default branch, so `Closes #NNN` auto-closes the issue on merge. Confirm it closed and add the evidence comment:
 
 ```bash
 gh pr merge <pr-number> --squash --delete-branch
-gh issue close <number> --comment "Closed via PR #<pr-number> merged into Dev_new_gui."
+gh issue view <number> --json state   # confirm state=CLOSED; if not, gh issue close <number>
+gh issue comment <number> --body "Closed via PR #<pr-number> merged into main."
 ```
 
 ## Step 6: Worktree Cleanup (After Merge)
@@ -115,7 +116,7 @@ Do not leave merged worktrees on disk. Stale worktrees waste disk and confuse `g
 
 ## Red Flags (STOP)
 
-- Branch is `Dev_new_gui` or `main`
+- Branch is `main` or `release`
 - Uncommitted changes present
 - No issue reference in title or body
 - Skipped pre-push quality checks (Step 1.5)
