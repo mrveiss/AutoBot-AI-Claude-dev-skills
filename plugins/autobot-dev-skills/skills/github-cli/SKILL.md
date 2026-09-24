@@ -66,8 +66,8 @@ gh pr view [number]
 gh pr list --state open
 gh pr diff [number]
 
-# Create (always target Dev_new_gui)
-gh pr create --base Dev_new_gui --title "..." --body "..."
+# Create (always target main)
+gh pr create --base main --title "..." --body "..."
 
 # Review / merge
 gh pr review <number> --approve
@@ -105,7 +105,7 @@ gh pr review <number> --comment --body "..."
 | Link child to umbrella | `gh api -X POST repos/$REPO/issues/$P/sub_issues -F sub_issue_id=$(gh api repos/$REPO/issues/$C -q .id)` |
 | Link blocker | `gh api -X POST repos/$REPO/issues/$B/dependencies/blocked_by -F issue_id=$(gh api repos/$REPO/issues/$A -q .id)` |
 | Close issue | `gh issue close <n>` |
-| Create PR | `gh pr create --base Dev_new_gui ...` |
+| Create PR | `gh pr create --base main ...` |
 | View PR diff | `gh pr diff <n>` |
 | Merge PR | `gh pr merge <n> --squash` |
 | List labels | `gh label list` |
@@ -114,21 +114,21 @@ gh pr review <number> --comment --body "..."
 ## AutoBot Conventions
 
 - **Repo:** `mrveiss/AutoBot-AI`
-- **Base branch:** Always `Dev_new_gui` (never `main`) for PRs
+- **Base branch:** Always `main` (the default branch; never `release`) for PRs
 - **Required labels:** type (`bug`, `enhancement`, `technical-debt`) + area (`backend`, `frontend`) + priority (`priority: high`, etc.)
 - **Commit/PR title format:** `<type>(scope): <description> (#issue-number)`
-- **Auto-close limitation:** `Closes #NNN` in a PR body **does not auto-close issues** when merging into `Dev_new_gui` (only works for the default branch). **Always close the GH issue manually after merge:**
+- **Auto-close:** `main` is the default branch, so `Closes #NNN` (one per line) auto-closes the issue on merge. **Always confirm it closed and add the evidence comment:**
   ```bash
   gh pr merge <pr> --squash --delete-branch
-  gh issue close <number> --comment "Closed via PR #<pr> merged into Dev_new_gui."
-  gh issue view <number> --json state  # confirm state=CLOSED
+  gh issue view <number> --json state  # confirm state=CLOSED; if not, gh issue close <number>
+  gh issue comment <number> --body "Closed via PR #<pr> merged into main."
   ```
 
 ## Common Mistakes
 
-- Targeting `main` instead of `Dev_new_gui` for PRs
+- Targeting `release` instead of `main` for PRs
 - Forgetting required labels on new issues
-- Assuming `Closes #NNN` in PR body auto-closes the issue (it doesn't for `Dev_new_gui`)
+- Writing `Closes #A, #B` on one line — only #A is linked; use one `Closes #N` per line
 - Merging a PR without immediately closing the linked GH issue — issues stay open forever otherwise
 - Using Playwright/browser for GitHub when `gh` handles it in one command
 

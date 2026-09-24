@@ -4,7 +4,7 @@ AutoBot-AI-specific [Claude Code](https://claude.com/claude-code) skills, packag
 marketplace so every developer on the platform gets the **same** workflow setup with one install.
 
 These encode the AutoBot-AI development workflow — the issue-to-merge loop, full-stack debugging,
-and codebase auditing — and they hardcode AutoBot's conventions (`Dev_new_gui`, `autobot_shared`,
+and codebase auditing — and they hardcode AutoBot's conventions (`main` as the PR base, `release` as the stable branch, `autobot_shared`,
 the deploy path, the required PR-body headings). They are the project-specific counterpart to the
 general, reusable-anywhere skills in
 [Claude-Dev-Skills](https://github.com/mrveiss/Claude-Dev-Skills).
@@ -72,7 +72,7 @@ this repo. On a new machine, they restore the whole workflow.
 
 - **`batch-implement`** — Full implement→review→merge→close→discover loop for a list of GitHub issues, with self-healing retry and per-issue verification.
 - **`implement`** — End-to-end GitHub issue implementation — umbrella gate, worktree, design, code, verify, PR, CI, and the three-gate closure check
-- **`pr`** — Create a pull request with pre-flight branch checks, targeting Dev_new_gui by default
+- **`pr`** — Create a pull request with pre-flight branch checks, targeting main by default
 - **`pre-merge-validate`** — Validate code before merging — syntax, imports, call-site impact, tests, types, and linting
 - **`drain`** — Pick and solve the backlog issues that need no decision
 
