@@ -21,7 +21,7 @@ For each PR, classify CI status as **passing**, **failing**, or **queued/running
 ```bash
 gh pr checks <number> --json name,state,conclusion
 ```
-- **Do not cancel or retrigger queued checks** — they are running normally on self-hosted runners
+- **Never cancel a `train-*` run or a run with a live ci-slot hold** (`ledger holds | grep ci-slot`) — CI priority belongs to the trainmaster; queued checks are running normally
 - Only act on checks in state `failure` or `error`
 - Treat `code-quality` as a required blocking check
 
@@ -42,19 +42,22 @@ For each PR with green or actionable CI:
 For PRs blocked only on Black/isort/flake8/mypy:
 1. Check out on a feature branch (if branch-protected, never push direct)
 2. Run: `black . && isort . && ruff check --fix .`
-3. Commit and push to the PR branch
+3. Commit and push to the PR branch — never to a head queued in a train (the trainmaster fixes those in-train)
 
 ## Merge Decision
 
-Merge when:
+Approved PRs land via the trainmaster's merge train (merge commit, never squash). Hand off when:
 - All required checks pass (not just code-quality)
 - No blocking findings from the review pass
 - The branch is not behind base — a green run describes a merge base that may have moved
 
-Do NOT merge when:
+Do NOT hand off when:
 - CI checks are queued (wait for them)
 - Blocking security or correctness findings exist
 - CI is red — root-cause it; a tracking issue is not a substitute
+
+- A green PR still reads `BLOCKED`: the ruleset's 1-approval rule targets external contributors and no session can self-approve. Read `rules/branches/<b>`, not classic `branches/<b>/protection` (it reports no review rule).
+- `--admin` is only for the 1-approval rule, used by the merger, with all checks green, 0 unresolved threads and 0 behind. Never past red. Implementers never merge.
 
 ## PR Description Format
 

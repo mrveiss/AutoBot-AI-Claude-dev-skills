@@ -126,7 +126,7 @@ EOF
 
 If zero confirmed findings: post "Review Fleet found no confirmed issues across 10 angles."
 
-## Wiring into Paperclip Wake Payload
+## Wiring into the Agent Orchestrator's Wake Payload
 
 When a wake payload contains `{"type": "pr_review", "effort": "high"}` or `{"type": "pr_review", "fleet": true}`, trigger this skill automatically by including `/review-fleet <PR_NUMBER>` in the agent prompt.
 

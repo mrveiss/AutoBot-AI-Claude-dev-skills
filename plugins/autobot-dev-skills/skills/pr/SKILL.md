@@ -5,26 +5,7 @@ description: Create a pull request with pre-flight branch checks, targeting main
 
 # /pr - Create Pull Request
 
-Target: `main` (the default branch; never `release`, the stable branch). PR_LIMIT=10.
-
-## Step 0 — PR Queue Gate (MANDATORY)
-
-```bash
-OPEN_COUNT=$(gh pr list --repo mrveiss/AutoBot-AI --state open --json number | jq length)
-```
-
-- If `$OPEN_COUNT < PR_LIMIT`: skip to Step 1.
-- If at limit: audit CI state, merge GREEN PRs, fix straightforward FAILING PRs, re-check.
-
-```bash
-# Audit CI state
-gh pr list --repo mrveiss/AutoBot-AI --state open --json number,title,statusCheckRollup \
-  | jq '.[] | {number, title, ci: ([.statusCheckRollup[]?.state] | if all(. == "SUCCESS" or . == "NEUTRAL" or . == "SKIPPED") then "GREEN" elif any(. == "FAILURE" or . == "ERROR") then "FAILING" else "PENDING" end)}'
-# Merge green PRs
-gh pr merge <number> --squash --delete-branch
-```
-
-- All open PRs have unfixable failures → post Paperclip comment listing blockers, set issue `blocked`, stop.
+Target: `main` (the default branch; never `release`, the stable branch). There is no open-PR cap.
 
 ## Step 1 — Pre-Flight Checks
 
@@ -45,10 +26,10 @@ black autobot-backend/ autobot_shared/ autobot-slm-backend/ 2>/dev/null || true
 isort autobot-backend/ autobot_shared/ autobot-slm-backend/ 2>/dev/null || true
 ruff check --fix autobot-backend/ autobot_shared/ 2>/dev/null || true
 # Commit formatting changes if any
-git add -u && git diff --cached --quiet || git commit -m "style: auto-format code (black/isort/ruff)"
+git add -u && git diff --cached --quiet || git commit -m "style(format): auto-format (#<issue-number>)"
 ```
 
-- `print()` → `logging.getLogger(__name__)`; `console.*` → `createLogger()` from `@/utils/debugUtils`
+- `print()` → `get_logger(__name__)` from `autobot_shared.logging_manager`; `console.*` → `createLogger()` from `@/utils/debugUtils`
 - Fix all violations before proceeding.
 
 ## Step 2 — Push Branch
@@ -62,53 +43,51 @@ git push -u origin <current-branch>
 
 PR body must include these four headings: **Thinking Path · What Changed · Verification · Model Used**
 
-```bash
-gh pr create --base main \
-  --title "<type>(scope): <description> (#issue-number)" \
-  --body "$(cat <<'EOF'
+Write the body to a file (never an inline `--body`: backticks in it execute as shell).
+
+`Closes #N` auto-closes at merge: write it only when every AC is delivered, `Refs #N` otherwise. The merger posts the AC evidence; a failed AC reopens the issue.
+
+```markdown
 ## Thinking Path
 - <key decision>
 ## What Changed
 - <change>
 ## Verification
-- [ ] <test step>
+- <command + output>
 ## Model Used
-Claude Sonnet 4.6
+<model that did the work>
 
-Closes #<issue-number>
-EOF
-)"
+Refs #<issue-number>
 ```
 
-## Step 4 — Wait for CI (MANDATORY — do not exit until green)
-
 ```bash
-PR=$(gh pr view --json number -q .number)
-until [ "$(gh pr checks $PR --json state | jq '[.[]|select(.state=="PENDING" or .state=="QUEUED")]|length')" -eq 0 ]; do
-  echo "Waiting..."; sleep 30; done
-gh pr checks $PR
+gh pr create --base main --title "<type>(scope): <description> (#issue-number)" --body-file <file>
 ```
 
-- CI failing: push a fix commit; loop re-runs automatically.
+## Step 4 — CI
 
-## Step 5 — Close Issue After Merge
+- Never busy-poll: schedule one wakeup or arm one Monitor, then `gh pr checks <pr>` once when it fires.
+- CI failing: root-cause, push a fix commit (not once the head is queued in a train).
 
-`main` is the default branch, so `Closes #NNN` auto-closes the issue on merge. Confirm it closed and add the evidence comment:
+## Step 5 — Land and close
+
+Approved PRs land via a merge train run by the trainmaster session — merge commit, never squash. Hand the trainmaster the PR number + head SHA; never push to a head once it is queued; the trainmaster merges and fixes small findings in-train.
+
+The merger posts the per-AC evidence (Closes/Refs rule: Step 3).
 
 ```bash
-gh pr merge <pr-number> --squash --delete-branch
-gh issue view <number> --json state   # confirm state=CLOSED; if not, gh issue close <number>
-gh issue comment <number> --body "Closed via PR #<pr-number> merged into main."
+gh issue comment <number> --body-file <file>   # per-AC evidence, after the merge
 ```
 
 ## Step 6: Worktree Cleanup (After Merge)
 
-After the PR merges, immediately clean up both local worktree and branch:
+Once the PR is verified merged (`gh pr view <pr> --json state` = MERGED), clean up both local worktree and branch:
 
 ```bash
-git worktree remove .worktrees/<name>
-git branch -d <branch-name>
-# remote branch deleted automatically by --delete-branch; if not:
+ledger release worktree <name>
+git worktree remove .worktrees/<name>   # no force flag: a refusal is unfinished work
+git branch -D <branch-name>
+# remote branch normally deleted at landing; if not:
 git push origin --delete <branch-name>
 ```
 
@@ -120,4 +99,4 @@ Do not leave merged worktrees on disk. Stale worktrees waste disk and confuse `g
 - Uncommitted changes present
 - No issue reference in title or body
 - Skipped pre-push quality checks (Step 1.5)
-- Exiting before CI is green
+- Busy-polling CI or pushing to a head queued in a train

@@ -20,7 +20,7 @@ gh issue create --title "Bug: <desc>" --body "..." --label "bug,backend,priority
 
 # Update / close
 gh issue comment <number> --body "..."
-gh issue close <number>
+gh issue close <number>   # only once every AC is evidenced (Refs-linked issues)
 gh issue edit <number> --add-label "priority: high" --title "New title"
 
 # Check state
@@ -67,11 +67,10 @@ gh pr list --state open
 gh pr diff [number]
 
 # Create (always target main)
-gh pr create --base main --title "..." --body "..."
+gh pr create --base main --title "..." --body-file <file>
 
-# Review / merge
-gh pr review <number> --approve
-gh pr merge <number> --squash
+# Review (approved PRs land via the trainmaster's merge train — merge commit, never squash)
+gh pr review <number> --comment --body "..."
 
 # Status checks
 gh pr status
@@ -104,10 +103,10 @@ gh pr review <number> --comment --body "..."
 | Create issue | `gh issue create --title "..." --label "..."` |
 | Link child to umbrella | `gh api -X POST repos/$REPO/issues/$P/sub_issues -F sub_issue_id=$(gh api repos/$REPO/issues/$C -q .id)` |
 | Link blocker | `gh api -X POST repos/$REPO/issues/$B/dependencies/blocked_by -F issue_id=$(gh api repos/$REPO/issues/$A -q .id)` |
-| Close issue | `gh issue close <n>` |
+| Close issue | `gh issue close <n>` — only once every AC is evidenced |
 | Create PR | `gh pr create --base main ...` |
 | View PR diff | `gh pr diff <n>` |
-| Merge PR | `gh pr merge <n> --squash` |
+| Land PR | hand PR number + head to the trainmaster (merge train, merge commit) |
 | List labels | `gh label list` |
 | View checks | `gh pr checks <n>` |
 
@@ -117,19 +116,14 @@ gh pr review <number> --comment --body "..."
 - **Base branch:** Always `main` (the default branch; never `release`) for PRs
 - **Required labels:** type (`bug`, `enhancement`, `technical-debt`) + area (`backend`, `frontend`) + priority (`priority: high`, etc.)
 - **Commit/PR title format:** `<type>(scope): <description> (#issue-number)`
-- **Auto-close:** `main` is the default branch, so `Closes #NNN` (one per line) auto-closes the issue on merge. **Always confirm it closed and add the evidence comment:**
-  ```bash
-  gh pr merge <pr> --squash --delete-branch
-  gh issue view <number> --json state  # confirm state=CLOSED; if not, gh issue close <number>
-  gh issue comment <number> --body "Closed via PR #<pr> merged into main."
-  ```
+- **Auto-close:** one `Closes #NNN` per line. Closes/Refs rule — see `pr` Step 3.
 
 ## Common Mistakes
 
 - Targeting `release` instead of `main` for PRs
 - Forgetting required labels on new issues
 - Writing `Closes #A, #B` on one line — only #A is linked; use one `Closes #N` per line
-- Merging a PR without immediately closing the linked GH issue — issues stay open forever otherwise
+- Writing `Closes` for a partial delivery — it closes at merge; use `Refs`
 - Using Playwright/browser for GitHub when `gh` handles it in one command
 
 ## Prefer `--json` for issue reads
