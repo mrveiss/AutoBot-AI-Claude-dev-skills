@@ -32,7 +32,7 @@ description: Full implement→review→merge→close→discover loop for GitHub 
 3. Resolve issue list: `gh issue list --label <label> --state open --json number -q '.[].number'`
 4. Skip if already in main: `git log origin/main --oneline --grep="#<n>" | head -1`
 5. Skip if already closed: `gh issue view <n> --json state -q '.state'`
-6. Clean stale worktrees: `git worktree remove .worktrees/issue-<n> --force && git branch -D issue-<n>`
+6. Leftover `.worktrees/issue-<n>`: check `ledger who worktree issue-<n>`. Live owner → leave it. Landed (PR verified merged) → `git worktree remove` (never `--force`) then `git branch -D`. Not landed → finish it, never delete.
 
 Print summary before proceeding:
 ```
@@ -45,7 +45,8 @@ Pre-flight: To implement: #N, #M | Skipped: #K | Cleaned: N worktrees
 
 ```bash
 git worktree add .worktrees/issue-<n> -b issue-<n> origin/main
-cd .worktrees/issue-<n> && git branch --unset-upstream
+ledger claim worktree issue-<n> --ttl 168h
+git -C .worktrees/issue-<n> branch --unset-upstream
 ```
 
 - Agents MUST work inside the worktree — NEVER `git checkout` on the main tree.
@@ -112,7 +113,7 @@ Push only after all checks pass: `git push -u origin issue-<n>`
 ## Step 5: Create & Review PR
 
 ```bash
-gh pr create --base main --head issue-<n> --title "..." --body "..."
+gh pr create --base main --head issue-<n> --title "..." --body-file <file>
 ```
 
 - Syntax/imports: `python -m py_compile <file>` for Python; `vue-tsc` for TS/Vue.
@@ -124,22 +125,22 @@ Fix inline and re-push if validation fails. Never merge a failing PR.
 
 ---
 
-## Step 6: Merge
+## Step 6: Land
+
+Approved PRs land via a merge train run by the trainmaster session — merge commit, never squash. Hand the trainmaster the PR number + head SHA; never push to a head once it is queued; the trainmaster merges and fixes small findings in-train.
 
 ```bash
-gh pr merge <pr> --squash --delete-branch
-git fetch origin && git log origin/main --oneline --grep="#<n>" | head -1  # confirm
+git fetch origin && git log origin/main --oneline --grep="#<n>" | head -1  # confirm landed
 ```
-
-Merge one at a time. Verify before moving to next.
 
 ---
 
 ## Step 7: Close with Proof
 
+`Closes #N` auto-closes at merge: write it only when every AC is delivered, `Refs #N` otherwise. The merger posts the AC evidence; a failed AC reopens the issue.
+
 ```bash
-gh issue close <n>
-gh issue comment <n> --body "Closed — merged to main. Commit: <sha>. Criteria met: <evidence>. Discoveries: <#N or none>"
+gh issue comment <n> --body-file <file>   # merged commit <sha>, per-AC evidence, discoveries
 ```
 
 Check off the item on the umbrella issue.
@@ -161,7 +162,7 @@ File before cleanup. Include in closure comment.
 ## Step 9: Cleanup & Summary
 
 ```bash
-git worktree remove .worktrees/issue-<n> --force  # SUCCESS issues only; preserve ESCALATED
+ledger release worktree issue-<n> && git worktree remove .worktrees/issue-<n>  # landed issues only, no force flag; preserve ESCALATED
 gh pr list --state open   # should be 0 for this batch
 git worktree list          # should show only main
 ```

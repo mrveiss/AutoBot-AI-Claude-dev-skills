@@ -50,8 +50,8 @@ Base branch: `main` (adjust if the dispatch says otherwise).
    - **Active** (touched recently, or zero commits — a session that just
      started) → leave alone.
    - never `--force` (a dirty tree refusing removal is unfinished work, not an obstacle)
-   - never `-d`/`-D` on ancestry alone; squash-merge makes ancestry lie — confirm
-     via the branch's PR state
+   - `git branch -D` only after the branch's PR is verified merged — never on
+     ancestry alone
    - skip anything `locked`
 
 2. **Create YOUR isolated worktree**, then claim it so a concurrent sweep cannot
@@ -59,16 +59,12 @@ Base branch: `main` (adjust if the dispatch says otherwise).
    ```bash
    # from the main checkout's root; <name> is issue-<n> when there is an issue
    git worktree add .worktrees/<name> -b <name> origin/main
-   git worktree lock --reason "in use: <task> (session started $(date -u +%FT%TZ))" .worktrees/<name>
-   git -C .worktrees/<name> commit --allow-empty -m "chore: claim worktree for <task>"
+   ledger iam <session>
+   ledger claim worktree <name> --ttl 168h
    ```
-   Address the worktree by path (`git -C`), never through an earlier `cd`: agent
-   shells often drop `cwd` between calls, and a claim commit after a lost `cd`
-   lands on the caller's branch, usually the shared checkout's `main` (#14).
-   A wrong path makes `git -C` fail instead of committing somewhere else.
-   `lock` makes `git worktree remove --force` fail outright (it demands `-f -f`),
-   and the claim commit stops "no unique commits" heuristics from classifying the
-   worktree as finished. Unlock at the end: `git worktree unlock <path>`.
+   The ledger is the ownership record (`ledger who worktree <name>`); no claim
+   commit. Address the worktree by path (`git -C`), never through an earlier `cd`.
+   On removal: `ledger release worktree <name>`, then `git worktree remove`.
 3. **Read predecessor handoffs:** check `.session/` directory on the base
    branch for HANDOFF files from unmerged sessions touching your area. If one
    exists and its branch is unmerged, decide: continue their branch (rebase it
@@ -81,8 +77,9 @@ Base branch: `main` (adjust if the dispatch says otherwise).
 - One commit per logical change; reference issues (`fixes #NNNN`).
 - LICENSE, NOTICE, SPDX headers, and licensing statements are READ-ONLY.
   Flag concerns in the report; never modify.
-- Never push directly to the base branch. Never merge — merging is the
-  human's action.
+- Never push directly to the base branch. Never merge yourself — approved PRs
+  land via the trainmaster's merge train; hand it the PR number + head and never
+  push to a queued head.
 - If you discover another session has landed overlapping work: rebase onto
   latest base immediately and reconcile before continuing.
 

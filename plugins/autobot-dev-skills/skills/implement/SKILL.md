@@ -35,18 +35,19 @@ Read your assigned step from the umbrella issue before proceeding.
 ## Step 2 — Investigate, then design (do NOT code yet)
 - Grep/Glob for the affected files; confirm each exists.
 - Post the plan in ≤10 lines: files, changes, edge cases, risks.
-- Seek approval only if >10 files are touched; otherwise proceed.
+- Ask the moment a user-level decision surfaces (architecture, deletion, scope); in an autonomous loop post options + a recommendation on the issue with `needs-decision` and continue. A file count alone is not the trigger.
 - Write a TodoWrite checklist of discrete, testable tasks.
 
 ## Step 3 — Worktree (MANDATORY, never edit the main tree)
 ```bash
 git worktree add .worktrees/issue-<n> -b issue-<n> origin/main
+ledger iam <session> && ledger claim worktree issue-<n> --ttl 168h
 ```
 - Branch off the PR base branch, `origin/main`, never `release`. Never touch another session's worktree.
 - Commit incrementally inside the worktree — never `git stash` (it is shared repo-wide).
 
 ## Step 4 — Implement
-- <8 files: Read → Edit → verify syntax → next file. No subagents.
+- <8 files: Read → Edit → verify syntax → next file. No subagents (implementer sessions; the merge/review session delegates by model tier).
 - ≥8 files or genuinely parallel work: subagents.
 - Run the relevant tests after each task; fix failures before continuing.
 
@@ -89,8 +90,8 @@ gh pr create --base main --title "<type>(scope): <title> (#<n>)" --body-file <fi
   `## Thinking Path` · `## What Changed` · `## Verification` · `## Model Used`
 - Use `--body-file`, never an inline `--body`: backticks inside it execute as shell commands.
 
-## Step 9 — CI (do not exit until green)
-- `gh pr checks <PR>` — repeat until nothing is PENDING; `smoke-test` must be SUCCESS.
+## Step 9 — CI
+- `gh pr checks <PR>` — nothing PENDING and `smoke-test` SUCCESS before hand-off. Never busy-poll: one wakeup or Monitor, no sleep loops.
 - Dedupe check-runs to the latest push; sort by `startedAt` — rollup order is not chronological.
 - **Red CI never merges.** Root-cause it; a tracking issue is not a substitute. Never `--admin` past a failing check.
 - **A green PR still reads `BLOCKED`, and that is its normal resting state.** The ruleset's 1-approval rule targets external contributors; the owner merging past it is the designed path, not an exception to flag or ask about each time. No session can satisfy it anyway — GitHub forbids self-approval and every session is the same account, so `--auto` waits forever. Merge with `--admin` once every required check is green, no threads are unresolved, and the branch is not behind.
@@ -98,9 +99,9 @@ gh pr create --base main --title "<type>(scope): <title> (#<n>)" --body-file <fi
 - Never merge a branch behind base — a green run describes a merge base that may have moved.
 
 ## Step 10 — Merge or hand off
-- Merge: `gh pr merge <n> --squash --delete-branch` (verify the remote tip first).
+- Approved PRs land via a merge train run by the trainmaster session — merge commit, never squash. Hand the trainmaster the PR number + head SHA; never push to a head once it is queued; the trainmaster merges and fixes small findings in-train.
 - Must wait: post ONE comment, set status `in_review`, STOP. Never busy-poll.
-- `Closes #N` NEVER auto-closes on this repo — always close by hand.
+- `Closes #N` auto-closes at merge: write it only when every AC is delivered, `Refs #N` otherwise. The merger posts the AC evidence; a failed AC reopens the issue.
 
 ## Step 11 — Three-gate closure check (MANDATORY)
 ```bash
@@ -115,12 +116,11 @@ pipeline-scripts/check-issue-close-refs.sh <n>   # exit 1 = forward refs dangle 
 
 ```bash
 gh issue comment <n> --body-file <file>   # implementation ACs + integration ACs, with evidence
-gh issue close <n>
-gh issue view <n> --json state            # confirm
+gh issue view <n> --json state            # Closes fired at merge; Refs → close only once every AC is evidenced
 ```
 
 ## Step 12 — Dispose
-- Remove the worktree only after the PR is merged and the content is verified in base.
+- Only after the PR is verified merged and the content is in base: `ledger release worktree issue-<n>`, `git worktree remove .worktrees/issue-<n>` (never `--force`), `git branch -D issue-<n>`.
 
 ## Success checklist
 - [ ] Umbrella issue with step breakdown exists; issue verified open, no duplicate PR/branch
@@ -130,4 +130,4 @@ gh issue view <n> --json state            # confirm
 - [ ] Commit format correct, no trailers, no `--no-verify`
 - [ ] PR targets `main` with the four required headings; smoke-test green; not behind base
 - [ ] Every new module has ≥1 caller, or a wire-in issue is filed and referenced
-- [ ] All three closure gates run; issue closed by hand and confirmed
+- [ ] Handed to the trainmaster (PR number + head); `Closes` only if every AC is delivered, else `Refs`; AC evidence posted after merge
