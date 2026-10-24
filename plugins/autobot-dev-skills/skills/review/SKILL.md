@@ -56,6 +56,9 @@ Do NOT hand off when:
 - Blocking security or correctness findings exist
 - CI is red — root-cause it; a tracking issue is not a substitute
 
+- A green PR still reads `BLOCKED`: the ruleset's 1-approval rule targets external contributors and no session can self-approve. Read `rules/branches/<b>`, not classic `branches/<b>/protection` (it reports no review rule).
+- `--admin` is only for the 1-approval rule, used by the merger, with all checks green, 0 unresolved threads and 0 behind. Never past red. Implementers never merge.
+
 ## PR Description Format
 
 When creating or editing PR bodies, use these exact headings:

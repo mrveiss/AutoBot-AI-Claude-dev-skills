@@ -93,15 +93,12 @@ gh pr create --base main --title "<type>(scope): <title> (#<n>)" --body-file <fi
 ## Step 9 — CI
 - `gh pr checks <PR>` — nothing PENDING and `smoke-test` SUCCESS before hand-off. Never busy-poll: one wakeup or Monitor, no sleep loops.
 - Dedupe check-runs to the latest push; sort by `startedAt` — rollup order is not chronological.
-- **Red CI never merges.** Root-cause it; a tracking issue is not a substitute. Never `--admin` past a failing check.
-- **A green PR still reads `BLOCKED`, and that is its normal resting state.** The ruleset's 1-approval rule targets external contributors; the owner merging past it is the designed path, not an exception to flag or ask about each time. No session can satisfy it anyway — GitHub forbids self-approval and every session is the same account, so `--auto` waits forever. Merge with `--admin` once every required check is green, no threads are unresolved, and the branch is not behind.
-- **Read the ruleset, not classic protection.** `branches/<b>/protection` reports `required_pull_request_reviews: none` here while `rules/branches/<b>` carries the rule that actually blocks. Two systems, different answers, both return success.
-- Never merge a branch behind base — a green run describes a merge base that may have moved.
+- Merge gates (red never merges, 0 behind, `BLOCKED` resting state, `--admin` scope) — see `review` Merge Decision. Implementers never merge.
 
-## Step 10 — Merge or hand off
-- Approved PRs land via a merge train run by the trainmaster session — merge commit, never squash. Hand the trainmaster the PR number + head SHA; never push to a head once it is queued; the trainmaster merges and fixes small findings in-train.
+## Step 10 — Hand off
+- Hand off to the trainmaster's merge train — see `pr` Step 5.
 - Must wait: post ONE comment, set status `in_review`, STOP. Never busy-poll.
-- `Closes #N` auto-closes at merge: write it only when every AC is delivered, `Refs #N` otherwise. The merger posts the AC evidence; a failed AC reopens the issue.
+- Closes/Refs rule — see `pr` Step 3.
 
 ## Step 11 — Three-gate closure check (MANDATORY)
 ```bash

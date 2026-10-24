@@ -43,7 +43,9 @@ git push -u origin <current-branch>
 
 PR body must include these four headings: **Thinking Path · What Changed · Verification · Model Used**
 
-Write the body to a file (never an inline `--body`: backticks in it execute as shell):
+Write the body to a file (never an inline `--body`: backticks in it execute as shell).
+
+`Closes #N` auto-closes at merge: write it only when every AC is delivered, `Refs #N` otherwise. The merger posts the AC evidence; a failed AC reopens the issue.
 
 ```markdown
 ## Thinking Path
@@ -55,7 +57,7 @@ Write the body to a file (never an inline `--body`: backticks in it execute as s
 ## Model Used
 <model that did the work>
 
-Closes #<issue-number>   # only if every AC is delivered; otherwise Refs #<issue-number>
+Refs #<issue-number>
 ```
 
 ```bash
@@ -71,7 +73,7 @@ gh pr create --base main --title "<type>(scope): <description> (#issue-number)" 
 
 Approved PRs land via a merge train run by the trainmaster session — merge commit, never squash. Hand the trainmaster the PR number + head SHA; never push to a head once it is queued; the trainmaster merges and fixes small findings in-train.
 
-`Closes #N` auto-closes at merge: write it only when every AC is delivered, `Refs #N` otherwise. The merger posts the AC evidence; a failed AC reopens the issue.
+The merger posts the per-AC evidence (Closes/Refs rule: Step 3).
 
 ```bash
 gh issue comment <number> --body-file <file>   # per-AC evidence, after the merge

@@ -62,6 +62,7 @@ Base branch: `main` (adjust if the dispatch says otherwise).
    ledger iam <session>
    ledger claim worktree <name> --ttl 168h
    ```
+   `ledger` lives in the user's Claude scripts directory, which must be on `PATH`.
    The ledger is the ownership record (`ledger who worktree <name>`); no claim
    commit. Address the worktree by path (`git -C`), never through an earlier `cd`.
    On removal: `ledger release worktree <name>`, then `git worktree remove`.
@@ -77,9 +78,7 @@ Base branch: `main` (adjust if the dispatch says otherwise).
 - One commit per logical change; reference issues (`fixes #NNNN`).
 - LICENSE, NOTICE, SPDX headers, and licensing statements are READ-ONLY.
   Flag concerns in the report; never modify.
-- Never push directly to the base branch. Never merge yourself — approved PRs
-  land via the trainmaster's merge train; hand it the PR number + head and never
-  push to a queued head.
+- Never push directly to the base branch. Never merge yourself — Hand off to the trainmaster's merge train — see `pr` Step 5.
 - If you discover another session has landed overlapping work: rebase onto
   latest base immediately and reconcile before continuing.
 
@@ -110,14 +109,14 @@ Base branch: `main` (adjust if the dispatch says otherwise).
    needs_rebase_before_merge: yes|no
    remaining: <bullet list, empty if complete>
    blocked_on: <only if status=blocked — be precise>
-   worktree: .worktrees/<name>  (safe to remove after merge)
+   worktree: .worktrees/<name>  (remove only after the PR is verified merged)
    ```
 5. **Write the mission report** (`*_REPORT.md` per the dispatch prompt) — the
    handoff is for machines/next sessions; the report is for the human.
 6. **Self-cleanup of scratch only:** remove temp files, caches, and anything
    not belonging on the branch. Do NOT remove your own worktree — it must
-   survive until merge; the next session's start-protocol removes it after
-   the branch merges.
+   survive until merge. Once the PR is verified merged:
+   `ledger release worktree <name>`, then `git worktree remove .worktrees/<name>`.
 
 ## FAILURE MODES THIS PREVENTS
 - Orphaned branches drifting behind base (start-step 1 + end-step 2)

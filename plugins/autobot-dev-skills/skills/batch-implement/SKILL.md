@@ -121,13 +121,13 @@ gh pr create --base main --head issue-<n> --title "..." --body-file <file>
 - Wiring check: any new public module must have ≥1 production caller — HARD BLOCK if 0.
 - Linting: `python -m black --check <files>`
 
-Fix inline and re-push if validation fails. Never merge a failing PR.
+Fix inline and re-push if validation fails, unless the head is queued in a train. Never merge a failing PR.
 
 ---
 
 ## Step 6: Land
 
-Approved PRs land via a merge train run by the trainmaster session — merge commit, never squash. Hand the trainmaster the PR number + head SHA; never push to a head once it is queued; the trainmaster merges and fixes small findings in-train.
+Hand off to the trainmaster's merge train — see `pr` Step 5.
 
 ```bash
 git fetch origin && git log origin/main --oneline --grep="#<n>" | head -1  # confirm landed
@@ -137,7 +137,7 @@ git fetch origin && git log origin/main --oneline --grep="#<n>" | head -1  # con
 
 ## Step 7: Close with Proof
 
-`Closes #N` auto-closes at merge: write it only when every AC is delivered, `Refs #N` otherwise. The merger posts the AC evidence; a failed AC reopens the issue.
+Closes/Refs rule — see `pr` Step 3.
 
 ```bash
 gh issue comment <n> --body-file <file>   # merged commit <sha>, per-AC evidence, discoveries

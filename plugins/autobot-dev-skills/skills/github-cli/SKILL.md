@@ -67,7 +67,7 @@ gh pr list --state open
 gh pr diff [number]
 
 # Create (always target main)
-gh pr create --base main --title "..." --body "..."
+gh pr create --base main --title "..." --body-file <file>
 
 # Review (approved PRs land via the trainmaster's merge train — merge commit, never squash)
 gh pr review <number> --comment --body "..."
@@ -103,7 +103,7 @@ gh pr review <number> --comment --body "..."
 | Create issue | `gh issue create --title "..." --label "..."` |
 | Link child to umbrella | `gh api -X POST repos/$REPO/issues/$P/sub_issues -F sub_issue_id=$(gh api repos/$REPO/issues/$C -q .id)` |
 | Link blocker | `gh api -X POST repos/$REPO/issues/$B/dependencies/blocked_by -F issue_id=$(gh api repos/$REPO/issues/$A -q .id)` |
-| Close issue | `gh issue close <n>` |
+| Close issue | `gh issue close <n>` — only once every AC is evidenced |
 | Create PR | `gh pr create --base main ...` |
 | View PR diff | `gh pr diff <n>` |
 | Land PR | hand PR number + head to the trainmaster (merge train, merge commit) |
@@ -116,7 +116,7 @@ gh pr review <number> --comment --body "..."
 - **Base branch:** Always `main` (the default branch; never `release`) for PRs
 - **Required labels:** type (`bug`, `enhancement`, `technical-debt`) + area (`backend`, `frontend`) + priority (`priority: high`, etc.)
 - **Commit/PR title format:** `<type>(scope): <description> (#issue-number)`
-- **Auto-close:** `Closes #NNN` (one per line) auto-closes the issue at merge. Write it only when every AC is delivered, `Refs #NNN` otherwise; the merger posts the per-AC evidence comment.
+- **Auto-close:** one `Closes #NNN` per line. Closes/Refs rule — see `pr` Step 3.
 
 ## Common Mistakes
 
