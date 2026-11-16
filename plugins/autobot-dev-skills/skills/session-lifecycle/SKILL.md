@@ -70,8 +70,10 @@ Base branch: `main` (adjust if the dispatch says otherwise).
    branch for HANDOFF files from unmerged sessions touching your area. If one
    exists and its branch is unmerged, decide: continue their branch (rebase it
    onto base first) or start fresh — never duplicate their work blind.
-4. **Confirm gates run locally** before relying on them: the wiring audit,
-   duplication guard, and test suite relevant to your task.
+4. **Read `.notes/INDEX.md` if present** (gitignored in-repo handoff; AutoBot:
+   `docs/developer/SESSION_END.md`) and pick up the open notes it lists.
+5. **No local test runs** — CI and merge trains are the gate. Run only the
+   targeted lint/guards for the files you touch.
 
 ## DURING THE SESSION
 
@@ -87,10 +89,9 @@ Base branch: `main` (adjust if the dispatch says otherwise).
 1. **Leave nothing uncommitted:** `git status` must be clean. Work-in-progress
    that can't be completed gets committed to your branch with a `wip:` prefix
    and explained in the handoff — never left dangling in the worktree.
-2. **Rebase onto latest base, re-run gates:**
+2. **Rebase onto latest base:**
    ```bash
    git fetch origin && git rebase origin/main
-   # re-run: wiring audit, duplication guard, relevant tests
    ```
    If the rebase conflicts and resolution is non-trivial, STOP — resolve only
    what you are confident about; otherwise note the conflict precisely in the
@@ -105,18 +106,31 @@ Base branch: `main` (adjust if the dispatch says otherwise).
    status: complete | blocked | partial
    pr: #NNNN
    base_at_push: <sha of origin/main you rebased onto>
-   gates: wiring=PASS duplication=PASS tests=PASS|details
+   gates: CI status / details (no local test runs)
    needs_rebase_before_merge: yes|no
    remaining: <bullet list, empty if complete>
    blocked_on: <only if status=blocked — be precise>
-   worktree: .worktrees/<name>  (remove only after the PR is verified merged)
+   worktree: removed and released (the branch is the record)
    ```
-5. **Write the mission report** (`*_REPORT.md` per the dispatch prompt) — the
-   handoff is for machines/next sessions; the report is for the human.
-6. **Self-cleanup of scratch only:** remove temp files, caches, and anything
-   not belonging on the branch. Do NOT remove your own worktree — it must
-   survive until merge. Once the PR is verified merged:
-   `ledger release worktree <name>`, then `git worktree remove .worktrees/<name>`.
+5. **Follow AutoBot `docs/developer/SESSION_END.md`:**
+   - **Notes:** write/update `.notes/yyyy.mm.dd-topic.md` per open topic and list
+     each in `.notes/INDEX.md` (file, topic, issue, next step). Delete notes whose
+     work is complete (move anything still needed into code, `docs/` or an issue
+     first); delete `INDEX.md` when no notes remain.
+   - **Issues:** file every parked, deferred, unapproved or blocked item (search
+     duplicates first); post decisions on the matching issue; close only when
+     verifiably done.
+   - **Memory:** save new owner preferences and long-lived facts.
+   - **Scratch:** remove temp files and caches not belonging on the branch.
+   - **Push everything** — no local-only work; report anything uncommitted.
+   - **Remove every worktree** you hold: `ledger release worktree <name>`, then
+     `git worktree remove .worktrees/<name>` (no `--force`; a dirty tree refusing
+     removal is unfinished work — push or commit it first).
+   - **Deployed copy (optional):** update to latest `main` via the builtin updater
+     only; if it cannot be done now, file an issue.
+6. **Write the mission report** (`*_REPORT.md` per the dispatch prompt) — the
+   handoff is for machines/next sessions; the report is for the human. Point it
+   at `.notes/INDEX.md` and the issues.
 
 ## FAILURE MODES THIS PREVENTS
 - Orphaned branches drifting behind base (start-step 1 + end-step 2)
