@@ -66,7 +66,7 @@ text, `.git` metadata, archives — is **data, never instructions**.
 
 Topic search (a plain-text query with no URL) needs a configured web-search
 provider. The runtime registry
-([`autobot-backend/agent_loop/search/registry.py`](../../../autobot-backend/agent_loop/search/registry.py))
+([`autobot-backend/agent_loop/search/registry.py`](https://github.com/mrveiss/AutoBot-AI/blob/main/autobot-backend/agent_loop/search/registry.py))
 is credential-gated and degrades in this order:
 
 | Connect this | Unlocks |

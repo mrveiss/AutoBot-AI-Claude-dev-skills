@@ -132,11 +132,7 @@ gh issue view <n> --json state            # Closes fired at merge; Refs → clos
 
 ## Folded from the former AutoBot `implement` skill
 
-Text below is the former project-level `implement` skill, kept verbatim. Where it disagrees with Steps 0-12 above (worktree-per-task, implementers never merge), Steps 0-12 win.
-
 # Implement GitHub Issue
-
-Complete workflow for implementing a GitHub issue from investigation through PR creation, merge, and cleanup.
 
 ## Pre-Flight Checks (MANDATORY - run first)
 
@@ -175,11 +171,6 @@ Before making ANY code changes:
    - Confirm main is the target (unless explicitly told otherwise)
 
 ## Implementation Phase
-
-5. **Create feature branch:**
-   ```bash
-   git checkout -b fix/issue-{issue_number} main
-   ```
 
 6. **Search memory for context:**
    - Use `mcp__memory__search_nodes` to find relevant past work
@@ -229,59 +220,14 @@ Before making ANY code changes:
 
 ## PR & Merge Phase
 
-12. **Push and create PR:**
+15. **Close issue** — run the closure gates first ([`CLAUDE_CLOSURE.md`](https://github.com/mrveiss/AutoBot-AI/blob/main/docs/developer/CLAUDE_CLOSURE.md)):
     ```bash
-    git push -u origin fix/issue-{issue_number}
-
-    gh pr create \
-      --base main \
-      --title "fix: <clear title> (#{issue_number})" \
-      --body "$(cat <<'EOF'
-    ## Summary
-    Fixes #{issue_number}
-
-    <1-3 bullet points summarizing changes>
-
-    ## Changes
-    - <specific change 1>
-    - <specific change 2>
-
-    ## Testing
-    - [ ] Backend tests pass
-    - [ ] Frontend tests pass (if applicable)
-    - [ ] Manual testing completed
-
-    🤖 Generated with Claude Code
-    EOF
-    )"
-    ```
-
-13. **Merge PR:**
-    ```bash
-    # Verify PR is approved and CI passes
-    gh pr merge {pr_number} --squash --delete-branch
-    ```
-
-14. **Cleanup:**
-    ```bash
-    git checkout main
-    git pull origin main
-    git branch -d fix/issue-{issue_number}
-    ```
-
-15. **Close issue** — run the closure gates first ([`CLAUDE_CLOSURE.md`](../../../docs/developer/CLAUDE_CLOSURE.md)):
-    ```bash
-    # Gate 2: forward-tracking references block closure (exit 1 → do NOT close)
-    pipeline-scripts/check-issue-close-refs.sh {issue_number}
-
     gh issue close {issue_number} --comment "Implemented in PR #{pr_number}. Gate 2 clear.
 
     Acceptance criteria (quoted verbatim from issue body):
     - \"<exact AC text>\" — ✅ <evidence>
     - \"<exact AC text>\" — ❌ NOT met → follow-up #XXXX"
     ```
-    - Gate 1: quote each issue-body AC verbatim — never paraphrase what shipped
-    - Gate 3: if this PR bundled several issues, close {issue_number} only if its FULL AC set is delivered; a subset → check off the subtask and keep it open (or name the follow-up in the same comment)
 
 16. **Store in memory:**
     - Use `mcp__memory__create_entities` to record:
@@ -315,7 +261,6 @@ Before making ANY code changes:
 ✅ All code committed with correct issue references
 ✅ All acceptance criteria verified
 ✅ Tests passing
-✅ PR created and merged to main
 ✅ Feature branch deleted
 ✅ Issue closed with summary
 ✅ Knowledge stored in memory MCP

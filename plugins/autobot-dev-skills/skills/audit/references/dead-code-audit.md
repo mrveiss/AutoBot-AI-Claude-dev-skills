@@ -508,7 +508,7 @@ All issues are labeled `not-wired` or `dead-code` for filtering.
 
 ## Per-item review (former `dead-code-review` skill)
 
-Invoke as `/autobot-dev-skills:audit dead-code-review` when judging one piece of dead-looking code before removing or flagging it; the former `dead-code-review` skill, kept verbatim below.
+Invoke as `/autobot-dev-skills:audit dead-code-review` when judging one piece of dead-looking code before removing or flagging it; the former `dead-code-review` skill, kept below minus its removal path.
 
 # Dead Code Review
 
@@ -520,7 +520,6 @@ Before touching any dead-looking code, classify it:
 
 | Category | Definition | Action |
 |----------|-----------|--------|
-| **Truly dead** | Proven never called, no open issue, no git context suggesting intent | Remove — with documented justification |
 | **Unwired** | Implemented but not yet connected (no caller, no route, no event hook) | Create **implementation gap** issue. Do NOT delete. |
 | **Future phase** | Exists for a planned feature or phase not yet started | Note the issue/comment, leave it. Do NOT delete. |
 
@@ -580,19 +579,6 @@ if feature_flags.get("new_search_ui"):
 **Any of these → Unwired. Create an issue.**
 
 ## Step 4 — Classify and act
-
-### If Truly Dead
-Must satisfy ALL of these before deleting:
-- [ ] No callers found anywhere in codebase
-- [ ] Git history shows no feature intent (e.g., "cleanup", "remove old code")
-- [ ] No open GitHub issue referencing the functionality
-- [ ] No TODO/FIXME comment nearby suggesting wiring intent
-- [ ] Removing it does not break any tests
-
-Then document the removal:
-```bash
-git commit -m "chore: remove dead <name> — no callers, confirmed via grep + git log (#NNNN)"
-```
 
 ### If Unwired → Implementation Gap Issue
 
