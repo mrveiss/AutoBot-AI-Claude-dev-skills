@@ -1,8 +1,3 @@
----
-name: pre-merge-validate
-description: Validate code before merging — syntax, imports, call-site impact, tests, types, and linting
----
-
 # /pre-merge-validate — Pre-Merge Validation Gates
 
 ## Usage

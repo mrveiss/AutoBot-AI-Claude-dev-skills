@@ -1,8 +1,3 @@
----
-name: implement
-description: End-to-end GitHub issue implementation — umbrella gate, worktree, design, code, verify, PR, CI, and the three-gate closure check. Use when told to implement, fix, or solve a specific issue number, or when picking the next issue off the backlog. Supersedes the former `issue` skill.
----
-
 # /implement — End-to-End Issue Implementation
 
 Read your assigned step from the umbrella issue before proceeding.

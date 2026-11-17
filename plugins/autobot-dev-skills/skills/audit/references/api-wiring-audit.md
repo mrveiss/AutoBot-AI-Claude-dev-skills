@@ -1,8 +1,3 @@
----
-name: api-wiring-audit
-description: Audit and enforce frontend/backend API contract wiring in AutoBot-AI (or any FastAPI + SPA monorepo). Use this skill whenever the user mentions unwired features, dead buttons, 404s from the GUI, API contract drift, endpoints that "don't exist", unmounted routers, frontend/backend mismatch, or before marking ANY frontend feature complete. Also use it when implementing or modifying any frontend API call, any FastAPI route, or any router registration — run the audit as a completion gate, not just when explicitly asked.
----
-
 # API Wiring Audit
 
 Detects and fixes the three classes of frontend/backend contract drift:

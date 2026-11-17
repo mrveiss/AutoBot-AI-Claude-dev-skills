@@ -1,8 +1,3 @@
----
-name: batch-implement
-description: Full implement→review→merge→close→discover loop for GitHub issues. Use this whenever the user says "implement all X-labeled issues", "fix all Y bugs", "run a batch on these issues", or gives a list of issue numbers to work on. Do NOT ask for scope clarification — just run the pre-flight and start.
----
-
 # /batch-implement — Full Issue Resolution Loop
 
 ```bash

@@ -1,8 +1,3 @@
----
-name: pr
-description: Create a pull request with pre-flight branch checks, targeting main by default
----
-
 # /pr - Create Pull Request
 
 Target: `main` (the default branch; never `release`, the stable branch). There is no open-PR cap.

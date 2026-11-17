@@ -1,8 +1,3 @@
----
-name: dead-code-audit
-description: Systematic codebase audit for unwired code — identify unregistered routers, uninvoked hooks, orphaned components, and file discovery issues. All findings become "wire it in" issues — never deletion issues.
----
-
 # /dead-code-audit — Codebase Unwired Code Audit
 
 **POLICY: Code is never deleted. It was created for a reason. Every finding becomes a "wire it in" issue.**

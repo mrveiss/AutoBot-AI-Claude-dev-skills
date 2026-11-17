@@ -1,10 +1,3 @@
----
-name: review-fleet
-description: Dispatch a 10-angle parallel PR review fleet (finder agents + verifier agents) that posts only confirmed, deduplicated findings to a single PR comment. Use when asked for a high-effort or recall-biased PR review.
-metadata:
-  type: skill
----
-
 # Review Fleet
 
 Dispatches 10 parallel finder agents against a PR diff, runs verifiers on candidates, deduplicates by cross-angle agreement, and posts a single structured comment.

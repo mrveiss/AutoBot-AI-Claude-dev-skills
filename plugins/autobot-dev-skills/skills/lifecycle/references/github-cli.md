@@ -1,8 +1,3 @@
----
-name: github-cli
-description: Use when performing any GitHub operation — issues, PRs, comments, labels, reviews, merges, file contents, branch management, or repository queries. Always prefer gh CLI over GitHub MCP tools.
----
-
 # GitHub CLI (gh)
 
 Use `gh` for all GitHub operations. Never use browser automation or GitHub MCP tools when `gh` will do.

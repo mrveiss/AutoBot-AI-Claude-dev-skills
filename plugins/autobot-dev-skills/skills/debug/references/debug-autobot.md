@@ -1,8 +1,3 @@
----
-name: debug-autobot
-description: Debug any AutoBot failure across the full stack — dispatches parallel investigators per layer (Vue, FastAPI, Redis, ChromaDB, NPU, Browser, AI Stack), then synthesises their reports into a single root cause. Use for any bug whose layer is unknown, any cross-layer symptom, or when a fix in one layer did not hold.
----
-
 # /debug-autobot - Complete AutoBot Stack Debugging
 
 > **Hosts.** The commands below use `$REDIS_HOST`, `$NPU_HOST`, `$BROWSER_HOST`, and
