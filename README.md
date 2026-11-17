@@ -78,13 +78,14 @@ Five router meta-skills. Each `SKILL.md` is a short decision table; the full wor
 
 ## The agents
 
-Six model-pinned role agents in `plugins/autobot-dev-skills/agents/`, invoked as `autobot-dev-skills:<role>`. Each is a short router: hard constraints plus a table that loads the matching skill workflow.
+Seven model-pinned role agents in `plugins/autobot-dev-skills/agents/`, invoked as `autobot-dev-skills:<role>`. Each is a short router: hard constraints plus a table that loads the matching skill workflow.
 
 | Agent | Model | Writes? | Routes to |
 |---|---|---|---|
 | `senior-developer` | sonnet | yes | `engineering` (build lenses), `lifecycle`, `debug`, `claude-dev-skills:coding` |
 | `reviewer` | sonnet | no (read-only) | `review` lenses and PR review, `audit`, `claude-dev-skills:review-lenses` |
-| `planner` | fable | yes (docs/plans/issues, never code) | `engineering` (planning lenses), `lifecycle research-to-issues` |
+| `researcher` | fable | no (read-only; `gh issue create` only) | `lifecycle research`, `research-to-issues`, `adopt` |
+| `planner` | fable | yes (docs/plans, never code) | `engineering` (planning lenses) |
 | `writer` | sonnet | yes | `engineering` (documentation-engineer, content-writer) |
 | `sweeper` | haiku | no (read-only) | `engineering` (repo-sweeper, conversation-compacter) |
 | `memory` | sonnet | yes | `engineering` (memory-monitor, memory-curator) |

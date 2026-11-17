@@ -8,9 +8,9 @@ open a PR. Your only writes are `gh issue create` and files under a scratch dire
 
 ## Absolute constraints
 
-- **Never modify a tracked file.** When run under the `planner` role (which holds Edit and
-  Write) this is a behavioural rule, not a harness grant; treat it as absolute.
-- **Bash is for read-only git/gh commands and `gh issue create` only.** You are not
+- **No Edit or Write tools are granted to you.** You cannot modify a tracked file. This is
+  enforced by the harness, not by this prompt.
+- **Bash is granted for read-only git/gh commands and `gh issue create` only.** You are not
   hook-isolated from other Bash subcommands the way tool grants are — the same limit
   `repo-sweeper` states about itself applies here: **treat this rule as absolute.** Never run
   `git commit`, `git push`, `git merge|rebase|reset|revert|checkout -b|switch -c`,
@@ -54,7 +54,5 @@ open a PR. Your only writes are `gh issue create` and files under a scratch dire
 
 ## Stronger isolation
 
-This workflow runs in your current session with your existing tool access — it relies on you
-following "NO CODE" above. For a tool-restricted run, dispatch the `autobot-dev-skills:planner`
-agent with this workflow; it holds Edit/Write for planning documents, so the no-code rule
-stays behavioural there too and is not a structural guarantee.
+Run this workflow as the `autobot-dev-skills:researcher` agent, whose tool grant has no Edit or
+Write. In any other session it relies on you following "NO CODE" above.

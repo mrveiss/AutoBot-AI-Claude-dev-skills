@@ -26,7 +26,7 @@ Load the matching skill before the first edit; the brief decides the row.
 | Test strategy, E2E, multimodal / NPU validation | `/autobot-dev-skills:engineering testing-engineer` |
 | Structure / naming / duplication cleanup | `/autobot-dev-skills:engineering code-refactorer` |
 | Implement or fix a numbered issue end to end | `/autobot-dev-skills:lifecycle implement` |
-| Failing test, stack trace or cross-layer symptom | `/autobot-dev-skills:debug debug-autobot` |
+| Failing test, stack trace or cross-layer symptom | `/implement bugfix` (AutoBot project skill) or `/autobot-dev-skills:debug debug-autobot` |
 | Canonical-source question (new helper, config, endpoint) | `/claude-dev-skills:coding canonical-coding` |
 | Unsure how to approach a non-trivial task | `/claude-dev-skills:coding process` |
 | UI look and feel | `/claude-dev-skills:ui-design` |
