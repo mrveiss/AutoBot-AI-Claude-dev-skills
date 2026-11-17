@@ -84,7 +84,7 @@ Seven model-pinned role agents in `plugins/autobot-dev-skills/agents/`, invoked 
 |---|---|---|---|
 | `senior-developer` | sonnet | yes | `engineering` (build lenses), `lifecycle`, `debug`, `claude-dev-skills:coding` |
 | `reviewer` | sonnet | no (read-only) | `review` lenses and PR review, `audit`, `claude-dev-skills:review-lenses` |
-| `researcher` | fable | no (read-only; `gh issue create` only) | `lifecycle research`, `research-to-issues`, `adopt` |
+| `researcher` | fable | no (read-only; writes only `gh issue create` and the POST `sub_issues` / `dependencies/blocked_by` links) | `lifecycle research`, `research-to-issues`, `adopt` |
 | `planner` | fable | yes (docs/plans, never code) | `engineering` (planning lenses) |
 | `writer` | sonnet | yes | `engineering` (documentation-engineer, content-writer) |
 | `sweeper` | haiku | no (read-only) | `engineering` (repo-sweeper) |
