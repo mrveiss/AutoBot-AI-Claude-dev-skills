@@ -95,11 +95,14 @@ WORKTREE_PATH="${REPO_ROOT}/.worktrees/issue-${TEST_ISSUE}"
 
 # Remove if exists from previous failed attempt
 if [[ -d "$WORKTREE_PATH" ]]; then
-    git worktree remove "$WORKTREE_PATH" --force 2>/dev/null || rm -rf "$WORKTREE_PATH"
+    # Non-force: a dirty or owned tree refusing to go is information - STOP and ask its owner
+    git worktree remove "$WORKTREE_PATH" || { echo "STOP: $WORKTREE_PATH not removable (dirty or owned)"; exit 1; }
 fi
 
-# Create fresh worktree from main
-git worktree add "$WORKTREE_PATH" main
+# Create fresh worktree off origin/main on branch issue-N, and claim it
+git fetch origin main -q
+git worktree add "$WORKTREE_PATH" -b "issue-${TEST_ISSUE}" origin/main
+ledger claim worktree "issue-${TEST_ISSUE}" --ttl 168h
 
 # Verify creation
 if [[ ! -d "$WORKTREE_PATH/.git" ]]; then
@@ -124,9 +127,9 @@ Task(
     Implement GitHub issue #{TEST_ISSUE}:
     1. cd {WORKTREE_PATH}
     2. Verify you can read/write files
-    3. Create a feature branch: git checkout -b fix/issue-{TEST_ISSUE}
-    4. Make one small change (add a comment to verify write access)
-    5. git add . && git commit -m "test: verify worktree works (#{TEST_ISSUE})"
+    3. Confirm the branch is issue-{TEST_ISSUE}: git branch --show-current
+    4. Verify write access without leaving changes: touch .write-check && rm .write-check
+    5. Confirm git status is clean (nothing to commit)
     6. Report success or failure
 
     If ANY step fails (permission error, git error), report immediately and exit.
@@ -151,7 +154,8 @@ else
 fi
 
 # Clean up test worktree
-cd - && git worktree remove "$WORKTREE_PATH" --force
+cd - && git worktree remove "$WORKTREE_PATH" && git branch -d "issue-${TEST_ISSUE}" \
+    && ledger release worktree "issue-${TEST_ISSUE}"  # non-force: a dirty tree refusing is information
 ```
 
 **If test fails:** Skip to Fallback Sequential Implementation section below.
@@ -166,13 +170,15 @@ cd - && git worktree remove "$WORKTREE_PATH" --force
 ISSUES=(123 456 789)  # From user's list
 
 for ISSUE in "${ISSUES[@]}"; do
-    WORKTREE_PATH="../worktrees/issue-${ISSUE}"
+    WORKTREE_PATH=".worktrees/issue-${ISSUE}"
 
     # Clean up if exists
-    [[ -d "$WORKTREE_PATH" ]] && git worktree remove "$WORKTREE_PATH" --force 2>/dev/null
+    # Non-force: if it refuses, the tree is dirty or owned - skip this issue and report it
+    [[ -d "$WORKTREE_PATH" ]] && { git worktree remove "$WORKTREE_PATH" || { echo "SKIP #${ISSUE}: not removable"; continue; }; }
 
-    # Create fresh worktree
-    git worktree add "$WORKTREE_PATH" main
+    # Create fresh worktree off origin/main on branch issue-N, and claim it
+    git worktree add "$WORKTREE_PATH" -b "issue-${ISSUE}" origin/main
+    ledger claim worktree "issue-${ISSUE}" --ttl 168h
 
     echo "✅ Created worktree for issue #${ISSUE}"
 done
@@ -199,11 +205,11 @@ Task(
 
     Implement GitHub issue #123:
     1. cd .worktrees/issue-123 && pwd
-    2. git checkout -b fix/issue-123
+    2. git branch --show-current   # must be issue-123 (created with the worktree)
     3. Implement the full issue
-    4. Run tests and verify
+    4. Run targeted lint/type/guard checks only (no local test runs - CI is the gate)
     5. Commit: git commit -m "feat: description (#123)"
-    6. Push: git push -u origin fix/issue-123
+    6. Push: git push -u origin issue-123
     7. Report: files changed, tests status, branch name
 
     Timeout: 30 minutes. If blocked, report and exit.
@@ -214,7 +220,7 @@ Task(
     subagent_type="senior-backend-engineer",
     description="Implement issue #456",
     prompt="""
-    WORKTREE: ../worktrees/issue-456
+    WORKTREE: .worktrees/issue-456
 
     Implement GitHub issue #456 in isolation:
     [Same instructions as above, but for #456]
@@ -225,7 +231,7 @@ Task(
     subagent_type="senior-backend-engineer",
     description="Implement issue #789",
     prompt="""
-    WORKTREE: ../worktrees/issue-789
+    WORKTREE: .worktrees/issue-789
 
     Implement GitHub issue #789 in isolation:
     [Same instructions as above, but for #789]
@@ -254,7 +260,7 @@ echo "=========================="
 
 ISSUES=(123 456 789)
 for ISSUE in "${ISSUES[@]}"; do
-    WORKTREE_PATH="../worktrees/issue-${ISSUE}"
+    WORKTREE_PATH=".worktrees/issue-${ISSUE}"
 
     if [[ -d "$WORKTREE_PATH" ]]; then
         cd "$WORKTREE_PATH"
@@ -265,7 +271,7 @@ for ISSUE in "${ISSUES[@]}"; do
         # Check if commits were made
         COMMITS=$(git log main..HEAD --oneline | wc -l)
 
-        # Check if tests passed (look for pytest output in agent logs)
+        # Tests are not run locally - CI is the gate (check `gh pr checks` after the PR is open)
 
         echo "Issue #${ISSUE}:"
         echo "  Branch: $BRANCH"
@@ -284,7 +290,7 @@ done
 
 ```bash
 for ISSUE in "${ISSUES[@]}"; do
-    WORKTREE_PATH="../worktrees/issue-${ISSUE}"
+    WORKTREE_PATH=".worktrees/issue-${ISSUE}"
 
     if [[ -d "$WORKTREE_PATH" ]]; then
         cd "$WORKTREE_PATH"
@@ -294,14 +300,25 @@ for ISSUE in "${ISSUES[@]}"; do
         git push -u origin "$BRANCH" 2>/dev/null || echo "Already pushed"
 
         # Create PR
+        BODY_FILE=$(mktemp)
+        cat > "$BODY_FILE" <<EOB
+## Thinking Path
+Implements #${ISSUE}, developed in a parallel worktree by an automated agent.
+
+## What Changed
+$(git log origin/main..HEAD --pretty='- %s')
+
+## Verification
+Targeted lint/type/guard checks run before push; CI is the test gate.
+
+## Model Used
+<model id>
+EOB
         gh pr create \
             --base main \
             --title "$(git log -1 --pretty=%s)" \
-            --body "Implements #${ISSUE}
-
-Developed in parallel worktree by automated agent.
-
-🤖 Generated with Claude Code - Parallel Dispatch" || echo "PR may already exist"
+            --body-file "$BODY_FILE" || echo "PR may already exist"
+        rm -f "$BODY_FILE"
 
         cd - >/dev/null
     fi
@@ -343,11 +360,13 @@ done
 ISSUES=(123 456 789)
 
 for ISSUE in "${ISSUES[@]}"; do
-    WORKTREE_PATH="../worktrees/issue-${ISSUE}"
+    WORKTREE_PATH=".worktrees/issue-${ISSUE}"
 
     if [[ -d "$WORKTREE_PATH" ]]; then
         echo "Removing worktree for issue #${ISSUE}..."
-        git worktree remove "$WORKTREE_PATH" --force
+        # Non-force, only after the branch is pushed and its PR merged
+        git worktree remove "$WORKTREE_PATH" && ledger release worktree "issue-${ISSUE}" \
+            || echo "Kept #${ISSUE}: dirty or unmerged - a refusal is information"
     fi
 done
 
@@ -364,7 +383,7 @@ echo "✅ All worktrees cleaned up"
 
 **If multiple agents fail:**
 - STOP parallel dispatch
-- Check worktree permissions: `ls -la ../worktrees/`
+- Check worktree permissions: `ls -la .worktrees/`
 - Check disk space: `df -h`
 - Fall back to sequential implementation
 
@@ -398,14 +417,14 @@ echo "✅ All worktrees cleaned up"
 ## Troubleshooting
 
 **Error: "fatal: cannot create worktree"**
-- Fix: `rm -rf ../worktrees/issue-XXX && git worktree prune`
+- Fix: `git worktree remove .worktrees/issue-XXX` (non-force; a dirty tree refusing is information), then `git worktree prune`
 
 **Error: "permission denied"**
-- Fix: `chmod -R 755 ../worktrees/`
+- Fix: `chmod -R 755 .worktrees/`
 
 **Error: "cannot lock ref"**
 - Fix: Another worktree is using that branch - choose different branch name
 
 **Error: "disk quota exceeded"**
 - Fix: Clean up old worktrees: `git worktree prune`
-- Check space: `du -sh ../worktrees/`
+- Check space: `du -sh .worktrees/`

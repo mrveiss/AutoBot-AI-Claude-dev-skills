@@ -52,7 +52,6 @@ ledger iam <session> && ledger claim worktree issue-<n> --ttl 168h
 
 ## Step 5 — Verify
 ```bash
-pytest <test_dir>
 git diff --name-only | grep '\.py$' | xargs flake8 --max-line-length=100
 mypy <files>
 ```
@@ -172,20 +171,20 @@ Before making ANY code changes:
 
 ## Implementation Phase
 
-6. **Search memory for context:**
+5. **Search memory for context:**
    - Use `mcp__memory__search_nodes` to find relevant past work
    - Check for related issues or patterns
 
-7. **Create implementation plan:**
+6. **Create implementation plan:**
    - Break work into 3-10 subtasks
    - Add subtasks as checklist to GitHub issue
    - Identify backend vs frontend work
    - Plan commit checkpoints (every 2-3 logical tasks)
 
-8. **Implement using incremental edits:**
+7. **Implement using incremental edits:**
    - Use `Edit` for existing files >50 lines (NOT Write)
    - Focus on one subtask at a time
-   - Run relevant tests after each subtask
+   - Run targeted lint/type/guard checks after each subtask (no local test runs - CI is the gate)
    - **Commit after completing each logical group (2-3 subtasks)**
 
    **Commit pattern:**
@@ -196,31 +195,28 @@ Before making ANY code changes:
    git diff           # Verify nothing left uncommitted
    ```
 
-9. **For multi-phase work (backend + frontend):**
+8. **For multi-phase work (backend + frontend):**
    - Complete and commit backend FIRST
    - Then start frontend
    - Commit frontend when complete
-   - Run full test suite
+   - Push and let CI run the full suite
 
 ## Verification Phase
 
-10. **Run tests:**
+9. **Targeted checks (no local test runs - CI is the gate):**
     ```bash
-    # Backend
-    python -m pytest {affected_test_files}
-
-    # Frontend (if applicable)
-    npm run test {affected_components}
+    # Backend: lint/type/guards for touched files only
+    # Frontend (if applicable): vue-tsc / eslint for touched components
     ```
 
-11. **Pre-commit validation:**
+10. **Pre-commit validation:**
     - Run `git diff --staged` before committing
     - Verify no unintended files are staged
     - If pre-commit hooks fail, fix the issue (don't bypass)
 
 ## PR & Merge Phase
 
-15. **Close issue** — run the closure gates first ([`CLAUDE_CLOSURE.md`](https://github.com/mrveiss/AutoBot-AI/blob/main/docs/developer/CLAUDE_CLOSURE.md)):
+11. **Close issue** — run the closure gates first ([`CLAUDE_CLOSURE.md`](https://github.com/mrveiss/AutoBot-AI/blob/main/docs/developer/CLAUDE_CLOSURE.md)):
     ```bash
     gh issue close {issue_number} --comment "Implemented in PR #{pr_number}. Gate 2 clear.
 
@@ -229,7 +225,7 @@ Before making ANY code changes:
     - \"<exact AC text>\" — ❌ NOT met → follow-up #XXXX"
     ```
 
-16. **Store in memory:**
+12. **Store in memory:**
     - Use `mcp__memory__create_entities` to record:
       - What was implemented
       - Key technical decisions
@@ -410,4 +406,4 @@ gh issue create \
 
 > "Were there any gaps or issues discovered while implementing? Do all discoveries have a GitHub issue?"
 
-If yes → run this skill immediately for each discovery before closing the original issue.
+If yes → run this workflow immediately for each discovery before closing the original issue.

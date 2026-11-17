@@ -95,9 +95,7 @@ gh issue view <n> --json state -q '.state'   # CLOSED → abort
 # Type-check (frontend)
 cd autobot-frontend && npx vue-tsc --noEmit -p tsconfig.app.json
 
-# Tests for affected files
-npx vitest run src/.../__tests__/<relevant>.test.ts
-# or: pytest autobot-backend/<path> -xvs
+# No local test runs - CI is the gate; run only targeted lint/type/guards
 
 # Extraction PRs only — behavioral grep audit (before/after; after-count must be 0)
 grep -rnE "<behavior-pattern>" autobot-frontend/src --include="*.vue"

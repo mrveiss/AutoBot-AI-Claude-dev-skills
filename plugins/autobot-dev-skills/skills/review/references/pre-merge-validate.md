@@ -43,10 +43,10 @@ When to use: Validate code before merging — syntax, imports, call-site impact,
    - Block if any callers found
 10. For changed signatures — compare old vs new `def $symbol(` line; block if unchanged callers exist
 
-**Gate 3 — Targeted Test Run**
+**Gate 3 — Targeted Test Coverage (CI is the test gate; no local test runs)**
 11. Map `autobot-backend/services/kb_service.py` → `autobot-backend/tests/test_kb_service.py`
-12. Run: `cd autobot-backend && pytest $TEST_FILES -x --tb=short -q`
-    - Block on test failure; Skip if no matching test files found
+12. Check that a matching test file exists and that its CI check passed: `gh pr checks <pr>`
+    - Block on a failed CI test check; Skip if no matching test files found
 
 **Gate 4 — Frontend Type Check (conditional)**
 13. Check: `git diff origin/main...$BRANCH --name-only | grep -c "^autobot-frontend"`
