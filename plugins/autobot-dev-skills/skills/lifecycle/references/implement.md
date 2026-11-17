@@ -1,4 +1,6 @@
 When to use: End-to-end GitHub issue implementation — umbrella gate, worktree, design, code, verify, PR, CI, and the three-gate closure check. Use when told to implement, fix, or solve a specific issue number, or when picking the next issue off the backlog. Supersedes the former `issue` skill.
+When to use: Complete GitHub issue implementation workflow with built-in guardrails
+When to use: Complete GitHub issue creation workflow with required type, area, and priority labels
 
 # /autobot-dev-skills:lifecycle implement — End-to-End Issue Implementation
 
@@ -125,3 +127,342 @@ gh issue view <n> --json state            # Closes fired at merge; Refs → clos
 - [ ] PR targets `main` with the four required headings; smoke-test green; not behind base
 - [ ] Every new module has ≥1 caller, or a wire-in issue is filed and referenced
 - [ ] Handed to the trainmaster (PR number + head); `Closes` only if every AC is delivered, else `Refs`; AC evidence posted after merge
+
+---
+
+## Folded from the former AutoBot `implement` skill
+
+Text below is the former project-level `implement` skill, kept verbatim. Where it disagrees with Steps 0-12 above (worktree-per-task, implementers never merge), Steps 0-12 win.
+
+# Implement GitHub Issue
+
+Complete workflow for implementing a GitHub issue from investigation through PR creation, merge, and cleanup.
+
+## Pre-Flight Checks (MANDATORY - run first)
+
+Before making ANY code changes:
+
+1. **Verify branch state:**
+   ```bash
+   git branch --show-current
+   git status
+   git stash list
+   ```
+   - If on wrong branch, STOP and ask user
+   - If uncommitted changes exist, STOP and ask user how to handle
+   - If stashes exist, STOP and ask user how to handle
+
+2. **Fetch issue details:**
+   ```bash
+   gh issue view {issue_number}
+   ```
+   - Verify issue is still open
+   - Read full description and acceptance criteria
+   - Check for linked PRs or existing branches
+
+3. **Check for existing work:**
+   ```bash
+   gh pr list | grep {issue_number}
+   git branch -a | grep {issue_number}
+   ```
+   - If PR/branch exists, STOP and ask user
+
+4. **Verify target merge branch:**
+   ```bash
+   git fetch origin main
+   git log --oneline origin/main -3
+   ```
+   - Confirm main is the target (unless explicitly told otherwise)
+
+## Implementation Phase
+
+5. **Create feature branch:**
+   ```bash
+   git checkout -b fix/issue-{issue_number} main
+   ```
+
+6. **Search memory for context:**
+   - Use `mcp__memory__search_nodes` to find relevant past work
+   - Check for related issues or patterns
+
+7. **Create implementation plan:**
+   - Break work into 3-10 subtasks
+   - Add subtasks as checklist to GitHub issue
+   - Identify backend vs frontend work
+   - Plan commit checkpoints (every 2-3 logical tasks)
+
+8. **Implement using incremental edits:**
+   - Use `Edit` for existing files >50 lines (NOT Write)
+   - Focus on one subtask at a time
+   - Run relevant tests after each subtask
+   - **Commit after completing each logical group (2-3 subtasks)**
+
+   **Commit pattern:**
+   ```bash
+   git add <files-for-this-group>
+   git commit -m "<type>(scope): <description> (#{issue_number})"
+   git log -1 --stat  # Verify commit landed
+   git diff           # Verify nothing left uncommitted
+   ```
+
+9. **For multi-phase work (backend + frontend):**
+   - Complete and commit backend FIRST
+   - Then start frontend
+   - Commit frontend when complete
+   - Run full test suite
+
+## Verification Phase
+
+10. **Run tests:**
+    ```bash
+    # Backend
+    python -m pytest {affected_test_files}
+
+    # Frontend (if applicable)
+    npm run test {affected_components}
+    ```
+
+11. **Pre-commit validation:**
+    - Run `git diff --staged` before committing
+    - Verify no unintended files are staged
+    - If pre-commit hooks fail, fix the issue (don't bypass)
+
+## PR & Merge Phase
+
+12. **Push and create PR:**
+    ```bash
+    git push -u origin fix/issue-{issue_number}
+
+    gh pr create \
+      --base main \
+      --title "fix: <clear title> (#{issue_number})" \
+      --body "$(cat <<'EOF'
+    ## Summary
+    Fixes #{issue_number}
+
+    <1-3 bullet points summarizing changes>
+
+    ## Changes
+    - <specific change 1>
+    - <specific change 2>
+
+    ## Testing
+    - [ ] Backend tests pass
+    - [ ] Frontend tests pass (if applicable)
+    - [ ] Manual testing completed
+
+    🤖 Generated with Claude Code
+    EOF
+    )"
+    ```
+
+13. **Merge PR:**
+    ```bash
+    # Verify PR is approved and CI passes
+    gh pr merge {pr_number} --squash --delete-branch
+    ```
+
+14. **Cleanup:**
+    ```bash
+    git checkout main
+    git pull origin main
+    git branch -d fix/issue-{issue_number}
+    ```
+
+15. **Close issue** — run the closure gates first ([`CLAUDE_CLOSURE.md`](../../../docs/developer/CLAUDE_CLOSURE.md)):
+    ```bash
+    # Gate 2: forward-tracking references block closure (exit 1 → do NOT close)
+    pipeline-scripts/check-issue-close-refs.sh {issue_number}
+
+    gh issue close {issue_number} --comment "Implemented in PR #{pr_number}. Gate 2 clear.
+
+    Acceptance criteria (quoted verbatim from issue body):
+    - \"<exact AC text>\" — ✅ <evidence>
+    - \"<exact AC text>\" — ❌ NOT met → follow-up #XXXX"
+    ```
+    - Gate 1: quote each issue-body AC verbatim — never paraphrase what shipped
+    - Gate 3: if this PR bundled several issues, close {issue_number} only if its FULL AC set is delivered; a subset → check off the subtask and keep it open (or name the follow-up in the same comment)
+
+16. **Store in memory:**
+    - Use `mcp__memory__create_entities` to record:
+      - What was implemented
+      - Key technical decisions
+      - Patterns used
+      - Lessons learned
+
+## Guardrails
+
+**If session is getting long:**
+- Commit completed work immediately
+- Note what's left in issue comment
+- Ask user if should continue or pause
+
+**If implementation is blocked:**
+- Document blocker in issue comment
+- Ask user how to proceed
+- Don't implement workarounds without permission
+
+**If scope expands:**
+- Create new issue for additional work
+- Ask user if should include in current PR or defer
+
+**If tests fail:**
+- Fix failures before creating PR
+- Don't skip tests or mark as "will fix later"
+
+## Success Criteria
+
+✅ All code committed with correct issue references
+✅ All acceptance criteria verified
+✅ Tests passing
+✅ PR created and merged to main
+✅ Feature branch deleted
+✅ Issue closed with summary
+✅ Knowledge stored in memory MCP
+
+---
+
+## Folded from the former AutoBot `issue` skill (filing issues)
+
+Invoke as `/autobot-dev-skills:lifecycle issue` to file an issue: the former `issue` skill, kept verbatim below.
+
+# Create GitHub Issue
+
+Creates a well-labeled GitHub issue with all required metadata for filtering and triage.
+
+## Step 1 — Gather details
+
+If not provided upfront, collect:
+- **Title**: concise, action-oriented ("Fix X", "Add Y", "Refactor Z")
+- **Description**: what's broken or needed, where it is in the codebase, severity/impact
+- **Discovered during**: which issue or PR surfaced this (if applicable)
+
+## Step 2 — Choose labels
+
+**Every issue requires at minimum: one Type + one Priority.**
+
+### Type (pick one)
+| Label | When |
+|-------|------|
+| `bug` | Something broken |
+| `enhancement` | New feature or improvement |
+| `technical-debt` | Cleanup, refactoring |
+| `security` | Security vulnerability or hardening |
+| `performance` | Speed, memory, efficiency |
+| `testing` | Missing or broken tests |
+| `documentation` | Docs gap |
+
+### Area — coarse (pick one or more)
+`backend` · `frontend` · `testing` · `infrastructure` · `docs` · `ci` · `security`
+`database` · `deployment` · `configuration` · `monitoring` · `mcp` · `rag` · `agents`
+`memory` · `analytics` · `ai-ml` · `error-handling` · `optimization`
+
+### Area — cluster (pick exactly one)
+Every issue also carries its `area: <cluster>` label from the backlog dependency waves —
+32 clusters, coloured by wave, listed with `gh label list --search "area: "`. The cluster
+says *which body of work* the issue belongs to; the coarse label says which part of the
+stack it touches. An issue that fits no existing cluster gets the coarse label only, and
+says so in the report.
+
+### Priority (pick one)
+| Label | When |
+|-------|------|
+| `priority: critical` | Data loss, security breach, production down |
+| `priority: high` | Major feature broken, significant user impact |
+| `priority: medium` | Important but workaround exists |
+| `priority: low` | Cosmetic, nice-to-have, minor inconvenience |
+
+## Step 3 — Create issue
+
+```bash
+gh issue create \
+  --title "<title>" \
+  --body "$(cat <<'EOF'
+## Problem
+<what's wrong or needed>
+
+## Location
+<file paths, function names, line numbers>
+
+## Impact
+<who is affected and how>
+
+## Discovered During
+Working on #<original-issue> (if applicable)
+
+## Acceptance Criteria
+- [ ] <criterion 1>
+- [ ] <criterion 2>
+EOF
+)" \
+  --label "<type>,<area>,<priority>"
+```
+
+## Step 4 — Link relationships (native, not prose)
+
+A checklist item and a `Depends on: #N` line are prose — GitHub's hierarchy and dependency
+graphs cannot see them. Record the real edges immediately after creating the issue.
+`sub_issue_id` / `issue_id` take the issue's `id`, never its number.
+
+```bash
+REPO=mrveiss/AutoBot-AI
+
+# Attach to its umbrella
+gh api -X POST repos/$REPO/issues/$UMBRELLA/sub_issues \
+  -F sub_issue_id=$(gh api repos/$REPO/issues/$NEW -q .id)
+
+# One edge per blocker, recorded on the BLOCKED issue
+gh api -X POST repos/$REPO/issues/$NEW/dependencies/blocked_by \
+  -F issue_id=$(gh api repos/$REPO/issues/$BLOCKER -q .id)
+
+# Read back
+gh api repos/$REPO/issues/$UMBRELLA/sub_issues         -q '.[].number'
+gh api repos/$REPO/issues/$NEW/dependencies/blocked_by -q '.[].number'
+```
+
+- One parent per child — re-parenting is `DELETE .../sub_issue -F sub_issue_id=…` then POST.
+- Backfilling from an existing checklist: a row owns **at most one** issue. Refs in parentheses,
+  or after `blocked by` / `depends on` / `unblocks` / `sub-tree` / `PR`, are commentary — linking
+  them re-parents another umbrella's child, and one-parent-per-child then blocks the real parent.
+- A duplicate POST returns 422; that means already-linked, not a failure.
+- Hierarchy and dependency are separate graphs — never encode one as the other.
+- Issue *types* are an org-only GitHub feature and 404 here; labels stay the taxonomy.
+
+## Step 5 — Report and ask
+
+```bash
+gh issue view <new-number>   # Confirm creation
+```
+
+Then report:
+```
+Created #<number>: <title>
+Labels: <type> · <area> · <priority>
+Parent: #<umbrella> (native sub-issue) · Blocked by: #<n>, #<n>
+Should I: a) Fix now  b) Finish current issue first  c) Leave for later
+```
+
+## Examples
+
+```bash
+# Bug discovered during implementation
+gh issue create \
+  --title "Bug: query_cache has no max size limit" \
+  --label "bug,backend,rag,priority: medium"
+
+# New feature
+gh issue create \
+  --title "feat: add BM25 scoring to keyword search" \
+  --label "enhancement,backend,rag,performance,priority: medium"
+
+# Security issue
+gh issue create \
+  --title "Security: python-ecdsa Minerva timing attack" \
+  --label "security,backend,priority: high"
+```
+
+## Post-task Gap Check (ALWAYS after completing any task)
+
+> "Were there any gaps or issues discovered while implementing? Do all discoveries have a GitHub issue?"
+
+If yes → run this skill immediately for each discovery before closing the original issue.

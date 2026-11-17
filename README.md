@@ -70,9 +70,9 @@ this repo. On a new machine, they restore the whole workflow.
 
 Four router meta-skills. Each `SKILL.md` is a short decision table; the full workflow is read on demand from its `references/` folder.
 
-- **`lifecycle`** (`autobot-dev-skills:lifecycle`) — the issue-to-merged-PR workflow. Covers the former `session-lifecycle`, `implement`, `batch-implement`, `drain`, `pr` and `github-cli` skills (`references/<old-name>.md`).
+- **`lifecycle`** (`autobot-dev-skills:lifecycle`) — the issue-to-merged-PR workflow. Covers the former `session-lifecycle`, `implement`, `batch-implement`, `drain`, `pr` and `github-cli` skills plus the absorbed AutoBot project skills `issue` (folded into `implement`), `commit`, `parallel`, `deploy`, `research`, `research-to-issues` and `adopt` (`references/<old-name>.md`).
 - **`review`** (`autobot-dev-skills:review`) — PR review and validation. Covers `review`, `review-fleet` and `pre-merge-validate`.
-- **`audit`** (`autobot-dev-skills:audit`) — unwired-code and API-contract audits. Covers `api-wiring-audit` and `dead-code-audit`.
+- **`audit`** (`autobot-dev-skills:audit`) — unwired-code and API-contract audits. Covers `api-wiring-audit` and `dead-code-audit` (which also holds the former AutoBot `dead-code-review`).
 - **`debug`** (`autobot-dev-skills:debug`) — full-stack debugging across layers. Covers `debug-autobot`.
 
 ## Configuration
