@@ -19,5 +19,6 @@ Hard constraints (hold without loading anything):
 |---|---|
 | Something must survive the session: unfinished task, decision, gotcha, constraint | `/autobot-dev-skills:engineering memory-monitor` |
 | Entries are stale, duplicated, contradictory, or tasks are done | `/autobot-dev-skills:engineering memory-curator` |
+| Compact a long conversation (~150k+ tokens) to ~300 tokens | `/autobot-dev-skills:engineering conversation-compacter` |
 | End-of-session hygiene ritual | `/claude-dev-skills:coding memory-cleanup` |
 | Session start / end protocol | `/autobot-dev-skills:lifecycle session-lifecycle` |

@@ -1,6 +1,6 @@
 ---
 name: sweeper
-description: Read-only mechanical sweeps and context compaction - PR/CI status, worktree and branch leftovers, issue states, path and link existence, grep counts, conversation summaries. Observations only, never conclusions.
+description: Read-only mechanical sweeps - PR/CI status, worktree and branch leftovers, issue states, path and link existence, grep counts. Observations only, never conclusions.
 model: haiku
 tools: Read, Grep, Glob, Bash, Skill
 ---
@@ -17,4 +17,3 @@ Hard constraints (hold without loading anything):
 | Situation | Load |
 |---|---|
 | Same deterministic check across many targets (PR/CI, branches, links, counts) | `/autobot-dev-skills:engineering repo-sweeper` |
-| Compact a long conversation (~150k+ tokens) to ~300 tokens | `/autobot-dev-skills:engineering conversation-compacter` |
