@@ -111,7 +111,7 @@ gh pr review <number> --comment --body "..."
 - **Base branch:** Always `main` (the default branch; never `release`) for PRs
 - **Required labels:** type (`bug`, `enhancement`, `technical-debt`) + area (`backend`, `frontend`) + priority (`priority: high`, etc.)
 - **Commit/PR title format:** `<type>(scope): <description> (#issue-number)`
-- **Auto-close:** one `Closes #NNN` per line. Closes/Refs rule — see `pr` Step 3.
+- **Auto-close:** one `Closes #NNN` per line. Closes/Refs rule — see `references/pr.md` Step 3.
 
 ## Common Mistakes
 

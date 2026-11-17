@@ -68,36 +68,16 @@ this repo. On a new machine, they restore the whole workflow.
 
 ## The skills
 
-### Issue → merge
+Four router meta-skills. Each `SKILL.md` is a short decision table; the full workflow is read on demand from its `references/` folder.
 
-- **`batch-implement`** — Full implement→review→merge→close→discover loop for a list of GitHub issues, with self-healing retry and per-issue verification.
-- **`implement`** — End-to-end GitHub issue implementation — umbrella gate, worktree, design, code, verify, PR, CI, and the three-gate closure check
-- **`pr`** — Create a pull request with pre-flight branch checks, targeting main by default
-- **`pre-merge-validate`** — Validate code before merging — syntax, imports, call-site impact, tests, types, and linting
-- **`drain`** — Pick and solve the backlog issues that need no decision
-
-### Review
-
-- **`review`** — Run a PR review cycle — CI diagnosis, a three-angle finder pass, lint-only auto-fix, and the merge decision
-- **`review-fleet`** — Dispatch a 10-angle parallel PR review fleet (finder agents + verifier agents) that posts only confirmed, deduplicated findings to a single PR comment
-
-### Audit
-
-- **`api-wiring-audit`** — Audit and enforce frontend/backend API contract wiring in AutoBot-AI (or any FastAPI + SPA monorepo)
-- **`dead-code-audit`** — Systematic codebase audit for unwired code — identify unregistered routers, uninvoked hooks, orphaned components, and file discovery issues
-
-### Debug
-
-- **`debug-autobot`** — Debug any AutoBot failure across the full stack — dispatches parallel investigators per layer (Vue, FastAPI, Redis, ChromaDB, NPU, Browser, AI Stack),
-
-### Platform & session
-
-- **`github-cli`** — Use when performing any GitHub operation — issues, PRs, comments, labels, reviews, merges, file contents, branch management, or repository queries
-- **`session-lifecycle`** — Mandatory start-of-session and end-of-session protocol for every Claude Code session in this repository
+- **`lifecycle`** (`autobot-dev-skills:lifecycle`) — the issue-to-merged-PR workflow. Covers the former `session-lifecycle`, `implement`, `batch-implement`, `drain`, `pr` and `github-cli` skills (`references/<old-name>.md`).
+- **`review`** (`autobot-dev-skills:review`) — PR review and validation. Covers `review`, `review-fleet` and `pre-merge-validate`.
+- **`audit`** (`autobot-dev-skills:audit`) — unwired-code and API-contract audits. Covers `api-wiring-audit` and `dead-code-audit`.
+- **`debug`** (`autobot-dev-skills:debug`) — full-stack debugging across layers. Covers `debug-autobot`.
 
 ## Configuration
 
-`debug-autobot` reads service hosts from environment variables — export them from your deployment
+The `debug` skill (`references/debug-autobot.md`) reads service hosts from environment variables — export them from your deployment
 before use, never hardcode addresses:
 
 ```bash

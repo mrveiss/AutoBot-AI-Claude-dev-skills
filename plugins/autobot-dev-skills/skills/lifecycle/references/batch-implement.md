@@ -1,9 +1,9 @@
-# /batch-implement — Full Issue Resolution Loop
+# autobot-dev-skills:lifecycle (references/batch-implement.md) — Full Issue Resolution Loop
 
 ```bash
-/batch-implement 4703 4704 4705          # explicit issue numbers
-/batch-implement --label bug             # all open issues with label
-/batch-implement --label bug --limit 9   # cap at N
+autobot-dev-skills:lifecycle (references/batch-implement.md) 4703 4704 4705          # explicit issue numbers
+autobot-dev-skills:lifecycle (references/batch-implement.md) --label bug             # all open issues with label
+autobot-dev-skills:lifecycle (references/batch-implement.md) --label bug --limit 9   # cap at N
 ```
 
 **Core rule:** Agents commit locally. Main session always pushes.
@@ -122,7 +122,7 @@ Fix inline and re-push if validation fails, unless the head is queued in a train
 
 ## Step 6: Land
 
-Hand off to the trainmaster's merge train — see `pr` Step 5.
+Hand off to the trainmaster's merge train — see `references/pr.md` Step 5.
 
 ```bash
 git fetch origin && git log origin/main --oneline --grep="#<n>" | head -1  # confirm landed
@@ -132,7 +132,7 @@ git fetch origin && git log origin/main --oneline --grep="#<n>" | head -1  # con
 
 ## Step 7: Close with Proof
 
-Closes/Refs rule — see `pr` Step 3.
+Closes/Refs rule — see `references/pr.md` Step 3.
 
 ```bash
 gh issue comment <n> --body-file <file>   # merged commit <sha>, per-AC evidence, discoveries

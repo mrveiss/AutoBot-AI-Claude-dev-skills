@@ -1,4 +1,4 @@
-# /pr - Create Pull Request
+# autobot-dev-skills:lifecycle (references/pr.md) - Create Pull Request
 
 Target: `main` (the default branch; never `release`, the stable branch). There is no open-PR cap.
 

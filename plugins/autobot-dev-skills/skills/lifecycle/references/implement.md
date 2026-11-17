@@ -1,4 +1,4 @@
-# /implement — End-to-End Issue Implementation
+# autobot-dev-skills:lifecycle (references/implement.md) — End-to-End Issue Implementation
 
 Read your assigned step from the umbrella issue before proceeding.
 
@@ -91,9 +91,9 @@ gh pr create --base main --title "<type>(scope): <title> (#<n>)" --body-file <fi
 - Merge gates (red never merges, 0 behind, `BLOCKED` resting state, `--admin` scope) — see `review` Merge Decision. Implementers never merge.
 
 ## Step 10 — Hand off
-- Hand off to the trainmaster's merge train — see `pr` Step 5.
+- Hand off to the trainmaster's merge train — see `references/pr.md` Step 5.
 - Must wait: post ONE comment, set status `in_review`, STOP. Never busy-poll.
-- Closes/Refs rule — see `pr` Step 3.
+- Closes/Refs rule — see `references/pr.md` Step 3.
 
 ## Step 11 — Three-gate closure check (MANDATORY)
 ```bash

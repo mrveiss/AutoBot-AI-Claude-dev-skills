@@ -121,7 +121,7 @@ If zero confirmed findings: post "Review Fleet found no confirmed issues across 
 
 ## Wiring into the Agent Orchestrator's Wake Payload
 
-When a wake payload contains `{"type": "pr_review", "effort": "high"}` or `{"type": "pr_review", "fleet": true}`, trigger this skill automatically by including `/review-fleet <PR_NUMBER>` in the agent prompt.
+When a wake payload contains `{"type": "pr_review", "effort": "high"}` or `{"type": "pr_review", "fleet": true}`, trigger this skill automatically by including `autobot-dev-skills:review (references/review-fleet.md) <PR_NUMBER>` in the agent prompt.
 
 ## Regression Test
 
@@ -129,6 +129,6 @@ To verify the fleet catches known bugs, run against a PR known to have issues:
 ```bash
 # Pick a PR with known IDOR or privilege escalation finding from history
 KNOWN_BUGGY_PR=<pr-number-from-history>
-/review-fleet $KNOWN_BUGGY_PR --dry-run   # Verify prompts look right
-/review-fleet $KNOWN_BUGGY_PR             # Run and confirm finding appears in output
+autobot-dev-skills:review (references/review-fleet.md) $KNOWN_BUGGY_PR --dry-run   # Verify prompts look right
+autobot-dev-skills:review (references/review-fleet.md) $KNOWN_BUGGY_PR             # Run and confirm finding appears in output
 ```

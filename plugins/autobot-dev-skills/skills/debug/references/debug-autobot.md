@@ -1,4 +1,4 @@
-# /debug-autobot - Complete AutoBot Stack Debugging
+# autobot-dev-skills:debug (references/debug-autobot.md) - Complete AutoBot Stack Debugging
 
 > **Hosts.** The commands below use `$REDIS_HOST`, `$NPU_HOST`, `$BROWSER_HOST`, and
 > `$AISTACK_HOST`. Export them from your deployment's service config before running — never
@@ -36,13 +36,13 @@ Investigates bugs across AutoBot's distributed architecture using parallel speci
 ## Usage
 
 ```bash
-/debug-autobot "<symptom>" [--layers <specific layers>]
+autobot-dev-skills:debug (references/debug-autobot.md) "<symptom>" [--layers <specific layers>]
 
 # Full stack investigation
-/debug-autobot "Chat responses are slow"
+autobot-dev-skills:debug (references/debug-autobot.md) "Chat responses are slow"
 
 # Specific layers only
-/debug-autobot "NPU inference failing" --layers npu,backend,redis
+autobot-dev-skills:debug (references/debug-autobot.md) "NPU inference failing" --layers npu,backend,redis
 ```
 
 ## Investigation Agents
@@ -281,7 +281,7 @@ gh issue create --title "Fix: <root cause>" \
 
 **Fix Approach:** <proposed solution>"
 
-/implement <issue-number>
+autobot-dev-skills:lifecycle (references/implement.md) <issue-number>
 ```
 
 ## Example: Real AutoBot Bug
@@ -334,7 +334,7 @@ $ redis-cli -h $REDIS_HOST
 gh issue create --title "Fix: Initialize ChromaDB collection on startup"
 
 # Implement
-/implement <issue>
+autobot-dev-skills:lifecycle (references/implement.md) <issue>
 ```
 
 ## Multi-Layer Debugging Patterns

@@ -1,4 +1,4 @@
-# /dead-code-audit — Codebase Unwired Code Audit
+# autobot-dev-skills:audit (references/dead-code-audit.md) — Codebase Unwired Code Audit
 
 **POLICY: Code is never deleted. It was created for a reason. Every finding becomes a "wire it in" issue.**
 
@@ -13,7 +13,7 @@ Findings are classified, deduplicated against existing issues, and batch-filed a
 ## Usage
 
 ```bash
-/dead-code-audit
+autobot-dev-skills:audit (references/dead-code-audit.md)
 ```
 
 Scans the entire codebase (no arguments). Runs 3 audit agents in parallel, classifies findings, and files issues.

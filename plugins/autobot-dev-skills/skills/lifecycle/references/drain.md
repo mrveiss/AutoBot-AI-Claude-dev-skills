@@ -1,10 +1,10 @@
-# /drain — spend the loop's attention on what it can actually finish
+# autobot-dev-skills:lifecycle (references/drain.md) — spend the loop's attention on what it can actually finish
 
 The loop's scarce resource is **attention**, not filing capacity. Picking the
 oldest open issue blindly burns a tick whenever it turns out to need an answer
 only the owner can give. This selects work that is finishable now.
 
-Selection only. Execution belongs to `batch-implement`; PR mechanics to
+Selection only. Execution belongs to `references/batch-implement.md`; PR mechanics to
 `ci-pipelining.md`. Do not reimplement either here.
 
 ## 1. Land what is already finished, before starting anything
@@ -55,7 +55,7 @@ tick because one issue turned out to be decision-gated.
 
 ## 4. Execute
 
-Hand the chosen numbers to `batch-implement`, which owns worktree → implement →
+Hand the chosen numbers to `references/batch-implement.md`, which owns worktree → implement →
 review → merge → close → cleanup.
 
 ## Hard rules
@@ -66,5 +66,5 @@ review → merge → close → cleanup.
 - **Discovered problems still get filed** (that rule is absolute), just never as
   a substitute for solving something.
 - **A decision-gated issue is posted and skipped, never waited on.**
-- **Evidence before done** — `batch-implement` and the closure gate own this;
+- **Evidence before done** — `references/batch-implement.md` and the closure gate own this;
   do not claim a close without the verifying output.
