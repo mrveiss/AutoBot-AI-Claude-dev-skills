@@ -1,6 +1,8 @@
+When to use: Run a PR review cycle — CI diagnosis, a three-angle finder pass, lint-only auto-fix, and the merge decision. Use when reviewing open PRs, working the review queue, or when a heartbeat tick has no assigned issue.
+
 # Review Skill
 
-Use this skill when running a PR review cycle — either from a heartbeat or manually.
+Use this workflow when running a PR review cycle — either from a heartbeat or manually.
 
 ## Pre-Flight
 

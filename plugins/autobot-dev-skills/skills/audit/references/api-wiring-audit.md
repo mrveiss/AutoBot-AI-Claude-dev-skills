@@ -1,3 +1,5 @@
+When to use: Audit and enforce frontend/backend API contract wiring in AutoBot-AI (or any FastAPI + SPA monorepo). Use this skill whenever the user mentions unwired features, dead buttons, 404s from the GUI, API contract drift, endpoints that "don't exist", unmounted routers, frontend/backend mismatch, or before marking ANY frontend feature complete. Also use it when implementing or modifying any frontend API call, any FastAPI route, or any router registration — run the audit as a completion gate, not just when explicitly asked.
+
 # API Wiring Audit
 
 Detects and fixes the three classes of frontend/backend contract drift:
@@ -70,7 +72,7 @@ python scripts/audit_api_wiring.py --openapi openapi.json --dead-surface
    cd autobot-frontend && npm run gen:types
    ```
 
-## Rules (apply even when the skill wasn't explicitly invoked)
+## Rules (apply even when this workflow wasn't explicitly invoked)
 
 - Never write a frontend API call against a path absent from `openapi.json`. If the endpoint doesn't exist yet, implement the backend route first, dump the spec, then write the frontend call.
 - Frontend components must derive request/response types from `src/types/generated/api.ts`, not hand-typed strings/interfaces. If the generated file lacks the endpoint, that *is* the wiring check failing — fix the backend or regenerate, don't hand-type around it.

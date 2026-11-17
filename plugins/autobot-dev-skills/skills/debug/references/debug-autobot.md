@@ -1,4 +1,6 @@
-# autobot-dev-skills:debug (references/debug-autobot.md) - Complete AutoBot Stack Debugging
+When to use: Debug any AutoBot failure across the full stack — dispatches parallel investigators per layer (Vue, FastAPI, Redis, ChromaDB, NPU, Browser, AI Stack), then synthesises their reports into a single root cause. Use for any bug whose layer is unknown, any cross-layer symptom, or when a fix in one layer did not hold.
+
+# /autobot-dev-skills:debug debug-autobot - Complete AutoBot Stack Debugging
 
 > **Hosts.** The commands below use `$REDIS_HOST`, `$NPU_HOST`, `$BROWSER_HOST`, and
 > `$AISTACK_HOST`. Export them from your deployment's service config before running — never
@@ -36,13 +38,13 @@ Investigates bugs across AutoBot's distributed architecture using parallel speci
 ## Usage
 
 ```bash
-autobot-dev-skills:debug (references/debug-autobot.md) "<symptom>" [--layers <specific layers>]
+/autobot-dev-skills:debug debug-autobot "<symptom>" [--layers <specific layers>]
 
 # Full stack investigation
-autobot-dev-skills:debug (references/debug-autobot.md) "Chat responses are slow"
+/autobot-dev-skills:debug debug-autobot "Chat responses are slow"
 
 # Specific layers only
-autobot-dev-skills:debug (references/debug-autobot.md) "NPU inference failing" --layers npu,backend,redis
+/autobot-dev-skills:debug debug-autobot "NPU inference failing" --layers npu,backend,redis
 ```
 
 ## Investigation Agents
@@ -281,7 +283,7 @@ gh issue create --title "Fix: <root cause>" \
 
 **Fix Approach:** <proposed solution>"
 
-autobot-dev-skills:lifecycle (references/implement.md) <issue-number>
+/autobot-dev-skills:lifecycle implement <issue-number>
 ```
 
 ## Example: Real AutoBot Bug
@@ -334,7 +336,7 @@ $ redis-cli -h $REDIS_HOST
 gh issue create --title "Fix: Initialize ChromaDB collection on startup"
 
 # Implement
-autobot-dev-skills:lifecycle (references/implement.md) <issue>
+/autobot-dev-skills:lifecycle implement <issue>
 ```
 
 ## Multi-Layer Debugging Patterns

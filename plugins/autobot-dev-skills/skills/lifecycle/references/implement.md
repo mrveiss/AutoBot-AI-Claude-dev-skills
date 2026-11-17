@@ -1,4 +1,6 @@
-# autobot-dev-skills:lifecycle (references/implement.md) — End-to-End Issue Implementation
+When to use: End-to-end GitHub issue implementation — umbrella gate, worktree, design, code, verify, PR, CI, and the three-gate closure check. Use when told to implement, fix, or solve a specific issue number, or when picking the next issue off the backlog. Supersedes the former `issue` skill.
+
+# /autobot-dev-skills:lifecycle implement — End-to-End Issue Implementation
 
 Read your assigned step from the umbrella issue before proceeding.
 
@@ -88,7 +90,7 @@ gh pr create --base main --title "<type>(scope): <title> (#<n>)" --body-file <fi
 ## Step 9 — CI
 - `gh pr checks <PR>` — nothing PENDING and `smoke-test` SUCCESS before hand-off. Never busy-poll: one wakeup or Monitor, no sleep loops.
 - Dedupe check-runs to the latest push; sort by `startedAt` — rollup order is not chronological.
-- Merge gates (red never merges, 0 behind, `BLOCKED` resting state, `--admin` scope) — see `review` Merge Decision. Implementers never merge.
+- Merge gates (red never merges, 0 behind, `BLOCKED` resting state, `--admin` scope) — see `references/review.md` Merge Decision. Implementers never merge.
 
 ## Step 10 — Hand off
 - Hand off to the trainmaster's merge train — see `references/pr.md` Step 5.

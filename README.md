@@ -90,7 +90,8 @@ export REDIS_HOST=… NPU_HOST=… BROWSER_HOST=… AISTACK_HOST=…
 .claude-plugin/marketplace.json            the marketplace manifest
 plugins/autobot-dev-skills/
   .claude-plugin/plugin.json               the plugin manifest
-  skills/<name>/SKILL.md                    one skill each
+  skills/<meta>/SKILL.md                    router (decision table)
+  skills/<meta>/references/<workflow>.md   full workflow, read on demand
 ```
 
 ## Updating

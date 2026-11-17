@@ -1,9 +1,11 @@
-# autobot-dev-skills:lifecycle (references/batch-implement.md) — Full Issue Resolution Loop
+When to use: Full implement→review→merge→close→discover loop for GitHub issues. Use this whenever the user says "implement all X-labeled issues", "fix all Y bugs", "run a batch on these issues", or gives a list of issue numbers to work on. Do NOT ask for scope clarification — just run the pre-flight and start.
+
+# /autobot-dev-skills:lifecycle batch-implement — Full Issue Resolution Loop
 
 ```bash
-autobot-dev-skills:lifecycle (references/batch-implement.md) 4703 4704 4705          # explicit issue numbers
-autobot-dev-skills:lifecycle (references/batch-implement.md) --label bug             # all open issues with label
-autobot-dev-skills:lifecycle (references/batch-implement.md) --label bug --limit 9   # cap at N
+/autobot-dev-skills:lifecycle batch-implement 4703 4704 4705          # explicit issue numbers
+/autobot-dev-skills:lifecycle batch-implement --label bug             # all open issues with label
+/autobot-dev-skills:lifecycle batch-implement --label bug --limit 9   # cap at N
 ```
 
 **Core rule:** Agents commit locally. Main session always pushes.

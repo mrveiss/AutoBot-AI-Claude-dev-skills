@@ -1,10 +1,12 @@
-# autobot-dev-skills:review (references/pre-merge-validate.md) — Pre-Merge Validation Gates
+When to use: Validate code before merging — syntax, imports, call-site impact, tests, types, and linting
+
+# /autobot-dev-skills:review pre-merge-validate — Pre-Merge Validation Gates
 
 ## Usage
 ```
-autobot-dev-skills:review (references/pre-merge-validate.md) <PR-number>     # resolve branch via gh pr view
-autobot-dev-skills:review (references/pre-merge-validate.md) issue-<branch>  # use branch name directly
-autobot-dev-skills:review (references/pre-merge-validate.md)                 # validate current branch vs main
+/autobot-dev-skills:review pre-merge-validate <PR-number>     # resolve branch via gh pr view
+/autobot-dev-skills:review pre-merge-validate issue-<branch>  # use branch name directly
+/autobot-dev-skills:review pre-merge-validate                 # validate current branch vs main
 ```
 
 ## Gates
@@ -66,5 +68,5 @@ autobot-dev-skills:review (references/pre-merge-validate.md)                 # v
 ## Integration with /team-implement
 17. In SUCCESS path before `gh pr create`:
     ```bash
-    autobot-dev-skills:review (references/pre-merge-validate.md) issue-$issue || { mark RETRY_QUEUED, Last Failure=VALIDATION_FAILED; return; }
+    /autobot-dev-skills:review pre-merge-validate issue-$issue || { mark RETRY_QUEUED, Last Failure=VALIDATION_FAILED; return; }
     ```

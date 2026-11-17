@@ -1,4 +1,6 @@
-# autobot-dev-skills:lifecycle (references/pr.md) - Create Pull Request
+When to use: Create a pull request with pre-flight branch checks, targeting main by default
+
+# /autobot-dev-skills:lifecycle pr - Create Pull Request
 
 Target: `main` (the default branch; never `release`, the stable branch). There is no open-PR cap.
 

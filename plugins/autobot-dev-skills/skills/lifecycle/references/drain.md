@@ -1,4 +1,6 @@
-# autobot-dev-skills:lifecycle (references/drain.md) — spend the loop's attention on what it can actually finish
+When to use: Pick and solve the backlog issues that need no decision. Use when asked to work the backlog, drain issues, "solve what you can", run the loop autonomously, or whenever a loop tick has no assigned issue. Selects work; delegates execution to batch-implement.
+
+# /autobot-dev-skills:lifecycle drain — spend the loop's attention on what it can actually finish
 
 The loop's scarce resource is **attention**, not filing capacity. Picking the
 oldest open issue blindly burns a tick whenever it turns out to need an answer

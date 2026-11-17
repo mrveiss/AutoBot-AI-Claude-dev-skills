@@ -1,4 +1,6 @@
-# autobot-dev-skills:audit (references/dead-code-audit.md) — Codebase Unwired Code Audit
+When to use: Systematic codebase audit for unwired code — identify unregistered routers, uninvoked hooks, orphaned components, and file discovery issues. All findings become "wire it in" issues — never deletion issues.
+
+# /autobot-dev-skills:audit dead-code-audit — Codebase Unwired Code Audit
 
 **POLICY: Code is never deleted. It was created for a reason. Every finding becomes a "wire it in" issue.**
 
@@ -13,7 +15,7 @@ Findings are classified, deduplicated against existing issues, and batch-filed a
 ## Usage
 
 ```bash
-autobot-dev-skills:audit (references/dead-code-audit.md)
+/autobot-dev-skills:audit dead-code-audit
 ```
 
 Scans the entire codebase (no arguments). Runs 3 audit agents in parallel, classifies findings, and files issues.

@@ -1,19 +1,19 @@
 ---
 name: lifecycle
-description: Use for any AutoBot-AI issue-to-merged-PR work: starting or ending a session, implementing an issue, batches, draining the backlog, opening a PR, or any gh operation. Read the matching reference before acting.
+description: Use for every AutoBot-AI session start and end, and for issue-to-merged-PR work: implementing issues, batches, draining the backlog, opening PRs, any gh operation. Read the matching reference before acting.
 ---
 
 # Issue → PR lifecycle (router)
 
-Read the one reference whose situation matches; do not read the rest.
+Invoke as `/autobot-dev-skills:lifecycle <workflow> [args]`; the first argument selects the row; with no argument, pick the row from the situation. Read only the matching reference.
 
-| Situation | Read |
-|---|---|
-| Session start/end, resume, take over, wrap up, hand off, stale-branch leftovers | `references/session-lifecycle.md` |
-| Told to implement/fix/solve one issue number (umbrella gate, worktree, design, code, verify, PR, CI, closure) | `references/implement.md` |
-| "Implement all X-labeled issues", a list of issue numbers, a batch run | `references/batch-implement.md` |
-| Work the backlog / "solve what you can" / loop tick with no assigned issue | `references/drain.md` |
-| Create a pull request (pre-flight branch checks, target `main`) | `references/pr.md` |
-| Any GitHub operation: issues, PRs, comments, labels, reviews, merges, file contents, branches | `references/github-cli.md` |
+| Workflow | Situation | Read |
+|---|---|---|
+| `session-lifecycle` | Applies to ALL sessions: run at the START (worktree, stale-branch cleanup, rebase) and END (wrap up, finish, hand off, mission complete or blocked); also resuming/taking over a session or finding another session's leftovers | `references/session-lifecycle.md` |
+| `implement` | Told to implement/fix/solve one issue number, or picking the next issue off the backlog | `references/implement.md` |
+| `batch-implement` | "Implement all X-labeled issues", "fix all Y bugs", a list of issue numbers. Do NOT ask for scope clarification: run the pre-flight and start | `references/batch-implement.md` |
+| `drain` | Work the backlog, drain issues, "solve what you can", run the loop autonomously, or a loop tick with no assigned issue | `references/drain.md` |
+| `pr` | Create a pull request (pre-flight branch checks, target `main`) | `references/pr.md` |
+| `github-cli` | ANY GitHub operation (issues, PRs, comments, labels, reviews, merges, file contents, branches, repo queries); always prefer gh CLI over GitHub MCP tools | `references/github-cli.md` |
 
-Chain: session-lifecycle → implement (or drain → batch-implement) → pr → review skill (`autobot-dev-skills:review`).
+Chain: session-lifecycle → implement (or drain → batch-implement) → pr → `/autobot-dev-skills:review review`.
