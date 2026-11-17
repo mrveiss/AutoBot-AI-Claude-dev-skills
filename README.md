@@ -87,8 +87,8 @@ Seven model-pinned role agents in `plugins/autobot-dev-skills/agents/`, invoked 
 | `researcher` | fable | no (read-only; `gh issue create` only) | `lifecycle research`, `research-to-issues`, `adopt` |
 | `planner` | fable | yes (docs/plans, never code) | `engineering` (planning lenses) |
 | `writer` | sonnet | yes | `engineering` (documentation-engineer, content-writer) |
-| `sweeper` | haiku | no (read-only) | `engineering` (repo-sweeper, conversation-compacter) |
-| `memory` | sonnet | yes | `engineering` (memory-monitor, memory-curator) |
+| `sweeper` | haiku | no (read-only) | `engineering` (repo-sweeper) |
+| `memory` | sonnet | yes | `engineering` (memory-monitor, memory-curator, conversation-compacter) |
 
 ## Configuration
 
