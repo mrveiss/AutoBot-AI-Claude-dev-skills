@@ -68,12 +68,26 @@ this repo. On a new machine, they restore the whole workflow.
 
 ## The skills
 
-Four router meta-skills. Each `SKILL.md` is a short decision table; the full workflow is read on demand from its `references/` folder.
+Five router meta-skills. Each `SKILL.md` is a short decision table; the full workflow is read on demand from its `references/` folder.
 
 - **`lifecycle`** (`autobot-dev-skills:lifecycle`) — the issue-to-merged-PR workflow. Covers the former `session-lifecycle`, `implement`, `batch-implement`, `drain`, `pr` and `github-cli` skills plus the absorbed AutoBot project skills `issue` (folded into `implement`), `commit`, `parallel`, `deploy`, `research`, `research-to-issues` and `adopt` (`references/<old-name>.md`).
-- **`review`** (`autobot-dev-skills:review`) — PR review and validation. Covers `review`, `review-fleet` and `pre-merge-validate`.
+- **`review`** (`autobot-dev-skills:review`) — PR review and validation. Covers `review`, `review-fleet` and `pre-merge-validate`, plus the read-only reviewer lenses `code-reviewer`, `code-skeptic` and `security-auditor`.
 - **`audit`** (`autobot-dev-skills:audit`) — unwired-code and API-contract audits. Covers `api-wiring-audit` and `dead-code-audit` (which also holds the former AutoBot `dead-code-review`).
 - **`debug`** (`autobot-dev-skills:debug`) — full-stack debugging across layers. Covers `debug-autobot`.
+- **`engineering`** (`autobot-dev-skills:engineering`) — 20 domain lenses (backend, frontend, database, devops, performance, AI/ML, multimodal, testing, refactoring, architecture, planning, PRDs, design specs, documentation, content, sweeps, conversation compaction, memory capture and curation), one reference each. Invoke as `/autobot-dev-skills:engineering <lens>`.
+
+## The agents
+
+Six model-pinned role agents in `plugins/autobot-dev-skills/agents/`, invoked as `autobot-dev-skills:<role>`. Each is a short router: hard constraints plus a table that loads the matching skill workflow.
+
+| Agent | Model | Writes? | Routes to |
+|---|---|---|---|
+| `senior-developer` | sonnet | yes | `engineering` (build lenses), `lifecycle`, `debug`, `claude-dev-skills:coding` |
+| `reviewer` | sonnet | no (read-only) | `review` lenses and PR review, `audit`, `claude-dev-skills:review-lenses` |
+| `planner` | fable | yes (docs/plans/issues, never code) | `engineering` (planning lenses), `lifecycle research-to-issues` |
+| `writer` | sonnet | yes | `engineering` (documentation-engineer, content-writer) |
+| `sweeper` | haiku | no (read-only) | `engineering` (repo-sweeper, conversation-compacter) |
+| `memory` | sonnet | yes | `engineering` (memory-monitor, memory-curator) |
 
 ## Configuration
 
@@ -92,6 +106,7 @@ plugins/autobot-dev-skills/
   .claude-plugin/plugin.json               the plugin manifest
   skills/<meta>/SKILL.md                    router (decision table)
   skills/<meta>/references/<workflow>.md   full workflow, read on demand
+  agents/<role>.md                         model-pinned role agent (auto-discovered)
 ```
 
 ## Updating

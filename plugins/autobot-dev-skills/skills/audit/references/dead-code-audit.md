@@ -514,7 +514,7 @@ Invoke as `/autobot-dev-skills:audit dead-code-review` when judging one piece of
 
 **Core principle:** Unused code is not the same as unwanted code. Code exists for a reason — find the reason before removing it.
 
-## The Three Categories
+## The Two Categories
 
 Before touching any dead-looking code, classify it:
 
