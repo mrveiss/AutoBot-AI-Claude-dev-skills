@@ -1,4 +1,4 @@
-When to use: Dispatch a 10-angle parallel PR review fleet (finder agents + verifier agents) that posts only confirmed, deduplicated findings to a single PR comment. Use when asked for a high-effort or recall-biased PR review.
+When to use: Dispatch a 10-angle parallel PR review fleet (finder agents + verifier agents) that posts confirmed, deduplicated findings, open proof gaps and a coverage table to a single PR comment. Use when asked for a high-effort or recall-biased PR review.
 
 # Review Fleet
 
@@ -50,10 +50,15 @@ Dispatch all 10 angles at once with `Agent` tool calls in a single message. Each
     "line": 142,
     "severity": "BLOCKER|HIGH|MEDIUM",
     "title": "Short description",
-    "evidence": "Exact quote from the diff or file showing the issue"
+    "evidence": "Exact quote from the diff or file showing the issue",
+    "counterevidence": "What could disprove this (a guard, caller check, test) and whether it was looked for",
+    "confidence": 0.0,
+    "confidence_rationale": "Required when confidence < 0.7: what is unverified"
   }
 ]
 ```
+
+Severity rubric: BLOCKER = exploitable or data-losing as written; HIGH = wrong behaviour on a reachable path; MEDIUM = quality or hardening. Unconfirmed impact lowers `confidence`, never `severity`.
 
 If no findings: return `[]`. Do not fabricate. Do not include speculative issues.
 
@@ -64,18 +69,22 @@ For each finding from Phase 1, dispatch a verifier agent (batch to max 5 paralle
 **Verifier prompt must include:**
 - The specific finding (file, line, evidence)
 - The file list from `/tmp/fleet-files.txt`
-- Instruction: "Read the actual file at the given line. Confirm this finding exists in HEAD code, not just the diff context. Return JSON with confirmed: true/false and confidence: 0.0-1.0."
+- Instruction: "Read the actual file at the given line. Confirm this finding exists in HEAD code, not just the diff context. Return JSON with state: confirmed | ruled_out | open_proof_gap and confidence: 0.0-1.0. ruled_out requires the protecting control at file:line."
 
 **Verifier output format:**
 ```json
 {
-  "confirmed": true,
+  "state": "confirmed",
   "confidence": 0.92,
+  "control": "file:line of the protecting control (ruled_out only)",
   "note": "Optional clarification"
 }
 ```
 
-Drop any finding where `confirmed: false` OR `confidence < 0.7`.
+Every candidate ends in exactly one closure state; none is dropped:
+- `confirmed` — verified in HEAD code and `confidence >= 0.7`.
+- `ruled_out` — the verifier cites the protecting control at `file:line`; no citation, no `ruled_out`.
+- `open_proof_gap` — not confirmed and not ruled out (includes `confidence < 0.7`). Listed under "Open proof gaps", never posted as a blocker.
 
 ## Phase 3 — Deduplicate and Rank
 
@@ -98,7 +107,7 @@ Post a single PR comment:
 gh pr comment $PR_NUMBER --body "$(cat <<'EOF'
 ## Review Fleet — PR #<number>
 
-**Angles run:** 10 | **Candidates:** <N> | **Confirmed:** <M>
+**Angles run:** 10 | **Candidates:** <N> | **Confirmed:** <M> | **Ruled out:** <R> | **Open proof gaps:** <G>
 
 ### BLOCKERS
 <!-- Only if any -->
@@ -113,13 +122,25 @@ gh pr comment $PR_NUMBER --body "$(cat <<'EOF'
 - **[observability]** `file.py:201` — Title
   > Evidence quote
 
+### Open proof gaps
+<!-- Unconfirmed, not ruled out; never blockers -->
+- **[angle]** `file.py:310` — Title — what is unverified (`confidence_rationale`)
+
+### Coverage
+| Angle | Outcome | Evidence |
+|-------|---------|----------|
+| security | reported | `file.py:142` |
+| a11y | not_applicable | backend-only diff |
+
 ---
-*Review Fleet: 10 finder angles + verifier pass. Unconfirmed findings dropped.*
+*Review Fleet: 10 finder angles + verifier pass. Every candidate is confirmed, ruled out or an open proof gap.*
 EOF
 )"
 ```
 
-If zero confirmed findings: post "Review Fleet found no confirmed issues across 10 angles."
+Coverage outcome per angle: `reported | no_issue_found | ruled_out | not_applicable | needs_follow_up`, one evidence line each — an angle that skipped the diff is `not_applicable`, never clean.
+
+If zero confirmed findings: post "Review Fleet found no confirmed issues across 10 angles." plus the Coverage table and any Open proof gaps.
 
 ## Wiring into the Agent Orchestrator's Wake Payload
 

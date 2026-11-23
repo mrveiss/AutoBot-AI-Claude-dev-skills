@@ -6,14 +6,14 @@
   },
   "metadata": {
     "description": "AutoBot-AI-specific Claude Code development skills — issue-to-PR lifecycle, PR review, full-stack debugging, codebase auditing, engineering lenses and seven model-pinned role agents tuned to the AutoBot-AI platform.",
-    "version": "1.3.2"
+    "version": "1.3.3"
   },
   "plugins": [
     {
       "name": "autobot-dev-skills",
       "source": "./plugins/autobot-dev-skills",
       "description": "The AutoBot-AI development workflow as 5 router meta-skills and 7 role agents (senior-developer, reviewer, researcher, planner, writer, sweeper, memory): lifecycle (session-lifecycle, implement, issue, commit, parallel, deploy, research, research-to-issues, adopt, batch-implement, drain, pr, github-cli), review (review, review-fleet, pre-merge-validate, code-reviewer, code-skeptic, security-auditor), audit (api-wiring-audit, dead-code-audit, dead-code-review), debug (debug-autobot), engineering (20 domain lenses).",
-      "version": "1.3.2"
+      "version": "1.3.3"
     }
   ]
 }

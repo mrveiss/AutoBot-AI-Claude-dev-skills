@@ -55,6 +55,13 @@ ledger iam <session> && ledger claim worktree issue-<n> --ttl 168h
 git diff --name-only | grep '\.py$' | xargs flake8 --max-line-length=100
 mypy <files>
 ```
+- **`security`-labelled issue:** run these gates in order, never trading an earlier for a later:
+  1. **Applies** — the final diff contains only the intended change.
+  2. **Closes** — re-run the issue's reproduction or test against the patch; it no longer reproduces.
+  3. **Bypass review** — a separate subagent, given the patch but not the author's reasoning, tries variants (encodings, alternate route, sibling call site). The author re-reading their own diff does not count.
+  4. **Preserved behaviour** — the legitimate case through the same path still works.
+  5. **Repo checks** — the flake8/mypy/test checks above.
+- **Any gate fails → fix withheld:** no `Closes #N` (use `Refs`), and the failed gate is recorded on the issue.
 
 ## Step 6 — Commit
 ```bash
@@ -105,6 +112,7 @@ pipeline-scripts/check-issue-close-refs.sh <n>   # exit 1 = forward refs dangle 
 ```
 - **Gate 1 — verbatim ACs:** quote each issue-body AC word-for-word with evidence, or `❌ NOT met → follow-up #X`. Never restate what shipped instead.
 - **Gate 2 — dangling refs:** the script above; also eyeball the credited PR diff for `#<n>`.
+- **Security withhold:** a `security` issue with a failed or unrun Step 5 gate is never closed — see Step 5.
 - **Gate 3 — no partial close:** a bundled PR's `Closes #A, #B` requires each issue's FULL AC set. Subset delivery → check off the subtask, leave the issue open or name the follow-up in the same comment.
 - New module with 0 production callers → wire it in, or file a `wire-in:` issue first and reference it.
 - Host-behaviour ACs need HOST evidence, never merge evidence.
@@ -121,6 +129,7 @@ gh issue view <n> --json state            # Closes fired at merge; Refs → clos
 - [ ] Umbrella issue with step breakdown exists; issue verified open, no duplicate PR/branch
 - [ ] Issue attached to the umbrella as a native sub-issue, and every blocker as a `blocked_by` edge
 - [ ] Work done in a worktree off `origin/main`, committed incrementally
+- [ ] `security` issue: all 5 Step 5 gates passed, else fix withheld (`Refs`, failed gate on the issue)
 - [ ] Tests + lint + mypy pass; no `print(`/`console.` violations; formatted
 - [ ] Commit format correct, no trailers, no `--no-verify`
 - [ ] PR targets `main` with the four required headings; smoke-test green; not behind base
