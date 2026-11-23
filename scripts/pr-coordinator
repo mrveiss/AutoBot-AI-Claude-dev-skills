@@ -32,6 +32,8 @@ try:
         raise ValueError("no timezone")
 except ValueError as exc:
     raise SystemExit(f"PR_COORDINATOR_PROOF_CUTOFF {PROOF_CUTOFF!r} is not an ISO-8601 instant with a timezone: {exc}")
+# A Reviewer cell holding one of these is a placeholder, not a sign-off (an empty cell is rejected earlier, as an empty cell).
+UNSIGNED_REVIEWER = {"", "pending", "tbd", "todo", "?", "-", "\u2014"}
 PROOF_COLUMNS = ["ac", "precondition", "postcondition", "establishing lines", "argument", "reviewer"]
 OWN_AUTHORS = {"mrveiss", "dependabot", "app/dependabot"}
 RED = {"FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ERROR", "ACTION_REQUIRED"}
@@ -58,11 +60,16 @@ PREBOARD_OK = {"green", "green_with_skips"}           # `overall` values that le
 PREBOARD_PASS = {"success", "green", "green_with_skips"}   # check statuses not listed as failing in a guards-red page
 PREBOARD_SLOT_WAIT_S = int(os.environ.get("PR_COORDINATOR_PREBOARD_SLOT_WAIT_S", "1200"))   # slow lane: release the slot
 PREBOARD_NO_RUN_S = int(os.environ.get("PR_COORDINATOR_PREBOARD_NO_RUN_S", "600"))   # dispatched, no run ever appeared
+PREBOARD_MAX_TRIES = int(os.environ.get("PR_COORDINATOR_PREBOARD_MAX_TRIES", "2"))   # dispatches per head before the lane counts as broken
 PREBOARD_LIST_CAP = 10                                # failing items named in one page (count capped, text not)
+# gh's wording when the branch has no such workflow file, no workflow_dispatch trigger or no `base` input (from gh's
+# messages as remembered, not captured): the lane is then unavailable for THAT branch, not broken.
+LANE_MISSING = re.compile(r"could not find any workflow|workflow_dispatch|unexpected inputs|HTTP 404|HTTP 422|not found", re.I)
+OPEN_HEADS = {}   # {pr number: head sha} of every open PR, set each tick: lets the lane-down count see all lane-broken heads
 ACTIVE = {"QUEUED", "IN_PROGRESS", "WAITING", "PENDING", "REQUESTED"}
 
 Q = """query($c:String){repository(owner:"mrveiss",name:"AutoBot-AI"){pullRequests(states:OPEN,first:100,after:$c){
-pageInfo{hasNextPage endCursor} nodes{number title createdAt updatedAt isDraft body changedFiles headRefName headRefOid mergeable author{login}}}}}"""
+pageInfo{hasNextPage endCursor} nodes{number title createdAt updatedAt isDraft body changedFiles headRefName headRefOid isCrossRepository mergeable author{login}}}}}"""
 THREADS = """reviewThreads(first:60){nodes{id isResolved comments(first:1){nodes{author{login}}}
   last:comments(last:1){nodes{author{login} createdAt url}}}}"""
 CHECKS = """commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{
@@ -93,6 +100,12 @@ def write_atomic(path, text):
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
+
+
+def sh_rc(*cmd):
+    """(returncode, stdout, stderr): for the calls whose failure must be read, not swallowed."""
+    p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
+    return p.returncode, p.stdout.strip(), p.stderr.strip()
 
 
 def sh(*cmd, check=False):
@@ -310,13 +323,18 @@ def read_preboard(run_id, head):
     return ("green", "") if res["overall"] in PREBOARD_OK else ("red", preboard_failures(res))
 
 
-def preboard_state(head):
-    """Newest lane run for exactly this head: none | pending | green | red | unreadable, plus a detail."""
+def lane_runs(head):
+    """Lane runs for exactly this head, newest first: [(id, status, conclusion)]."""
     out = sh("gh", "api", f"repos/{REPO}/actions/workflows/{PREBOARD_WORKFLOW}/runs?head_sha={head}&event=workflow_dispatch&per_page=5",
              "--jq", '.workflow_runs[]|[.id, .status, (.conclusion // "")]|@tsv')
-    if not out:
+    return [tuple((ln.split("\t") + ["", ""])[:3]) for ln in out.splitlines() if ln]
+
+
+def lane_result(runs, head):
+    """State of the newest lane run: none | pending | green | red | unreadable, plus a detail."""
+    if not runs:
         return "none", ""
-    run_id, status, conclusion = (out.splitlines()[0].split("\t") + ["", ""])[:3]
+    run_id, status, conclusion = runs[0]
     if status != "completed":
         return "pending", ""
     if conclusion == "cancelled":
@@ -333,54 +351,117 @@ def preboard_page(n, p, seen, attention, key, checks):
                           "branch": p["headRefName"], "head": p["headRefOid"][:9], "title": p["title"][:70], "checks": checks})
 
 
-def preboard_wait(n, p, state, seen, log):
-    """No green result yet: dispatch the lane once per (PR, head), then wait. A lane still not done after
-    PREBOARD_SLOT_WAIT_S parks the PR off-slot (why-chain in main), undone by preboard_unpark. Returns the
-    (state, detail) to act on: a lane that never produced a run within PREBOARD_NO_RUN_S is unreadable."""
-    head, k = p["headRefOid"], f"{n}:preboard-dispatch:{p['headRefOid']}"
-    if k not in seen:
-        seen[k] = int(time.time())
-        if state == "pending":                    # a run for this head already exists (dispatched by hand): adopt it
-            return "pending", ""
-        log.append(f"#{n} preboard guards: no result at this head, dispatching the lane")
-        if not DRY:
-            sh("gh", "workflow", "run", PREBOARD_WORKFLOW, "--repo", REPO, "--ref", p["headRefName"], "-f", "base=main")
-        return "pending", ""
-    age = time.time() - seen[k]
-    if state == "none" and age > PREBOARD_NO_RUN_S:
-        return "unreadable", f"lane dispatched {int(age)}s ago but no run for {head[:9]} appeared"
-    if age > PREBOARD_SLOT_WAIT_S:
-        seen.setdefault(f"{n}:preboard-parked:{head}", int(time.time()))
-        log.append(f"#{n} preboard lane slow ({int(age)}s): slot released until it completes")
-    return "pending", ""
+def broken_heads(seen):
+    return sorted(n for n, h in OPEN_HEADS.items() if f"{n}:preboard-broken:{h}" in seen)
+
+
+def lane_down(seen):
+    """Two or more open PRs with a lane-broken head: the lane itself is down. The guard stage is an optimisation,
+    so while it is down the suite starts as it did before the lane existed."""
+    return len(broken_heads(seen)) >= 2
+
+
+def preboard_dispatch(n, p, seen, log, newest):
+    """One dispatch attempt of the lane on the PR branch. "ok", "unavailable" (the branch lacks the workflow or its
+    input: fail open for it) or "failed". The dispatch marker is set only on success; every attempt counts as a try."""
+    head, tk = p["headRefOid"], f"{n}:preboard-tries:{p['headRefOid']}"
+    seen[tk] = seen.get(tk, 0) + 1
+    rc, err = 0, ""
+    if not DRY:
+        rc, _out, err = sh_rc("gh", "workflow", "run", PREBOARD_WORKFLOW, "--repo", REPO, "--ref", p["headRefName"], "-f", "base=main")
+    if rc and LANE_MISSING.search(err):
+        seen[f"{n}:preboard-unavailable:{head}"] = int(time.time())
+        log.append(f"#{n} preboard lane unavailable for branch {p['headRefName']} ({err[:160]}): failing open, suite not held")
+        return "unavailable"
+    if rc:
+        log.append(f"#{n} preboard dispatch failed (exit {rc}, try {seen[tk]}/{PREBOARD_MAX_TRIES}): {err[:200]}")
+        return "failed"
+    seen[f"{n}:preboard-dispatch:{head}"], seen[f"{n}:preboard-lastrun:{head}"] = int(time.time()), newest
+    log.append(f"#{n} preboard guards: dispatched the lane (try {seen[tk]}/{PREBOARD_MAX_TRIES})")
+    return "ok"
+
+
+def preboard_broken(n, p, seen, log, attention, why):
+    """The lane produced nothing usable in PREBOARD_MAX_TRIES tries. Marks the head (the why-chain then parks the
+    PR off-slot) and raises ONE escalation to the coordinator, never the PR owner. Returns True when this makes the
+    lane down: this PR then fails open."""
+    head, k = p["headRefOid"], f"{n}:preboard-broken:{p['headRefOid']}"
+    if k in seen:
+        return lane_down(seen)
+    seen[k] = int(time.time())
+    OPEN_HEADS.setdefault(n, head)
+    down = lane_down(seen)
+    log.append(f"#{n} preboard lane broken at {head[:9]} after {PREBOARD_MAX_TRIES} tries: {why}")
+    base = {"owner": ME, "owner_state": "coordinator", "title": p["title"][:70]}
+    if down and "preboard-lane-down" not in seen:
+        seen["preboard-lane-down"] = int(time.time())
+        attention.append({**base, "pr": n, "kind": "preboard-lane-down", "prs": broken_heads(seen), "reason": why})
+        log.append("preboard lane DOWN (2+ lane-broken PRs): guard stage skipped, suites start as before the lane")
+    elif not down:
+        attention.append({**base, "pr": n, "kind": "preboard-lane-broken", "branch": p["headRefName"], "head": head[:9], "reason": why})
+    return down
+
+
+def preboard_progress(n, p, seen, log, attention, runs, state, detail):
+    """No green/red verdict yet. Wait for a run that is on its way, park a slow one, redispatch up to
+    PREBOARD_MAX_TRIES (the count also takes the runs the API lists, so a lost `seen` cannot exceed the cap),
+    then declare the lane broken for this head. True only when the suite may start."""
+    head, now = p["headRefOid"], time.time()
+    sent = seen.get(f"{n}:preboard-dispatch:{head}")
+    age = now - sent if sent is not None else None
+    newest = runs[0][0] if runs else ""
+    if age is not None and age < PREBOARD_NO_RUN_S and newest == seen.get(f"{n}:preboard-lastrun:{head}"):
+        return False                              # the run just dispatched is not listed yet
+    if state == "pending":
+        if age is None:
+            seen[f"{n}:preboard-dispatch:{head}"], seen[f"{n}:preboard-lastrun:{head}"] = int(now), ""
+        elif age > PREBOARD_SLOT_WAIT_S:          # age is of the latest try, not the first dispatch
+            seen.setdefault(f"{n}:preboard-parked:{head}", int(now))
+            log.append(f"#{n} preboard lane slow ({int(age)}s): slot released until it completes")
+        return False
+    if max(seen.get(f"{n}:preboard-tries:{head}", 0), len(runs)) >= PREBOARD_MAX_TRIES:
+        return preboard_broken(n, p, seen, log, attention, detail or "no usable lane run")
+    if state == "unreadable":
+        log.append(f"#{n} preboard result unreadable ({detail}): redispatching")
+    return preboard_dispatch(n, p, seen, log, newest) == "unavailable"
 
 
 def preboard_clear(n, p, seen, log, attention):
-    """True when the full suite may start at this head: a completed lane result is green/green_with_skips.
-    Anything else (pending, red, unreadable, no result) is False: fail closed, with the reason logged."""
+    """True when the full suite may start at this head: a completed lane result is green/green_with_skips, or the
+    lane cannot be used (fork PR, branch without the workflow, lane down), which fails OPEN with a log line.
+    Pending, red and not-yet-usable results are False."""
     head = p["headRefOid"]
+    if p.get("isCrossRepository"):
+        log.append(f"#{n} fork PR: preboard lane cannot run on its branch, failing open")
+        return True
     if f"{n}:guards-red:{head}" in seen:
         return False
-    state, detail = preboard_state(head)
+    if f"{n}:preboard-unavailable:{head}" in seen:
+        return True
+    runs = lane_runs(head)
+    state, detail = lane_result(runs, head)
     if state == "green":
         return True
-    if state in ("none", "pending"):
-        state, detail = preboard_wait(n, p, state, seen, log)
     if state == "red":
         log.append(f"#{n} preboard guards RED at {head[:9]}: {'; '.join(detail)}")
         preboard_page(n, p, seen, attention, "guards-red", detail)
-    elif state == "unreadable":
-        log.append(f"#{n} preboard guards unreadable, not starting the suite: {detail}")
-        preboard_page(n, p, seen, attention, "guards-unreadable", [detail])
-    return False
+        return False
+    if lane_down(seen):
+        log.append(f"#{n} preboard guard stage skipped: the lane is down")
+        return True
+    return preboard_progress(n, p, seen, log, attention, runs, state, detail)
 
 
 def preboard_unpark(prs, seen, log):
-    """A parked PR (lane slow) is unparked once its lane run is no longer pending, so it can take a slot and
-    preboard_clear acts on the result (start, page red, or page unreadable)."""
+    """Tick start. A parked PR (lane slow) is unparked once its lane run is no longer pending; the lane-down mark
+    is cleared once fewer than two heads are lane-broken."""
+    OPEN_HEADS.clear()
+    OPEN_HEADS.update({p["number"]: p["headRefOid"] for p in prs})
+    if not lane_down(seen):
+        seen.pop("preboard-lane-down", None)
     for p in prs:
         k = f"{p['number']}:preboard-parked:{p['headRefOid']}"
-        if k in seen and preboard_state(p["headRefOid"])[0] != "pending":
+        if k in seen and lane_result(lane_runs(p["headRefOid"]), p["headRefOid"])[0] != "pending":
             del seen[k]
             log.append(f"#{p['number']} preboard lane finished: eligible for a slot again")
 
@@ -487,6 +568,8 @@ def proof_table_reason(body):
         cells = _cells(row)
         if len(cells) != len(PROOF_COLUMNS) or not all(cells):
             return f"row {k} has an empty cell or the wrong cell count"
+        if cells[-1].lower() in UNSIGNED_REVIEWER:
+            return f"row {k}: Reviewer not signed"
     return ""
 
 
@@ -824,6 +907,8 @@ def main():
             p["why"] = "preboard guards red at this head (owner paged); waits for a new head"
         elif f"{n}:preboard-parked:{p['headRefOid']}" in seen:
             p["why"] = "preboard lane still running: off-slot until it completes"
+        elif f"{n}:preboard-broken:{p['headRefOid']}" in seen and not lane_down(seen) and not active:
+            p["why"] = "preboard lane broken for this head (coordinator paged): off-slot so the next PR proceeds"
         else:
             p["why"] = ""
             eligible.append(n)

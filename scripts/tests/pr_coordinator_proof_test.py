@@ -55,6 +55,15 @@ class Table(unittest.TestCase):
     def test_empty_cell(self):
         self.assertIn("empty", PC.proof_table_reason(body(HEAD + "| AC1 | x | | a.py:1 | z | alice |")))
 
+    def test_unsigned_reviewer_placeholders_fail(self):
+        for cell in ("pending", "TBD", " Pending ", "todo", "?", "-", "\u2014"):
+            row = f"| AC1 | x | y | a.py:1 | z | {cell} |"
+            self.assertEqual(PC.proof_table_reason(body(HEAD + row)), "row 1: Reviewer not signed", cell)
+
+    def test_signed_reviewer_passes(self):
+        row = "| AC1 | x | y | a.py:1 | z | reviewer: holds at abc1234 |"
+        self.assertEqual(PC.proof_table_reason(body(HEAD + row)), "")
+
     def test_missing_reviewer(self):
         self.assertIn("empty", PC.proof_table_reason(body(HEAD + "| AC1 | x | y | a.py:1 | z |  |")))
         t = "| AC | Precondition | Postcondition | Establishing lines | Argument |\n|---|---|---|---|---|\n| 1 | a | b | c | d |"
