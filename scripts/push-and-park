@@ -3,7 +3,7 @@
 #
 # pr-coordinator owns CI slots and cancellation (owner rules 2026-11-18: FIFO, 2 slots,
 # rule 2 cancels every non-slot PR's runs through ci-cancel). A second canceller here
-# (pr-queue-gate --park) ranked its own slots, could admit a PR the coordinator had not,
+# (the retired pr-queue-gate --park) ranked its own slots, could admit a PR the coordinator had not,
 # and printed nothing on some runs (Claude-Dev-Skills#11). So this script no longer parks:
 # it pushes and then prints the coordinator's read-only view (--dry), always ending in an
 # explicit status line so a silent run cannot look like success.

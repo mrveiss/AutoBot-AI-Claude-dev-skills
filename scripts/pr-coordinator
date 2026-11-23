@@ -79,6 +79,15 @@ def migration_gate_ran(head):
     return False
 
 
+def write_atomic(path, text):
+    """State files are read by concurrent ticks (push-and-park runs --dry): write a temp file in the same
+    directory, then os.replace, so a reader sees the old or the new content, never a torn file."""
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def sh(*cmd, check=False):
     p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
     if check and p.returncode:
@@ -143,7 +152,7 @@ def fetch_prs():
         if not p["isDraft"]:
             new_cache[str(p["number"])] = {"updatedAt": p["updatedAt"], "threads": p["reviewThreads"]}
     if not DRY:
-        cache_path.write_text(json.dumps(new_cache), encoding="utf-8")
+        write_atomic(cache_path, json.dumps(new_cache))
     return prs
 
 
@@ -216,7 +225,15 @@ def _ghost_cutoff():
 # Post-merge bookkeeping that runs when a PR closes and carries no test load: the PR is already gone from the
 # queue, so rule 2 would cancel it and the landing note would be lost (ci-enforce.sh, 2026-11-06). "train-content-gate"
 # was exempted there too but only matters for merge trains, which are retired, so it is not ported.
-EXEMPT_WORKFLOWS = {"Issue landing notes"}
+# Ported from the retired pr-queue-gate: cheap required-context publishers are never cancelled either. A cancelled
+# required check renders as a red X and blocks the merge (#17948 lost "No open blocks-merge issues reference this PR"
+# that way, 2026-10-04), and these run for seconds, so cancelling saves nothing. Exact workflow names (a wrong guess
+# silently reintroduces that red). The five *-required-context names stop existing at the one-workflow cutover (#18208).
+REQUIRED_CONTEXT_PUBLISHERS = {
+    "PR Blocking Findings", "No Commit Trailers", "Enforce Pre-commit Hooks", "backend-required-context",
+    "code-quality-required-context", "docker-smoke-required-context", "Frontend Required Context",
+    "python-required-context"}
+EXEMPT_WORKFLOWS = {"Issue landing notes"} | REQUIRED_CONTEXT_PUBLISHERS
 
 
 def actions_runs():
@@ -226,6 +243,13 @@ def actions_runs():
                  "--jq", f'.workflow_runs[]|select(.created_at > "{_ghost_cutoff()}")|[.id,.head_branch,.head_sha,.event,.name]|@tsv')
         runs += [line.split("\t") for line in raw.splitlines() if line]
     return [r[:4] for r in {r[0]: r for r in runs}.values() if (r[4:5] or [""])[0] not in EXEMPT_WORKFLOWS]   # a run can appear under two status filters
+
+
+def stale_pr_claims(claims, open_nums):
+    """Ported from pr-queue-gate: a claim on a PR that is no longer open blocks the next session for no reason,
+    and only its owner can release it. Report-only. `claims` is {pr number: owner}."""
+    return [f"stale claim: #{n} still held by {o} but the PR is closed/merged; only {o} can release it"
+            for n, o in sorted(claims.items()) if n not in open_nums]
 
 
 def owner_of(r, lg, pr):
@@ -610,6 +634,8 @@ def main():
     deps_path = STATE / "deps.json"                # {"<pr>": [<pr it must land after>, ...]}, set by the coordinator
     deps = json.loads(deps_path.read_text(encoding="utf-8")) if deps_path.exists() else {}
     open_now = {p["number"] for p in prs}
+    pr_claims = {int(k.rsplit(":", 1)[1]): r.hget(k, "owner") or "?" for k in r.scan_iter("lg:claim:pr:*")}
+    log.extend(stale_pr_claims(pr_claims, open_now))
 
     for p in prs:
         n, red, active, total = p["number"], *ci_state(p)
@@ -725,8 +751,8 @@ def main():
         slot_land_phase(n, p, landing_head, r, seen, log, attention)
 
     if not DRY:
-        seen_path.write_text(json.dumps(seen), encoding="utf-8")
-        recent_path.write_text(json.dumps(RECENT), encoding="utf-8")
+        write_atomic(seen_path, json.dumps(seen))
+        write_atomic(recent_path, json.dumps(RECENT))
         sh("redis-cli", "--no-auth-warning", "-n", "15", "DEL", "claude:landing-order")
         if eligible:
             sh("redis-cli", "--no-auth-warning", "-n", "15", "RPUSH", "claude:landing-order", *map(str, eligible))
@@ -736,7 +762,9 @@ def main():
         rows.append(f"| {pos} | #{p['number']} | {p['createdAt'][:16]} | {slot} | {ci} | {p['why'] or 'ready'} "
                     f"| {p['owner']} ({p['alive']}) | {p['title'][:55]} |")
     table = "| # | PR | submitted (UTC) | slot | CI | state | owner | title |\n|---|---|---|---|---|---|---|---|\n" + "\n".join(rows)
-    (STATE / "queue.md").write_text(f"# PR queue — {time.strftime('%F %T')} (dry={DRY})\n\n{table}\n", encoding="utf-8")
+    # a --dry view (push-and-park) must not clobber the live queue.md: it writes queue.dry.md instead
+    write_atomic(STATE / ("queue.dry.md" if DRY else "queue.md"),
+                 f"# PR queue — {time.strftime('%F %T')} (dry={DRY})\n\n{table}\n")
     print(f"slots={slots} eligible={len(eligible)} open={len(prs)} dry={DRY}")
     for line in log:
         print("ACTION", line)
@@ -769,7 +797,7 @@ def degraded_tick(err):
         if n not in held:                         # an open PR without a slot, or a closed-PR / PR-less branch
             cancel(rid, branch, n or "-", "rule2: no CI slot (FIFO, degraded tick)", log)
     if not DRY:
-        recent_path.write_text(json.dumps(RECENT), encoding="utf-8")
+        write_atomic(recent_path, json.dumps(RECENT))
     print(f"DEGRADED tick ({err[:80]}): slots held={sorted(held)}")
     for line in log:
         print("ACTION", line)
