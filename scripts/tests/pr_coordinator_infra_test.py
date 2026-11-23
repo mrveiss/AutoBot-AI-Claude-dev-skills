@@ -39,6 +39,28 @@ class Classify(unittest.TestCase):
             self.assertFalse(PC.is_infra_failure(tail), name)
 
 
+TS = "2026-11-23T09:12:03.1234567Z "
+
+
+def stamped(text):
+    return "\n".join(TS + line for line in text.splitlines())
+
+
+class Timestamped(unittest.TestCase):
+    def classify(self, text):
+        return PC.is_infra_failure(PC.clean_log(stamped(text)))
+
+    def test_apt_is_infra(self):
+        self.assertTrue(self.classify(INFRA["apt"]))
+
+    def test_pytest_lines_without_summary_are_code(self):
+        self.assertFalse(self.classify("FAILED a::b - boom\nTemporary failure resolving 'x'"))
+        self.assertFalse(self.classify("E   assert 1 == 2\nTemporary failure resolving 'x'"))
+
+    def test_prefix_stripped(self):
+        self.assertEqual(PC.clean_log(TS + "hello"), "hello")
+
+
 class Rerun(unittest.TestCase):
     def setUp(self):
         self.calls = []

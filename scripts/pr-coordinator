@@ -313,13 +313,18 @@ INFRA_PATTERNS = [re.compile(x) for x in (
     r"Failed to connect to \S+ port \d+.*(timed out|Connection refused)")]
 # Test-failure evidence anywhere in the tail vetoes an infra verdict.
 CODE_FAILURE = re.compile(r"^FAILED \S+::|\b\d+ failed\b|AssertionError|No export is defined on the .* mock|error TS\d+|"
-                          r"Test Files +\d+ failed|Tests +\d+ failed|^E {3}")
+                          r"Test Files +\d+ failed|Tests +\d+ failed|^E {3}", re.M)
 LOG_TAIL_LINES = 200
 
 
+def clean_log(raw):
+    """Last LOG_TAIL_LINES lines of a job log, without ANSI escapes or the per-line timestamp prefix."""
+    lines = [re.sub(r"^\d{4}-\d\d-\d\dT[\d:.]+Z ", "", re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", x)) for x in raw.splitlines()]
+    return "\n".join(lines[-LOG_TAIL_LINES:])
+
+
 def log_tail(job_id):
-    raw = sh("gh", "api", f"repos/{REPO}/actions/jobs/{job_id}/logs")
-    return "\n".join(re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", raw).splitlines()[-LOG_TAIL_LINES:])
+    return clean_log(sh("gh", "api", "--allow-escape-sequences", f"repos/{REPO}/actions/jobs/{job_id}/logs"))
 
 
 def is_infra_failure(tail):
