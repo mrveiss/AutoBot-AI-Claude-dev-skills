@@ -353,6 +353,11 @@ def _table_after_heading(body):
     return rest[:next((j for j, x in enumerate(rest) if not x.startswith("|")), len(rest))]
 
 
+def _header_name(cell):
+    """Normalised header cell: one trailing parenthetical note stripped, lower-cased, spaces collapsed."""
+    return re.sub(r"\s+", " ", re.sub(r"\s*\([^)]*\)\s*$", "", cell).lower()).strip()
+
+
 def proof_table_reason(body):
     """Empty string when the PR body holds a valid requirement-proof table, else the reason it is not."""
     table = _table_after_heading(body)
@@ -360,7 +365,7 @@ def proof_table_reason(body):
         return "no '## Requirement proofs' heading"
     if not table:
         return "no table under the '## Requirement proofs' heading"
-    if len(table) < 2 or [re.sub(r"\s+", " ", c.lower()) for c in _cells(table[0])] != PROOF_COLUMNS:
+    if len(table) < 2 or [_header_name(c) for c in _cells(table[0])] != PROOF_COLUMNS:
         return "table header is not AC | Precondition | Postcondition | Establishing lines | Argument | Reviewer"
     sep = _cells(table[1])
     if len(sep) != len(PROOF_COLUMNS) or not all(re.fullmatch(r":?-+:?", c.replace(" ", "")) for c in sep):
