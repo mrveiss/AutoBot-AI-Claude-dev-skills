@@ -15,7 +15,7 @@ No active trainmaster is assumed; when one is active (ledger hold `trainmaster`)
 Prints the queue + an ATTENTION block (JSON lines) the coordinator session relays to owners.
 State: ~/.claude/state/pr-coordinator/ (notified keys, queue.md).
 """
-import importlib.machinery, importlib.util, json, re, subprocess, sys, time
+import importlib.machinery, importlib.util, json, os, re, subprocess, sys, time
 from pathlib import Path
 
 REPO, WIDTH, LAST = "mrveiss/AutoBot-AI", 2, {19456}
@@ -25,6 +25,9 @@ PROTECTED = {"main", "release", "master"}   # a promotion PR's head is main: its
 S = Path.home() / ".claude/scripts"
 STATE = Path.home() / ".claude/state/pr-coordinator"
 DRY = "--dry" in sys.argv
+# Owner 2026-11-23: a head pushed after this instant needs a valid requirement-proof table in the PR body before CI starts.
+PROOF_CUTOFF = os.environ.get("PR_COORDINATOR_PROOF_CUTOFF", "2026-11-23T11:36:00Z")
+PROOF_COLUMNS = ["ac", "precondition", "postcondition", "establishing lines", "argument", "reviewer"]
 OWN_AUTHORS = {"mrveiss", "dependabot", "app/dependabot"}
 RED = {"FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ERROR", "ACTION_REQUIRED"}
 # Contexts that go red BECAUSE a PR is parked: ci-dispatch-watchdog fails any head with no executed CI
@@ -47,7 +50,7 @@ SIGNAL_RUN = json.loads(_sr.read_text(encoding="utf-8")) if _sr.exists() else {}
 ACTIVE = {"QUEUED", "IN_PROGRESS", "WAITING", "PENDING", "REQUESTED"}
 
 Q = """query($c:String){repository(owner:"mrveiss",name:"AutoBot-AI"){pullRequests(states:OPEN,first:100,after:$c){
-pageInfo{hasNextPage endCursor} nodes{number title createdAt updatedAt isDraft changedFiles headRefName headRefOid mergeable author{login}}}}}"""
+pageInfo{hasNextPage endCursor} nodes{number title createdAt updatedAt isDraft body changedFiles headRefName headRefOid mergeable author{login}}}}}"""
 THREADS = """reviewThreads(first:60){nodes{id isResolved comments(first:1){nodes{author{login}}}
   last:comments(last:1){nodes{author{login} createdAt url}}}}"""
 CHECKS = """commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{
@@ -279,6 +282,110 @@ def merges_only_main(others):
     return True
 
 
+def _cells(line):
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def _table_after_heading(body):
+    """Table lines under the `## Requirement proofs` heading, or None when the heading is absent."""
+    lines = (body or "").splitlines()
+    for i, ln in enumerate(lines):
+        if re.fullmatch(r"#{2,}\s*requirement\s+proofs\s*", ln.strip(), re.I):
+            rest = [x.strip() for x in lines[i + 1:]]
+            while rest and not rest[0]:
+                rest.pop(0)
+            table = []
+            for x in rest:
+                if not x.startswith("|"):
+                    break
+                table.append(x)
+            return table
+    return None
+
+
+def proof_table_reason(body):
+    """Empty string when the PR body holds a valid requirement-proof table, else the reason it is not."""
+    table = _table_after_heading(body)
+    if table is None:
+        return "no '## Requirement proofs' heading"
+    if len(table) < 2 or [re.sub(r"\s+", " ", c.lower()) for c in _cells(table[0])] != PROOF_COLUMNS:
+        return "table header is not AC | Precondition | Postcondition | Establishing lines | Argument | Reviewer"
+    if not all(re.fullmatch(r":?-+:?", c.replace(" ", "")) for c in _cells(table[1])):
+        return "table has no separator row"
+    rows = table[2:]
+    if not rows:
+        return "table has no data row"
+    for k, row in enumerate(rows, 1):
+        cells = _cells(row)
+        if len(cells) != len(PROOF_COLUMNS) or not all(cells):
+            return f"row {k} has an empty cell or the wrong cell count"
+    return ""
+
+
+def _commit_facts(sha):
+    raw = sh("gh", "api", f"repos/{REPO}/commits/{sha}",
+             "--jq", '[.sha, (.parents|map(.sha)|join(",")), .commit.committer.date]|@tsv')
+    return raw.split("\t") if raw.count("\t") == 2 else None
+
+
+def effective_push(head):
+    """(sha, committer date) of the newest commit that is NOT a merge of main, walking first parents. A merge
+    of main (two parents, every later parent already in main: the coordinator's update-branch, the sync bot,
+    a hand merge) is not a new push, so an exempt PR stays exempt through its syncs."""
+    cur = head
+    for _ in range(40):
+        facts = _commit_facts(cur)
+        if not facts:
+            return None
+        sha, parents, date = facts
+        parents = parents.split(",")
+        if not (len(parents) >= 2 and merges_only_main(parents[1:])):
+            return sha, date
+        cur = parents[0]
+    return None
+
+
+def head_is_exempt(n, head):
+    """Exempt = the pushed work is at or before the cutoff. Push time is the later of the effective head's
+    committer date and the PR timeline's latest head_ref_force_pushed event: neither alone is a push time
+    (a plain push has no timeline event; a commit made earlier keeps its old committer date), the later is the
+    safest bound. An unreadable head is NOT exempt (fail closed)."""
+    eff = effective_push(head)
+    if not eff:
+        return False
+    force = sh("gh", "api", f"repos/{REPO}/issues/{n}/timeline?per_page=100", "--paginate", "--jq",
+               '.[]|select(.event=="head_ref_force_pushed")|.created_at').split()
+    return max([eff[1]] + force[-1:]) <= PROOF_CUTOFF
+
+
+_PROOF = {}   # (pr, head) -> reason; a head's verdict cannot change until its body or head does
+
+
+def proof_status(p):
+    """Empty string when CI may start for this head; else why not (requirement-proof gate, owner 2026-11-23)."""
+    reason = proof_table_reason(p.get("body"))
+    if not reason:
+        return ""
+    key = (p["number"], p["headRefOid"], p.get("body"))
+    if key not in _PROOF:
+        _PROOF[key] = "" if head_is_exempt(p["number"], p["headRefOid"]) else reason
+    return _PROOF[key]
+
+
+def proof_blocked(p, seen, log, attention):
+    """True (and reported once per head) when the proof gate bars CI. The PR keeps its FIFO place."""
+    reason = proof_status(p)
+    if not reason:
+        return False
+    k = f"{p['number']}:proof-missing:{p['headRefOid']}"
+    if k not in seen:
+        seen[k] = int(time.time())
+        log.append(f"#{p['number']} blocked: requirement-proof table missing/invalid ({reason})")
+        attention.append({"pr": p["number"], "kind": "proof-missing", "owner": p.get("owner"), "owner_state": p.get("alive"),
+                          "branch": p["headRefName"], "head": p["headRefOid"][:9], "reason": reason})
+    return True
+
+
 def review_carries(review_sha, head):
     """Owner 2026-11-18: an approval carries forward across commits that are ONLY auto-sync merges of main
     or empty (0-file) start-CI commits. Any real commit, or a rewritten history, needs a new review."""
@@ -340,6 +447,8 @@ def infra_rerun(p, seen, log):
     if not red or any(k in seen for k in keys.values()) or not all(p["red_ids"].get(c) for c in red):
         return red
     if not all(is_infra_failure(log_tail(p["red_ids"][c])) for c in red):
+        return red
+    if proof_status(p):                           # no rerun of a head the proof gate bars (the slot loop reports it)
         return red
     for c in red:
         run = sh("gh", "api", f"repos/{REPO}/actions/jobs/{p['red_ids'][c]}", "--jq", ".run_id")
@@ -488,6 +597,8 @@ def main():
                 sh("gh", "api", "-X", "PUT", f"repos/{REPO}/pulls/{n}/update-branch",
                    "-f", f"expected_head_sha={p['headRefOid']}")
             continue
+        if proof_blocked(p, seen, log, attention):
+            continue                              # no start-ci / rerun without a requirement-proof table
         runs_here = sh("gh", "api", f"repos/{REPO}/actions/runs?head_sha={p['headRefOid']}&per_page=100",
                        "--jq", '.workflow_runs[]|[.id, .status, (.conclusion // "")]|@tsv').splitlines()
         cancelled = [r.split("\t")[0] for r in runs_here if r.endswith("\tcancelled")]
