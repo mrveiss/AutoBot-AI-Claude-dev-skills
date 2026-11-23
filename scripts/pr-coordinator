@@ -253,7 +253,10 @@ REQUIRED_CONTEXT_PUBLISHERS = {
     "PR Blocking Findings", "No Commit Trailers", "Enforce Pre-commit Hooks", "backend-required-context",
     "code-quality-required-context", "docker-smoke-required-context", "Frontend Required Context",
     "python-required-context"}
-EXEMPT_WORKFLOWS = {"Issue landing notes"} | REQUIRED_CONTEXT_PUBLISHERS
+PREBOARD_LANE_NAME = "Dispatch Preboard Guards"   # the lane's `name:` in dispatch-preboard-guards.yml, as Actions reports it
+# The lane runs on the PR branch, outside the CI slots (#49): rule 2/4 and the degraded tick must never cancel it,
+# or every non-slot PR's lane reads as cancelled and burns its retries.
+EXEMPT_WORKFLOWS = {"Issue landing notes", PREBOARD_LANE_NAME} | REQUIRED_CONTEXT_PUBLISHERS
 
 
 def actions_runs():

@@ -238,6 +238,16 @@ class LaneDown(Base):
         self.assertNotIn("preboard-lane-down", seen)
 
 
+class LaneRunsNeverCancelled(Base):
+    """Rule 2, rule 4 and the degraded tick all take their runs from actions_runs(): the lane's name must be filtered there."""
+
+    def test_lane_name_is_exempt_and_actions_runs_drops_it(self):
+        self.assertEqual(PC.PREBOARD_LANE_NAME, "Dispatch Preboard Guards")
+        self.assertIn(PC.PREBOARD_LANE_NAME, PC.EXEMPT_WORKFLOWS)
+        PC.sh = lambda *a, **k: "1\tissue-9\tsha\tworkflow_dispatch\tDispatch Preboard Guards\n2\tissue-9\tsha\tpull_request\tAutoBot CI/CD Pipeline"
+        self.assertEqual([r[0] for r in PC.actions_runs()], ["2"])
+
+
 class InfraRerun(Base):
     def test_infra_rerun_stays_ungated(self):
         p = {"number": 7, "headRefOid": HEAD, "red": ["job"], "red_ids": {"job": 5}, "body": ""}
