@@ -15,7 +15,7 @@ No active trainmaster is assumed; when one is active (ledger hold `trainmaster`)
 Prints the queue + an ATTENTION block (JSON lines) the coordinator session relays to owners.
 State: ~/.claude/state/pr-coordinator/ (notified keys, queue.md).
 """
-import datetime, importlib.machinery, importlib.util, json, os, re, subprocess, sys, time
+import datetime, importlib.machinery, importlib.util, json, os, re, subprocess, sys, tempfile, time
 from pathlib import Path
 
 REPO, WIDTH, LAST = "mrveiss/AutoBot-AI", 2, {19456}
@@ -32,6 +32,8 @@ try:
         raise ValueError("no timezone")
 except ValueError as exc:
     raise SystemExit(f"PR_COORDINATOR_PROOF_CUTOFF {PROOF_CUTOFF!r} is not an ISO-8601 instant with a timezone: {exc}")
+# A Reviewer cell holding one of these is a placeholder, not a sign-off (an empty cell is rejected earlier, as an empty cell).
+UNSIGNED_REVIEWER = {"", "pending", "tbd", "todo", "?", "-", "\u2014"}
 PROOF_COLUMNS = ["ac", "precondition", "postcondition", "establishing lines", "argument", "reviewer"]
 OWN_AUTHORS = {"mrveiss", "dependabot", "app/dependabot"}
 RED = {"FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ERROR", "ACTION_REQUIRED"}
@@ -52,10 +54,19 @@ RECHECK = json.loads(_rc.read_text(encoding="utf-8")) if _rc.exists() else {}
 # (e.g. "does this move a ratchet baseline"). It may hold a slot but still never lands until approved.
 _sr = Path.home() / ".claude/state/pr-coordinator/signal-run.json"
 SIGNAL_RUN = json.loads(_sr.read_text(encoding="utf-8")) if _sr.exists() else {}
+PREBOARD_WORKFLOW = "dispatch-preboard-guards.yml"   # AutoBot-AI's dispatch-only guard lane (its header documents the artifact)
+PREBOARD_ARTIFACT = "preboard-guards-result"
+PREBOARD_OK = {"green", "green_with_skips"}           # `overall` values that mean the lane found nothing
+PREBOARD_PASS = {"success", "green", "green_with_skips"}   # check statuses not listed as failing in a guards-advisory page
+PREBOARD_MAX_TRIES = int(os.environ.get("PR_COORDINATOR_PREBOARD_MAX_TRIES", "2"))   # dispatch attempts per head (failures count)
+PREBOARD_LIST_CAP = 10                                # failing items named in one page (count capped, text not)
+# gh's wording when the branch has no such workflow file, no workflow_dispatch trigger or no `base` input (from gh's
+# messages as remembered, not captured): the lane is then unavailable for THAT branch, not broken.
+LANE_MISSING = re.compile(r"could not find any workflow|workflow_dispatch|unexpected inputs|HTTP 404|HTTP 422|not found", re.I)
 ACTIVE = {"QUEUED", "IN_PROGRESS", "WAITING", "PENDING", "REQUESTED"}
 
 Q = """query($c:String){repository(owner:"mrveiss",name:"AutoBot-AI"){pullRequests(states:OPEN,first:100,after:$c){
-pageInfo{hasNextPage endCursor} nodes{number title createdAt updatedAt isDraft body changedFiles headRefName headRefOid mergeable author{login}}}}}"""
+pageInfo{hasNextPage endCursor} nodes{number title createdAt updatedAt isDraft body changedFiles headRefName headRefOid isCrossRepository mergeable author{login}}}}}"""
 THREADS = """reviewThreads(first:60){nodes{id isResolved comments(first:1){nodes{author{login}}}
   last:comments(last:1){nodes{author{login} createdAt url}}}}"""
 CHECKS = """commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{
@@ -86,6 +97,12 @@ def write_atomic(path, text):
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
+
+
+def sh_rc(*cmd):
+    """(returncode, stdout, stderr): for the calls whose failure must be read, not swallowed."""
+    p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
+    return p.returncode, p.stdout.strip(), p.stderr.strip()
 
 
 def sh(*cmd, check=False):
@@ -233,7 +250,10 @@ REQUIRED_CONTEXT_PUBLISHERS = {
     "PR Blocking Findings", "No Commit Trailers", "Enforce Pre-commit Hooks", "backend-required-context",
     "code-quality-required-context", "docker-smoke-required-context", "Frontend Required Context",
     "python-required-context"}
-EXEMPT_WORKFLOWS = {"Issue landing notes"} | REQUIRED_CONTEXT_PUBLISHERS
+PREBOARD_LANE_NAME = "Dispatch Preboard Guards"   # the lane's `name:` in dispatch-preboard-guards.yml, as Actions reports it
+# The lane runs on the PR branch, outside the CI slots (#49): rule 2/4 and the degraded tick must never cancel it,
+# or every non-slot PR's lane reads as cancelled and burns its retries.
+EXEMPT_WORKFLOWS = {"Issue landing notes", PREBOARD_LANE_NAME} | REQUIRED_CONTEXT_PUBLISHERS
 
 
 def actions_runs():
@@ -274,6 +294,102 @@ def cancel(run_id, branch, n, reason, log):
     if not DRY:
         time.sleep(1)
         sh(str(S / "ci-cancel"), run_id, ME, reason, branch, str(n))
+
+
+def preboard_failures(res):
+    """Names of what failed in a preboard result.json: checks whose status is not a pass, the guard `problems`,
+    and the failed tests. The guards check's own status vocabulary is not documented, so only known passes are dropped."""
+    checks = res.get("checks") if isinstance(res.get("checks"), dict) else {}
+    out = [f"{k}={v.get('status')}" for k, v in checks.items() if isinstance(v, dict) and v.get("status") not in PREBOARD_PASS]
+    guards = checks.get("guards") if isinstance(checks.get("guards"), dict) else {}
+    out += [str(x) for x in guards.get("problems") or []]
+    out += [str(t.get("nodeid")) for t in res.get("failed_tests") or [] if isinstance(t, dict)]
+    return (out or [f"overall={res.get('overall')}"])[:PREBOARD_LIST_CAP]
+
+
+def read_preboard(run_id, head):
+    """(state, detail) from a completed lane run's artifact; any failure to read it is "unreadable" (fail closed).
+    The base_sha may be stale: the full suite re-checks on the merge ref, so it is deliberately not compared."""
+    with tempfile.TemporaryDirectory() as d:
+        sh("gh", "run", "download", run_id, "--repo", REPO, "-n", PREBOARD_ARTIFACT, "-D", d)
+        try:
+            res = json.loads((Path(d) / "result.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            return "unreadable", f"run {run_id}: {PREBOARD_ARTIFACT} not readable ({type(exc).__name__})"
+    if not isinstance(res, dict) or not isinstance(res.get("overall"), str):
+        return "unreadable", f"run {run_id}: result.json has no `overall`"
+    if res.get("sha") != head:
+        return "unreadable", f"run {run_id}: result is for another head ({str(res.get('sha'))[:9]})"
+    return ("green", "") if res["overall"] in PREBOARD_OK else ("red", preboard_failures(res))
+
+
+def lane_runs(head):
+    """Lane runs for exactly this head, newest first: [(id, status, conclusion)]."""
+    out = sh("gh", "api", f"repos/{REPO}/actions/workflows/{PREBOARD_WORKFLOW}/runs?head_sha={head}&event=workflow_dispatch&per_page=5",
+             "--jq", '.workflow_runs[]|[.id, .status, (.conclusion // "")]|@tsv')
+    return [tuple((ln.split("\t") + ["", ""])[:3]) for ln in out.splitlines() if ln]
+
+
+def lane_result(runs, head):
+    """State of the newest lane run: none | pending | green | red | unreadable, plus a detail."""
+    if not runs:
+        return "none", ""
+    run_id, status, conclusion = runs[0]
+    if status != "completed":
+        return "pending", ""
+    if conclusion == "cancelled":
+        return "unreadable", f"run {run_id} was cancelled"
+    return read_preboard(run_id, head)
+
+
+def preboard_dispatch(n, p, seen, log):
+    """One dispatch attempt of the lane on the PR branch, at most PREBOARD_MAX_TRIES per head. The marker is set only
+    on success. A branch without the workflow or its input is marked unavailable (no more attempts)."""
+    head, tk = p["headRefOid"], f"{n}:preboard-tries:{p['headRefOid']}"
+    seen[tk] = seen.get(tk, 0) + 1
+    rc, err = 0, ""
+    if not DRY:
+        rc, _out, err = sh_rc("gh", "workflow", "run", PREBOARD_WORKFLOW, "--repo", REPO, "--ref", p["headRefName"], "-f", "base=main")
+    if rc and LANE_MISSING.search(err):
+        seen[f"{n}:preboard-unavailable:{head}"] = int(time.time())
+        log.append(f"#{n} preboard lane unavailable for branch {p['headRefName']} ({err[:160]})")
+    elif rc:
+        log.append(f"#{n} preboard dispatch failed (exit {rc}, try {seen[tk]}/{PREBOARD_MAX_TRIES}): {err[:200]}")
+    else:
+        seen[f"{n}:preboard-dispatch:{head}"] = int(time.time())
+        log.append(f"#{n} preboard guards: lane dispatched in parallel with the suite (advisory)")
+
+
+def preboard_note(n, p, seen, log, detail):
+    """A lane result we cannot use is logged once per head and pages nobody."""
+    k = f"{n}:preboard-lane-note:{p['headRefOid']}"
+    if k not in seen:
+        seen[k] = int(time.time())
+        log.append(f"#{n} preboard lane result not usable (advisory, ignored): {detail}")
+
+
+def preboard_advisory(n, p, seen, log, attention):
+    """The lane is ADVISORY (owner decision): it never gates the suite, a slot, a merge or landing. For a slot PR
+    head, dispatch it once alongside the suite; once its result is red, page the owner once per head with
+    `guards-advisory`. A broken, cancelled or unreadable result is only logged."""
+    head = p["headRefOid"]
+    if p.get("isCrossRepository"):
+        return                                    # a fork's headRefName is not a ref of this repo: no lane
+    if f"{n}:preboard-unavailable:{head}" in seen:
+        return
+    runs = lane_runs(head)
+    if not runs and f"{n}:preboard-dispatch:{head}" not in seen and seen.get(f"{n}:preboard-tries:{head}", 0) < PREBOARD_MAX_TRIES:
+        return preboard_dispatch(n, p, seen, log)
+    state, detail = lane_result(runs, head)
+    if state == "red":
+        k = f"{n}:guards-advisory:{head}"
+        if k not in seen:
+            seen[k] = int(time.time())
+            log.append(f"#{n} preboard guards RED at {head[:9]} (advisory): {'; '.join(detail)}")
+            attention.append({"pr": n, "kind": "guards-advisory", "advisory": True, "owner": p["owner"], "owner_state": p["alive"],
+                              "branch": p["headRefName"], "head": head[:9], "title": p["title"][:70], "checks": detail})
+    elif state == "unreadable":
+        preboard_note(n, p, seen, log, detail)
 
 
 def start_ci_or_report(n, p, gate, seen, log, attention):
@@ -376,6 +492,8 @@ def proof_table_reason(body):
         cells = _cells(row)
         if len(cells) != len(PROOF_COLUMNS) or not all(cells):
             return f"row {k} has an empty cell or the wrong cell count"
+        if cells[-1].lower() in UNSIGNED_REVIEWER:
+            return f"row {k}: Reviewer not signed"
     return ""
 
 
@@ -784,6 +902,8 @@ def main():
         if n in held and held[n].get("by") != ME:
             continue                              # another session drives its own slot
         blocked = proof_blocked(p, seen, log, attention)   # gates ONLY the CI starters; every other page still runs
+        if not blocked:
+            preboard_advisory(n, p, seen, log, attention)  # advisory only: never changes what happens next (#49)
         if slot_ci_phase(n, p, blocked, seen, log, attention):
             continue
         landing_head = n in unblock or not any(could_land(m) for m in slots[:i] if m in open_nums)

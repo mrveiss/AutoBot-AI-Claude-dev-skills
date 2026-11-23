@@ -26,7 +26,7 @@ while read -r n b base land; do
     if [ "$land" != true ]; then
       sleep 20
       h=$(gh pr view "$n" --repo $REPO --json headRefOid -q .headRefOid)
-      for id in $(gh run list --repo $REPO --branch "$b" --status queued --limit 60 --json databaseId,headSha -q ".[]|select(.headSha==\"$h\")|.databaseId"); do
+      for id in $(gh run list --repo $REPO --branch "$b" --status queued --limit 60 --json databaseId,headSha,workflowName -q ".[]|select(.headSha==\"$h\" and .workflowName!=\"Dispatch Preboard Guards\")|.databaseId"); do
         "$HOME/.claude/scripts/ci-cancel" "$id" branch-refresh "queued run on a refreshed head" "$b" "$n" >/dev/null && cancelled=$((cancelled+1))
       done
     fi

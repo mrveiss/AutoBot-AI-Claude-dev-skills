@@ -25,8 +25,8 @@ done
 # maintenance runs on main (test-durations refresh, 2026-10-26) are what a train waits on.
 # Otherwise main is not kept. A pull_request run whose head
 # is main (the release-promotion PR) shares the PR shard lanes and lands later: it gets paused too.
-ids=$(gh run list --repo $REPO --limit 300 --json databaseId,status,headBranch,event \
-  -q '.[]|select(.status!="completed")|"\(.databaseId) \(.headBranch) \(.event)"' \
+ids=$(gh run list --repo $REPO --limit 300 --json databaseId,status,headBranch,event,workflowName \
+  -q '.[]|select(.status!="completed" and .workflowName!="Dispatch Preboard Guards")|"\(.databaseId) \(.headBranch) \(.event)"' \
   | awk -v k=" $keep " '!($2=="main" && ($3=="push" || $3=="workflow_dispatch" || $3=="schedule")) && !($2!="main" && index(k, " "$2" ")>0) {print $1}')
 n=$(grep -c . <<<"$ids")
 echo "priority to: $*  (branches kept: $keep); cancelling $n other in-flight run(s)"
