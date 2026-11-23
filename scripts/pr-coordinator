@@ -9,11 +9,13 @@
     main is updated (update-branch); its cancelled runs are re-run. Only the oldest slot PR may land.
   3 CodeRabbit threads awaiting a reply are reported for EVERY open PR, at once, regardless of CI.
   4 A red check at a PR's head cancels that PR's remaining runs and pages its creator session.
+    Exception: a check that failed on runner infrastructure (INFRA_PATTERNS) is re-run once per
+    (PR, head, job) and logged INFRA-RERUN; a second failure or any other failure is red as above.
 No active trainmaster is assumed; when one is active (ledger hold `trainmaster`), this tool reports only.
 Prints the queue + an ATTENTION block (JSON lines) the coordinator session relays to owners.
 State: ~/.claude/state/pr-coordinator/ (notified keys, queue.md).
 """
-import importlib.machinery, importlib.util, json, subprocess, sys, time
+import importlib.machinery, importlib.util, json, re, subprocess, sys, time
 from pathlib import Path
 
 REPO, WIDTH, LAST = "mrveiss/AutoBot-AI", 2, {19456}
@@ -151,6 +153,7 @@ def ci_state(pr):
     active = sum(1 for n, (_, concl, st) in latest.items() if n not in PARKING_ARTIFACTS
                  and (st in ACTIVE or concl in ACTIVE or (st is None and concl is None)))
     red = sorted(n for n, (_, concl, _) in latest.items() if concl in RED and n not in PARKING_ARTIFACTS)
+    pr["red_ids"] = {n: ids.get(n) for n in red}
     if red and set(red) <= set(BASE_DEFECTS) and not any(contains_fix(pr["headRefOid"], BASE_DEFECTS[n]) for n in red):
         red = []                                  # red only on a main defect whose fix this head predates
     if red and not pr.get("isDraft") and all(ids.get(n) and draft_gated(ids[n]) for n in red):
@@ -300,6 +303,48 @@ def review_carries(review_sha, head):
     return False
 
 
+# A red check whose log tail holds one of these is runner infrastructure, not code: it is re-run once per
+# (PR, head, job) instead of paging (#35). Keep every pattern specific: never a bare "error" or "timeout".
+INFRA_PATTERNS = [re.compile(x) for x in (
+    r"Temporary failure (resolving|in name resolution)", r"Could not resolve (host|')", r"Unable to find the server at",
+    r"getaddrinfo EAI_AGAIN", r"E: Failed to fetch https?://", r"Unable to fetch some archives",
+    r"The runner has received a shutdown signal", r"runner .{0,60}lost communication with the server",
+    r"No space left on device", r"Failed to download action", r"Unable to resolve action",
+    r"Failed to connect to \S+ port \d+.*(timed out|Connection refused)")]
+# Test-failure evidence anywhere in the tail vetoes an infra verdict.
+CODE_FAILURE = re.compile(r"^FAILED \S+::|\b\d+ failed\b|AssertionError|No export is defined on the .* mock|error TS\d+|"
+                          r"Test Files +\d+ failed|Tests +\d+ failed|^E {3}")
+LOG_TAIL_LINES = 200
+
+
+def log_tail(job_id):
+    raw = sh("gh", "api", f"repos/{REPO}/actions/jobs/{job_id}/logs")
+    return "\n".join(re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", raw).splitlines()[-LOG_TAIL_LINES:])
+
+
+def is_infra_failure(tail):
+    """True when the log tail shows a runner/network failure and no test-failure evidence."""
+    return bool(tail) and not CODE_FAILURE.search(tail) and any(x.search(tail) for x in INFRA_PATTERNS)
+
+
+def infra_rerun(p, seen, log):
+    """Rule 4 filter: when EVERY red check of this PR failed on infrastructure and none was re-run at this head
+    yet, re-run the failed jobs once and report no red. Otherwise return the red names unchanged."""
+    n, head, red = p["number"], p["headRefOid"], p["red"]
+    keys = {c: f"{n}:infra-rerun:{head}:{c}" for c in red}
+    if not red or any(k in seen for k in keys.values()) or not all(p["red_ids"].get(c) for c in red):
+        return red
+    if not all(is_infra_failure(log_tail(p["red_ids"][c])) for c in red):
+        return red
+    for c in red:
+        run = sh("gh", "api", f"repos/{REPO}/actions/jobs/{p['red_ids'][c]}", "--jq", ".run_id")
+        log.append(f"INFRA-RERUN #{n} {c} (run {run}): runner infrastructure failure, re-running failed jobs once")
+        if not DRY and run:
+            seen[keys[c]] = int(time.time())
+            sh("gh", "run", "rerun", run, "--failed", "--repo", REPO)
+    return []
+
+
 def main():
     lg = ledger_mod()
     r = lg.conn()
@@ -327,6 +372,7 @@ def main():
     for p in prs:
         n, red, active, total = p["number"], *ci_state(p)
         p["red"], p["active"], p["total"] = red, active, total
+        p["red"] = red = infra_rerun(p, seen, log)
         p["owner"], p["alive"] = owner_of(r, lg, p)
         author = (p["author"] or {}).get("login", "")
         rvb = r.hgetall(f"lg:pr:{n}")
