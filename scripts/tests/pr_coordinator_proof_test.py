@@ -163,7 +163,35 @@ class Gating(unittest.TestCase):
         self.assertFalse(any(c[:2] in (("gh", "run"), ("gh", "workflow")) for c in self.calls))
 
 
+class CutoffEnv(unittest.TestCase):
+    def test_malformed_cutoff_fails_at_import(self):
+        import os
+        for bad in ("yesterday", "2026-11-23T11:36:00"):
+            os.environ["PR_COORDINATOR_PROOF_CUTOFF"] = bad
+            try:
+                with self.assertRaises(SystemExit) as cm:
+                    load()
+                self.assertIn("PR_COORDINATOR_PROOF_CUTOFF", str(cm.exception))
+            finally:
+                del os.environ["PR_COORDINATOR_PROOF_CUTOFF"]
+
+    def test_plus_zero_cutoff_loads(self):
+        import os
+        os.environ["PR_COORDINATOR_PROOF_CUTOFF"] = "2026-11-23T11:36:00+00:00"
+        try:
+            self.assertEqual(load().PROOF_CUTOFF, "2026-11-23T11:36:00+00:00")
+        finally:
+            del os.environ["PR_COORDINATOR_PROOF_CUTOFF"]
+
+
 class InfraRefuses(unittest.TestCase):
+    def setUp(self):
+        self.saved = {k: getattr(PC, k) for k in ("head_is_exempt", "sh", "log_tail")}
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            setattr(PC, k, v)
+
     def test_infra_rerun_refuses_barred_head(self):
         PC.log_tail = lambda job: "Temporary failure resolving 'x'\n##[error]Process completed with exit code 100."
         calls = []

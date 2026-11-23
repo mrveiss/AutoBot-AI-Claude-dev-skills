@@ -27,6 +27,11 @@ STATE = Path.home() / ".claude/state/pr-coordinator"
 DRY = "--dry" in sys.argv
 # Owner 2026-11-23: a head pushed after this instant needs a valid requirement-proof table in the PR body before CI starts.
 PROOF_CUTOFF = os.environ.get("PR_COORDINATOR_PROOF_CUTOFF", "2026-11-23T11:36:00Z")
+try:
+    if datetime.datetime.fromisoformat(PROOF_CUTOFF.strip().replace("Z", "+00:00")).tzinfo is None:
+        raise ValueError("no timezone")
+except ValueError as exc:
+    raise SystemExit(f"PR_COORDINATOR_PROOF_CUTOFF {PROOF_CUTOFF!r} is not an ISO-8601 instant with a timezone: {exc}")
 PROOF_COLUMNS = ["ac", "precondition", "postcondition", "establishing lines", "argument", "reviewer"]
 OWN_AUTHORS = {"mrveiss", "dependabot", "app/dependabot"}
 RED = {"FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ERROR", "ACTION_REQUIRED"}
@@ -487,7 +492,7 @@ def infra_rerun(p, seen, log):
         return red
     if not all(is_infra_failure(log_tail(p["red_ids"][c])) for c in red):
         return red
-    if proof_status(p, seen):                           # no rerun of a head the proof gate bars (the slot loop reports it)
+    if proof_status(p, seen):                     # no rerun of a head the proof gate bars (the slot loop reports it)
         return red
     for c in red:
         run = sh("gh", "api", f"repos/{REPO}/actions/jobs/{p['red_ids'][c]}", "--jq", ".run_id")
