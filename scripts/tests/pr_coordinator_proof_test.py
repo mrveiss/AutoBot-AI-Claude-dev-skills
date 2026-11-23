@@ -15,7 +15,7 @@ def load():
 PC = load()
 START_CI = PC.START_CI_SUBJECT
 HEAD = "| AC | Precondition | Postcondition | Establishing lines | Argument | Reviewer |\n|---|---|---|---|---|---|\n"
-ROW = "| AC1 | x holds | y holds | a.py:1-9 | because z | alice |\n"
+ROW = "| AC1 | x holds | y holds | a.py:1-9 | because z | reviewer: holds |\n"
 
 
 def body(table, heading="## Requirement proofs"):
@@ -43,17 +43,30 @@ class Table(unittest.TestCase):
         self.assertEqual(PC.proof_table_reason(body(t + ROW)), "")
 
     def test_na_row_accepted(self):
-        self.assertEqual(PC.proof_table_reason(body(HEAD + "| — | n/a | n/a | f.py:3 | pure rename | alice |")), "")
-        self.assertEqual(PC.proof_table_reason(body(HEAD + "| - | n/a | n/a | f.py:3 | pure rename | alice |")), "")
+        self.assertEqual(PC.proof_table_reason(body(HEAD + "| — | n/a | n/a | f.py:3 | pure rename | reviewer: holds |")), "")
+        self.assertEqual(PC.proof_table_reason(body(HEAD + "| - | n/a | n/a | f.py:3 | pure rename | reviewer: holds |")), "")
 
     def test_na_row_needs_argument(self):
-        self.assertIn("empty", PC.proof_table_reason(body(HEAD + "| — | n/a | n/a | f.py:3 |  | alice |")))
+        self.assertIn("empty", PC.proof_table_reason(body(HEAD + "| — | n/a | n/a | f.py:3 |  | reviewer: holds |")))
+
+    def test_reviewer_verdict(self):
+        def reason(cell):
+            return PC.proof_table_reason(body(HEAD + f"| AC1 | x | y | a.py:1 | z | {cell} |"))
+        for ok in ("reviewer: holds at abc123", "Holds", "REVIEWER: HOLDS AT abc", "holds \u2014 failure path covered", "verified at abc",
+                   "reviewer: **verified**", "holds \u2014 failsafe covered",
+                   "reviewer: holds at 35d7798355 (prior finding fixed: npm ci hint first in the FAIL headline at pr-preflight.sh:739)",
+                   "reviewer (independent subagent): holds at abc", "autobot-dev-skills:reviewer \u2014 holds", "**holds**"):
+            self.assertEqual(reason(ok), "", ok)
+        for bad in ("autobot-dev-skills:reviewer \u2014 fails: x", "does not hold", "doesn't hold", "blocked",
+                    "changes requested", "reviewer: ok", "fails: x", "not verified", "no longer holds", "reviewer: not verified",
+                    "reviewer: doesn\u2019t hold"):
+            self.assertIn("verdict is not 'holds'", reason(bad), bad)
 
     def test_missing_heading(self):
         self.assertIn("heading", PC.proof_table_reason(HEAD + ROW))
 
     def test_empty_cell(self):
-        self.assertIn("empty", PC.proof_table_reason(body(HEAD + "| AC1 | x | | a.py:1 | z | alice |")))
+        self.assertIn("empty", PC.proof_table_reason(body(HEAD + "| AC1 | x | | a.py:1 | z | reviewer: holds |")))
 
     def test_unsigned_reviewer_placeholders_fail(self):
         for cell in ("pending", "TBD", " Pending ", "todo", "?", "-", "\u2014"):
@@ -70,9 +83,9 @@ class Table(unittest.TestCase):
         self.assertIn("header", PC.proof_table_reason(body(t)))
 
     def test_escaped_pipe_cell_both_directions(self):
-        self.assertEqual(PC.proof_table_reason(body(HEAD + "| AC1 | a \\| b | y | f.py:1 | c \\| d | alice |")), "")
+        self.assertEqual(PC.proof_table_reason(body(HEAD + "| AC1 | a \\| b | y | f.py:1 | c \\| d | reviewer: holds |")), "")
         self.assertEqual(PC._cells("| a \\| b | c |"), ["a | b", "c"])
-        self.assertIn("empty", PC.proof_table_reason(body(HEAD + "| AC1 | a | b | f.py:1 | c | d | alice |")))
+        self.assertIn("empty", PC.proof_table_reason(body(HEAD + "| AC1 | a | b | f.py:1 | c | d | reviewer: holds |")))
 
     def test_table_under_another_heading(self):
         self.assertIn("heading", PC.proof_table_reason("## Notes\n\n" + HEAD + ROW))
