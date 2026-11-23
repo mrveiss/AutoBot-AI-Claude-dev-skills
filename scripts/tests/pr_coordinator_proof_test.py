@@ -55,6 +55,20 @@ class Table(unittest.TestCase):
     def test_table_under_another_heading(self):
         self.assertIn("heading", PC.proof_table_reason("## Notes\n\n" + HEAD + ROW))
 
+    def test_prose_before_table(self):
+        self.assertEqual(PC.proof_table_reason(body("Proofs below, one per AC.\n\nSecond line.\n\n" + HEAD + ROW)), "")
+
+    def test_html_comment_before_table(self):
+        self.assertEqual(PC.proof_table_reason(body("<!-- fill in -->\n\n" + HEAD + ROW)), "")
+
+    def test_table_only_in_later_section(self):
+        r = PC.proof_table_reason("## Requirement proofs\n\nnone yet\n\n## Notes\n\n" + HEAD + ROW)
+        self.assertIn("no table", r)
+
+    def test_fenced_fake_table_before_real(self):
+        fake = "```\n" + HEAD + "| AC9 | bad | | | | |\n```\n\n"
+        self.assertEqual(PC.proof_table_reason(body(fake + HEAD + ROW)), "")
+
     def test_fenced_fake_heading(self):
         fenced = "```\n## Requirement proofs\n\n" + HEAD + ROW + "```\n"
         self.assertIn("heading", PC.proof_table_reason(fenced))
