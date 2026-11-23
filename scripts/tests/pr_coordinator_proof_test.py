@@ -13,6 +13,7 @@ def load():
 
 
 PC = load()
+START_CI = PC.START_CI_SUBJECT
 HEAD = "| AC | Precondition | Postcondition | Establishing lines | Argument | Reviewer |\n|---|---|---|---|---|---|\n"
 ROW = "| AC1 | x holds | y holds | a.py:1-9 | because z | alice |\n"
 
@@ -84,16 +85,22 @@ class Table(unittest.TestCase):
 
 class Exempt(unittest.TestCase):
     """History: old(2026-11-20) <- merge M1 of main <- merge M2 of main; new work N is 2026-11-24."""
-    COMMITS = {"old": ("old", "base", "2026-11-20T08:00:00Z"), "m1": ("m1", "old,mainA", "2026-11-24T08:00:00Z"),
-               "m2": ("m2", "m1,mainB", "2026-11-25T08:00:00Z"), "new": ("new", "m2", "2026-11-24T09:00:00Z"),
-               "base": ("base", "x", "2026-11-01T00:00:00Z")}
+    COMMITS = {"old": ("old", "base", "2026-11-20T08:00:00Z", "t-old", "feat: work"),
+               "m1": ("m1", "old,mainA", "2026-11-24T08:00:00Z", "t-m1", "Merge main"),
+               "m2": ("m2", "m1,mainB", "2026-11-25T08:00:00Z", "t-m2", "Merge main"),
+               "new": ("new", "m2", "2026-11-24T09:00:00Z", "t-new", "feat: more"),
+               "base": ("base", "x", "2026-11-01T00:00:00Z", "t-base", "root"),
+               "ci": ("ci", "m2", "2026-11-26T08:00:00Z", "t-m2", START_CI + " (#5)"),
+               "cifiles": ("cifiles", "m2", "2026-11-26T08:00:00Z", "t-other", START_CI + " (#5)"),
+               "empty": ("empty", "m2", "2026-11-26T08:00:00Z", "t-m2", "chore: nothing")}
 
     def setUp(self):
         self.force = ""
         def fake(*a, **k):
             if "compare" in a[2]:
                 return "ahead" if a[2].split("/")[-1].startswith("mainA") or "mainB" in a[2] else "diverged"
-            return "\t".join(self.COMMITS[a[2].split("/")[-1]])
+            c = self.COMMITS[a[2].split("/")[-1]]
+            return c[3] if a[-1] == ".commit.tree.sha" else "\t".join(c)
         PC.sh = fake
         self.timeline_ok = True
         PC._force_push_times = lambda n: (self.timeline_ok, self.force.split())
@@ -127,6 +134,15 @@ class Exempt(unittest.TestCase):
 
     def test_only_main_merges_after_exempt_head_stays_exempt(self):
         self.assertTrue(PC.head_is_exempt(self.pr("m2")))
+
+    def test_start_ci_commit_on_exempt_head_stays_exempt(self):
+        self.assertTrue(PC.head_is_exempt(self.pr("ci")))
+
+    def test_start_ci_titled_commit_with_files_is_not_skipped(self):
+        self.assertFalse(PC.head_is_exempt(self.pr("cifiles")))
+
+    def test_empty_commit_with_other_subject_is_not_skipped(self):
+        self.assertFalse(PC.head_is_exempt(self.pr("empty")))
 
     def test_real_commit_after_cutoff_is_not_exempt(self):
         self.assertFalse(PC.head_is_exempt(self.pr("new")))

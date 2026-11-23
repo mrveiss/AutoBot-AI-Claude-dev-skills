@@ -379,14 +379,28 @@ def _ts(text):
     return datetime.datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
 
 
+START_CI_SUBJECT = "chore(ci): start the suite on the synced head"   # subject of the coordinator's own start-CI commit
+
+
 def _commit_facts(sha):
     raw = sh("gh", "api", f"repos/{REPO}/commits/{sha}",
-             "--jq", '[.sha, (.parents|map(.sha)|join(",")), .commit.committer.date]|@tsv')
-    return raw.split("\t") if raw.count("\t") == 2 else None
+             "--jq", '[.sha, (.parents|map(.sha)|join(",")), .commit.committer.date, .commit.tree.sha, '
+                     '(.commit.message|split("\n")[0])]|@tsv')
+    return raw.split("\t") if raw.count("\t") == 4 else None
+
+
+def _is_start_ci_commit(parents, tree, subject):
+    """The coordinator's own empty start-CI commit: single parent, tree equal to the parent's, AND the subject.
+    Never the subject alone, so a real commit cannot fake it. None (unreadable) is treated as not skipped."""
+    if len(parents) != 1 or not subject.startswith(START_CI_SUBJECT):
+        return False
+    parent_tree = sh("gh", "api", f"repos/{REPO}/commits/{parents[0]}", "--jq", ".commit.tree.sha")
+    return bool(parent_tree) and parent_tree.strip() == tree
 
 
 def effective_push(head):
-    """(sha, committer date) of the newest commit that is NOT a merge of main, walking first parents. A merge
+    """(sha, committer date) of the newest commit that is NOT a merge of main or the coordinator's empty start-CI
+    commit, walking first parents. A merge
     of main (two parents, every later parent already in main: the coordinator's update-branch, the sync bot,
     a hand merge) is not a new push, so an exempt PR stays exempt through its syncs."""
     cur = head
@@ -394,8 +408,11 @@ def effective_push(head):
         facts = _commit_facts(cur)
         if not facts:
             return None
-        sha, parents, date = facts
+        sha, parents, date, tree, subject = facts
         parents = parents.split(",")
+        if len(parents) == 1 and _is_start_ci_commit(parents, tree, subject):
+            cur = parents[0]
+            continue
         if not (len(parents) >= 2 and merges_only_main(parents[1:])):
             return sha, date
         cur = parents[0]
