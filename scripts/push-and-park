@@ -1,21 +1,18 @@
 #!/usr/bin/env bash
-# push-and-park — push, then IMMEDIATELY enforce one-PR-CI.
+# push-and-park -- push, then show where the pushed PR stands in the CI queue.
 #
-# Owner rule 2026-11-06: 2 PRs hold CI, park (cancel) the rest; supersedes the
-# 2026-11-05 "no cancel". pr-queue-gate parks only with --park (its default is
-# report-only), so this passes it. Issue: https://github.com/mrveiss/Claude-Dev-Skills/issues/11
-#
-# A push to a non-admitted PR starts a full suite the instant it lands, so the
-# rule is violated in the window between pushing and the next sweep. I did
-# exactly that twice in one hour -- 22 runs the first time, 6 the second --
-# both times intending to park "on the next tick". The next tick is too late:
-# the runners are already allocated.
-#
-# So the park is not a separate step to remember, it is part of pushing.
+# pr-coordinator owns CI slots and cancellation (owner rules 2026-11-18: FIFO, 2 slots,
+# rule 2 cancels every non-slot PR's runs through ci-cancel). A second canceller here
+# (the retired pr-queue-gate --park) ranked its own slots, could admit a PR the coordinator had not,
+# and printed nothing on some runs (Claude-Dev-Skills#11). So this script no longer parks:
+# it pushes and then prints the coordinator's read-only view (--dry), always ending in an
+# explicit status line so a silent run cannot look like success.
 # Usage: push-and-park [<git push args...>]
 set -u
 echo "== pushing =="
 PATH="$(git rev-parse --show-toplevel 2>/dev/null)/venv/bin:${AUTOBOT_VENV:-$HOME/AutoBot-Ai/AutoBot-AI/venv}/bin:$PATH" \
-  git push "$@" || { echo "push failed — not parking"; exit 1; }
-echo "== enforcing one-PR-CI (parking non-admitted runs) =="
-exec "$(dirname "$0")/pr-queue-gate" --park
+  git push "$@" || { echo "push failed -- not checking the queue"; exit 1; }
+echo "== CI queue (pr-coordinator owns slots and parks non-slot runs on its next tick) =="
+"$(dirname "$0")/pr-coordinator" --dry; rc=$?
+if [ "$rc" -eq 0 ]; then echo "push-and-park: pushed; queue view above"; else echo "push-and-park: ERROR queue view failed (exit $rc); the push itself succeeded"; fi
+exit "$rc"
