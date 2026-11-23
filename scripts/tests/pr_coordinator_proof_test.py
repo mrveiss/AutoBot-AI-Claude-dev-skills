@@ -47,6 +47,23 @@ class Table(unittest.TestCase):
         t = "| AC | Precondition | Postcondition | Establishing lines | Argument |\n|---|---|---|---|---|\n| 1 | a | b | c | d |"
         self.assertIn("header", PC.proof_table_reason(body(t)))
 
+    def test_escaped_pipe_cell_both_directions(self):
+        self.assertEqual(PC.proof_table_reason(body(HEAD + "| AC1 | a \\| b | y | f.py:1 | c \\| d | alice |")), "")
+        self.assertEqual(PC._cells("| a \\| b | c |"), ["a | b", "c"])
+        self.assertIn("empty", PC.proof_table_reason(body(HEAD + "| AC1 | a | b | f.py:1 | c | d | alice |")))
+
+    def test_table_under_another_heading(self):
+        self.assertIn("heading", PC.proof_table_reason("## Notes\n\n" + HEAD + ROW))
+
+    def test_fenced_fake_heading(self):
+        fenced = "```\n## Requirement proofs\n\n" + HEAD + ROW + "```\n"
+        self.assertIn("heading", PC.proof_table_reason(fenced))
+
+    def test_bad_separator(self):
+        bad = HEAD.replace("|---|---|---|---|---|---|", "|---|---|---|")
+        self.assertIn("separator", PC.proof_table_reason(body(bad + ROW)))
+        self.assertIn("separator", PC.proof_table_reason(body(HEAD.replace("---|---|---|---|---|---", "a|b|c|d|e|f") + ROW)))
+
     def test_zero_rows(self):
         self.assertIn("no data row", PC.proof_table_reason(body(HEAD.rstrip("\n"))))
 
@@ -62,24 +79,50 @@ class Exempt(unittest.TestCase):
         def fake(*a, **k):
             if "compare" in a[2]:
                 return "ahead" if a[2].split("/")[-1].startswith("mainA") or "mainB" in a[2] else "diverged"
-            if "timeline" in a[2]:
-                return self.force
             return "\t".join(self.COMMITS[a[2].split("/")[-1]])
         PC.sh = fake
-        PC._PROOF.clear()
+        self.timeline_ok = True
+        PC._force_push_times = lambda n: (self.timeline_ok, self.force.split())
+        PC.PROOF_CUTOFF = "2026-11-23T11:36:00Z"
+
+    def pr(self, head, created="2026-11-01T00:00:00Z"):
+        return {"number": 5, "headRefOid": head, "createdAt": created, "headRefName": "b", "body": ""}
+
+    def test_timeline_api_error_fails_closed(self):
+        self.timeline_ok = False
+        self.assertIsNone(PC.head_is_exempt(self.pr("m2")))
+        seen = {}
+        self.assertIn("failing closed", PC.proof_status(self.pr("m2"), seen))
+        self.assertEqual(seen, {})
+
+    def test_pr_created_after_cutoff_never_exempt(self):
+        self.assertFalse(PC.head_is_exempt(self.pr("m2", "2026-11-23T12:00:00Z")))
+
+    def test_plus_zero_offset_cutoff_override(self):
+        PC.PROOF_CUTOFF = "2026-11-24T09:00:00+00:00"
+        self.assertTrue(PC.head_is_exempt(self.pr("new")))
+        PC.PROOF_CUTOFF = "2026-11-24T08:59:59+00:00"
+        self.assertFalse(PC.head_is_exempt(self.pr("new")))
+
+    def test_verdict_persisted_in_seen(self):
+        seen = {}
+        self.assertEqual(PC.proof_status(self.pr("m2"), seen), "")
+        self.assertEqual(seen, {"5:proof-exempt:m2": 1})
+        PC.sh = lambda *a, **k: self.fail("API called again")
+        self.assertEqual(PC.proof_status(self.pr("m2"), seen), "")
 
     def test_only_main_merges_after_exempt_head_stays_exempt(self):
-        self.assertTrue(PC.head_is_exempt(5, "m2"))
+        self.assertTrue(PC.head_is_exempt(self.pr("m2")))
 
     def test_real_commit_after_cutoff_is_not_exempt(self):
-        self.assertFalse(PC.head_is_exempt(5, "new"))
+        self.assertFalse(PC.head_is_exempt(self.pr("new")))
 
     def test_force_push_after_cutoff_is_not_exempt(self):
         self.force = "2026-11-23T12:00:00Z"
-        self.assertFalse(PC.head_is_exempt(5, "m2"))
+        self.assertFalse(PC.head_is_exempt(self.pr("m2")))
 
     def test_status_blocks_and_dedupes(self):
-        p = {"number": 5, "headRefOid": "new", "headRefName": "b", "body": "", "owner": "o", "alive": "a"}
+        p = {**self.pr("new"), "owner": "o", "alive": "a"}
         seen, log, att = {}, [], []
         self.assertTrue(PC.proof_blocked(p, seen, log, att))
         self.assertTrue(PC.proof_blocked(p, seen, log, att))
@@ -89,6 +132,46 @@ class Exempt(unittest.TestCase):
     def test_valid_table_never_blocks(self):
         p = {"number": 5, "headRefOid": "new", "headRefName": "b", "body": body(HEAD + ROW)}
         self.assertFalse(PC.proof_blocked(p, {}, [], []))
+
+
+class Gating(unittest.TestCase):
+    """The gate bars only the CI starters: a green, approved, barred PR still merges."""
+    def setUp(self):
+        self.calls = []
+        PC.DRY = False
+        PC.sh = lambda *a, **k: (self.calls.append(a), "GREEN" if a[0].endswith("ci-gate") else "")[1]
+        PC.review_carries = lambda *a: True
+        PC.MIGRATION_GROUP = set()
+        self.p = {"number": 7, "headRefOid": "h", "headRefName": "b", "body": "", "createdAt": "2026-11-24T00:00:00Z",
+                  "reviewThreads": {"nodes": []}, "owner": "o", "alive": "a"}
+
+    class R:
+        def hgetall(self, k):
+            return {"review_verdict": "approve", "review_sha": "h"}
+
+    def test_green_barred_pr_continues_to_merge(self):
+        log, att, seen = [], [], {}
+        self.assertTrue(PC.proof_blocked(self.p, seen, log, att))
+        self.assertFalse(PC.slot_ci_phase(7, self.p, True, seen, log, att))
+        PC.slot_land_phase(7, self.p, True, self.R(), seen, log, att)
+        self.assertIn("merge #7", log)
+        self.assertTrue(any(c[0].endswith("safe-merge") for c in self.calls))
+
+    def test_barred_non_green_pr_starts_no_ci(self):
+        PC.sh = lambda *a, **k: (self.calls.append(a), "RED" if a[0].endswith("ci-gate") else "")[1]
+        self.assertTrue(PC.slot_ci_phase(7, self.p, True, {}, [], []))
+        self.assertFalse(any(c[:2] in (("gh", "run"), ("gh", "workflow")) for c in self.calls))
+
+
+class InfraRefuses(unittest.TestCase):
+    def test_infra_rerun_refuses_barred_head(self):
+        PC.log_tail = lambda job: "Temporary failure resolving 'x'\n##[error]Process completed with exit code 100."
+        calls = []
+        PC.sh = lambda *a, **k: (calls.append(a), "")[1]
+        PC.head_is_exempt = lambda p: False
+        p = {"number": 9, "headRefOid": "abc", "body": "", "red": ["a"], "red_ids": {"a": 1}}
+        self.assertEqual(PC.infra_rerun(p, {}, []), ["a"])
+        self.assertFalse(any(c[:2] == ("gh", "run") for c in calls))
 
 
 if __name__ == "__main__":

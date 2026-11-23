@@ -16,6 +16,9 @@ while read -r n b base land; do
   case "$b" in release|main|Dev_new_gui|rescued/*) continue;; esac
   behind=$(gh api "repos/$REPO/compare/main...$b" -q .behind_by 2>/dev/null) || continue
   [ "${behind:-0}" -le "$MAX" ] && continue
+  if ! "$HOME/.claude/scripts/pr-coordinator" --proof-check "$n" 2>/dev/null; then
+    echo "branch-refresh: #$n skipped (requirement-proof gate)" >&2; continue
+  fi
   if gh pr update-branch "$n" --repo $REPO >/dev/null 2>&1; then
     upd="$upd #$n($behind)"
     if [ "$land" != true ]; then

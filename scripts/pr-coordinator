@@ -15,7 +15,7 @@ No active trainmaster is assumed; when one is active (ledger hold `trainmaster`)
 Prints the queue + an ATTENTION block (JSON lines) the coordinator session relays to owners.
 State: ~/.claude/state/pr-coordinator/ (notified keys, queue.md).
 """
-import importlib.machinery, importlib.util, json, os, re, subprocess, sys, time
+import datetime, importlib.machinery, importlib.util, json, os, re, subprocess, sys, time
 from pathlib import Path
 
 REPO, WIDTH, LAST = "mrveiss/AutoBot-AI", 2, {19456}
@@ -282,24 +282,30 @@ def merges_only_main(others):
     return True
 
 
+CELL_SPLIT = re.compile(r"(?<!\\)\|")
+FENCE = re.compile(r"^\s*(```|~~~)")
+WALK_LIMIT = 40   # first-parent steps when looking for the newest non-main-merge commit
+
+
 def _cells(line):
-    return [c.strip() for c in line.strip().strip("|").split("|")]
+    """Cells of one table row: split on unescaped pipes, `\\|` unescaped to `|`."""
+    inner = line.strip()
+    inner = inner[1:] if inner.startswith("|") else inner
+    inner = inner[:-1] if inner.endswith("|") and not inner.endswith("\\|") else inner
+    return [c.strip().replace("\\|", "|") for c in CELL_SPLIT.split(inner)]
 
 
 def _table_after_heading(body):
-    """Table lines under the `## Requirement proofs` heading, or None when the heading is absent."""
-    lines = (body or "").splitlines()
+    """Table lines under the `## Requirement proofs` heading (fenced code is not a heading), or None."""
+    lines, fenced = (body or "").splitlines(), False
     for i, ln in enumerate(lines):
-        if re.fullmatch(r"#{2,}\s*requirement\s+proofs\s*", ln.strip(), re.I):
+        if FENCE.match(ln):
+            fenced = not fenced
+        elif not fenced and re.fullmatch(r"#{2,}\s*requirement\s+proofs\s*", ln.strip(), re.I):
             rest = [x.strip() for x in lines[i + 1:]]
             while rest and not rest[0]:
                 rest.pop(0)
-            table = []
-            for x in rest:
-                if not x.startswith("|"):
-                    break
-                table.append(x)
-            return table
+            return [x for x in rest[:next((j for j, x in enumerate(rest) if not x.startswith("|")), len(rest))]]
     return None
 
 
@@ -310,16 +316,21 @@ def proof_table_reason(body):
         return "no '## Requirement proofs' heading"
     if len(table) < 2 or [re.sub(r"\s+", " ", c.lower()) for c in _cells(table[0])] != PROOF_COLUMNS:
         return "table header is not AC | Precondition | Postcondition | Establishing lines | Argument | Reviewer"
-    if not all(re.fullmatch(r":?-+:?", c.replace(" ", "")) for c in _cells(table[1])):
-        return "table has no separator row"
-    rows = table[2:]
-    if not rows:
+    sep = _cells(table[1])
+    if len(sep) != len(PROOF_COLUMNS) or not all(re.fullmatch(r":?-+:?", c.replace(" ", "")) for c in sep):
+        return "table separator row is not 6 cells of dashes"
+    if len(table) == 2:
         return "table has no data row"
-    for k, row in enumerate(rows, 1):
+    for k, row in enumerate(table[2:], 1):
         cells = _cells(row)
         if len(cells) != len(PROOF_COLUMNS) or not all(cells):
             return f"row {k} has an empty cell or the wrong cell count"
     return ""
+
+
+def _ts(text):
+    """ISO-8601 to an aware datetime; `Z` and `+00:00` spell the same instant."""
+    return datetime.datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
 
 
 def _commit_facts(sha):
@@ -333,7 +344,7 @@ def effective_push(head):
     of main (two parents, every later parent already in main: the coordinator's update-branch, the sync bot,
     a hand merge) is not a new push, so an exempt PR stays exempt through its syncs."""
     cur = head
-    for _ in range(40):
+    for _ in range(WALK_LIMIT):
         facts = _commit_facts(cur)
         if not facts:
             return None
@@ -345,36 +356,50 @@ def effective_push(head):
     return None
 
 
-def head_is_exempt(n, head):
-    """Exempt = the pushed work is at or before the cutoff. Push time is the later of the effective head's
+def _force_push_times(n):
+    """(ok, [created_at...]) of the PR's head_ref_force_pushed events; ok is False on an API error."""
+    proc = subprocess.run(["gh", "api", f"repos/{REPO}/issues/{n}/timeline?per_page=100", "--paginate", "--jq",
+                           '.[]|select(.event=="head_ref_force_pushed")|.created_at'],
+                          capture_output=True, text=True, encoding="utf-8")
+    return proc.returncode == 0, proc.stdout.split()
+
+
+def head_is_exempt(p):
+    """True/False, or None when the answer could not be read (fail closed: None is NOT exempt, never cached).
+    Exempt = the pushed work is at or before the cutoff. Push time is the later of the effective head's
     committer date and the PR timeline's latest head_ref_force_pushed event: neither alone is a push time
-    (a plain push has no timeline event; a commit made earlier keeps its old committer date), the later is the
-    safest bound. An unreadable head is NOT exempt (fail closed)."""
-    eff = effective_push(head)
-    if not eff:
+    (a plain push has no timeline event; a commit made earlier keeps its old committer date). A PR created
+    after the cutoff is never exempt."""
+    cutoff = _ts(PROOF_CUTOFF)
+    if p.get("createdAt") and _ts(p["createdAt"]) > cutoff:
         return False
-    force = sh("gh", "api", f"repos/{REPO}/issues/{n}/timeline?per_page=100", "--paginate", "--jq",
-               '.[]|select(.event=="head_ref_force_pushed")|.created_at').split()
-    return max([eff[1]] + force[-1:]) <= PROOF_CUTOFF
+    eff = effective_push(p["headRefOid"])
+    ok, force = _force_push_times(p["number"])
+    if not eff or not ok:
+        return None
+    return max(_ts(t) for t in [eff[1]] + force[-1:]) <= cutoff
 
 
-_PROOF = {}   # (pr, head) -> reason; a head's verdict cannot change until its body or head does
-
-
-def proof_status(p):
-    """Empty string when CI may start for this head; else why not (requirement-proof gate, owner 2026-11-23)."""
+def proof_status(p, seen=None):
+    """Empty string when CI may start for this head; else why not (requirement-proof gate, owner 2026-11-23).
+    The exemption verdict is persisted per (PR, head) in `seen` (notified.json) so the commit and timeline API
+    calls are made once per head, not every tick."""
     reason = proof_table_reason(p.get("body"))
     if not reason:
         return ""
-    key = (p["number"], p["headRefOid"], p.get("body"))
-    if key not in _PROOF:
-        _PROOF[key] = "" if head_is_exempt(p["number"], p["headRefOid"]) else reason
-    return _PROOF[key]
+    seen = {} if seen is None else seen
+    key = f"{p['number']}:proof-exempt:{p['headRefOid']}"
+    if key not in seen:
+        verdict = head_is_exempt(p)
+        if verdict is None:
+            return reason + " (exemption unreadable, failing closed)"
+        seen[key] = int(verdict)
+    return "" if seen[key] else reason
 
 
 def proof_blocked(p, seen, log, attention):
     """True (and reported once per head) when the proof gate bars CI. The PR keeps its FIFO place."""
-    reason = proof_status(p)
+    reason = proof_status(p, seen)
     if not reason:
         return False
     k = f"{p['number']}:proof-missing:{p['headRefOid']}"
@@ -384,6 +409,20 @@ def proof_blocked(p, seen, log, attention):
         attention.append({"pr": p["number"], "kind": "proof-missing", "owner": p.get("owner"), "owner_state": p.get("alive"),
                           "branch": p["headRefName"], "head": p["headRefOid"][:9], "reason": reason})
     return True
+
+
+def proof_check_cli(n):
+    """`pr-coordinator --proof-check N`: exit 0 = CI may start, 1 = barred (reason on stderr). Shared by
+    safe-merge and branch-refresh so the parser lives only here."""
+    raw = sh("gh", "api", f"repos/{REPO}/pulls/{n}", "--jq",
+             '{number, headRefOid: .head.sha, headRefName: .head.ref, body, createdAt: .created_at}')
+    if not raw:
+        print(f"#{n}: PR unreadable, failing closed", file=sys.stderr)
+        return 1
+    reason = proof_status(json.loads(raw))
+    if reason:
+        print(f"#{n}: requirement-proof table missing/invalid ({reason})", file=sys.stderr)
+    return 1 if reason else 0
 
 
 def review_carries(review_sha, head):
@@ -448,7 +487,7 @@ def infra_rerun(p, seen, log):
         return red
     if not all(is_infra_failure(log_tail(p["red_ids"][c])) for c in red):
         return red
-    if proof_status(p):                           # no rerun of a head the proof gate bars (the slot loop reports it)
+    if proof_status(p, seen):                           # no rerun of a head the proof gate bars (the slot loop reports it)
         return red
     for c in red:
         run = sh("gh", "api", f"repos/{REPO}/actions/jobs/{p['red_ids'][c]}", "--jq", ".run_id")
@@ -457,6 +496,90 @@ def infra_rerun(p, seen, log):
             seen[keys[c]] = int(time.time())
             sh("gh", "run", "rerun", run, "--failed", "--repo", REPO)
     return []
+
+
+def _update_step(n, p, blocked, log):
+    """update-branch makes a plain merge commit that DOES trigger CI (it is not the `[skip ci]` sync head), so a
+    barred PR is not updated unless it is already green."""
+    bo = sh(str(S / "behind-ok"), str(n))
+    if not (" UPDATE " in f" {bo} " or "UPDATE" in bo.split()[1:2]):
+        return False
+    if blocked and not sh(str(S / "ci-gate"), str(n)).endswith("GREEN"):
+        return True
+    log.append(f"update-branch #{n} ({bo})")
+    if not DRY:
+        sh("gh", "api", "-X", "PUT", f"repos/{REPO}/pulls/{n}/update-branch", "-f", f"expected_head_sha={p['headRefOid']}")
+    return True
+
+
+def _recheck_step(n, p, runs_here, blocked, seen, log):
+    if not (RECHECK.get(str(n)) == p["headRefOid"][:9] and any(r.endswith("\tfailure") for r in runs_here)):
+        return False
+    # A rerun replays the ORIGINAL event payload (labels/draft as they were), so a metadata-only fix never
+    # clears by rerun. A fresh head does: ask the sync for its empty start-CI commit, once per head.
+    k = f"{n}:recheck-start-ci:{p['headRefOid']}"
+    if k not in seen and not blocked:
+        seen[k] = int(time.time())
+        log.append(f"start-ci #{n} (stale red at a recheck head: fresh event needed)")
+        if not DRY:
+            sh("gh", "workflow", "run", "sync-branches-with-main.yml", "--repo", REPO, "-f", f"start_ci_for_pr={n}")
+    return True
+
+
+def slot_ci_phase(n, p, blocked, seen, log, attention):
+    """CI starters for one slot PR. Returns True when the tick for this PR ends here. `blocked` bars only the
+    starters (recheck start-ci, cancelled-run rerun, start_ci_or_report, update-branch of a non-green PR)."""
+    if _update_step(n, p, blocked, log):
+        return True
+    runs_here = sh("gh", "api", f"repos/{REPO}/actions/runs?head_sha={p['headRefOid']}&per_page=100",
+                   "--jq", '.workflow_runs[]|[.id, .status, (.conclusion // "")]|@tsv').splitlines()
+    if _recheck_step(n, p, runs_here, blocked, seen, log):
+        return True
+    cancelled = [r.split("\t")[0] for r in runs_here if r.endswith("\tcancelled")]
+    live = any(r.split("\t")[1] != "completed" for r in runs_here if r)
+    if cancelled and not live and not blocked:    # judge by Actions runs only: outside apps (semgrep) are not CI
+        log.append(f"rerun {len(cancelled)} cancelled run(s) #{n}")
+        if not DRY:
+            for rid in cancelled:
+                sh("gh", "run", "rerun", rid, "--repo", REPO)
+        return True
+    gate = sh(str(S / "ci-gate"), str(n))
+    if gate.endswith("GREEN"):
+        return False
+    if not blocked:                               # never stall silently: ask Actions whether a run is live
+        start_ci_or_report(n, p, gate, seen, log, attention)
+    return True
+
+
+def slot_land_phase(n, p, landing_head, r, seen, log, attention):
+    """Review, threads, migration-gate, FIFO and merge for a green slot PR. Never gated by the proof gate."""
+    rv = r.hgetall(f"lg:pr:{n}")
+    unresolved = sum(1 for t in p["reviewThreads"]["nodes"] if not t["isResolved"])
+    if rv.get("review_verdict") != "approve" or not review_carries(rv.get("review_sha", ""), p["headRefOid"]):
+        k = f"{n}:review:{p['headRefOid']}"
+        if k not in seen:
+            seen[k] = int(time.time())
+            attention.append({"pr": n, "kind": "review", "owner": p["owner"], "owner_state": p["alive"],
+                              "branch": p["headRefName"], "head": p["headRefOid"][:9]})
+    elif unresolved:
+        k = f"{n}:threads:{p['headRefOid']}:{unresolved}"   # say it once per head and count, not every tick
+        if k not in seen:
+            seen[k] = int(time.time())
+            log.append(f"#{n} green+approved but {unresolved} unresolved thread(s)")
+    elif str(n) in MIGRATION_GROUP and not migration_gate_ran(p["headRefOid"]):
+        k = f"{n}:migration-gate-skipped:{p['headRefOid']}"   # owner c3: the real-DB admin test skips
+        if k not in seen:                                        # without Postgres, so the gate must RUN
+            seen[k] = int(time.time())
+            log.append(f"#{n} green but run-migration-gate did not succeed at this head: no merge")
+    elif not landing_head:
+        k = f"{n}:fifo-wait:{p['headRefOid']}"
+        if k not in seen:
+            seen[k] = int(time.time())
+            log.append(f"#{n} green, waits for an older slot PR (FIFO)")
+    else:
+        log.append(f"merge #{n}")
+        if not DRY:
+            log.append(sh(str(S / "safe-merge"), str(n)))
 
 
 def main():
@@ -590,68 +713,11 @@ def main():
         p = pmap[n]
         if n in held and held[n].get("by") != ME:
             continue                              # another session drives its own slot
-        bo = sh(str(S / "behind-ok"), str(n))
-        if " UPDATE " in f" {bo} " or "UPDATE" in bo.split()[1:2]:
-            log.append(f"update-branch #{n} ({bo})")
-            if not DRY:
-                sh("gh", "api", "-X", "PUT", f"repos/{REPO}/pulls/{n}/update-branch",
-                   "-f", f"expected_head_sha={p['headRefOid']}")
-            continue
-        if proof_blocked(p, seen, log, attention):
-            continue                              # no start-ci / rerun without a requirement-proof table
-        runs_here = sh("gh", "api", f"repos/{REPO}/actions/runs?head_sha={p['headRefOid']}&per_page=100",
-                       "--jq", '.workflow_runs[]|[.id, .status, (.conclusion // "")]|@tsv').splitlines()
-        cancelled = [r.split("\t")[0] for r in runs_here if r.endswith("\tcancelled")]
-        if RECHECK.get(str(n)) == p["headRefOid"][:9] and any(r.endswith("\tfailure") for r in runs_here):
-            # A rerun replays the ORIGINAL event payload (labels/draft as they were), so a metadata-only fix never
-            # clears by rerun. A fresh head does: ask the sync for its empty start-CI commit, once per head.
-            k = f"{n}:recheck-start-ci:{p['headRefOid']}"
-            if k not in seen:
-                seen[k] = int(time.time())
-                log.append(f"start-ci #{n} (stale red at a recheck head: fresh event needed)")
-                if not DRY:
-                    sh("gh", "workflow", "run", "sync-branches-with-main.yml", "--repo", REPO,
-                       "-f", f"start_ci_for_pr={n}")
-            continue
-        live = any(r.split("\t")[1] != "completed" for r in runs_here if r)
-        if cancelled and not live:                # judge by Actions runs only: outside apps (semgrep) are not CI
-            log.append(f"rerun {len(cancelled)} cancelled run(s) #{n}")
-            if not DRY:
-                for rid in cancelled:
-                    sh("gh", "run", "rerun", rid, "--repo", REPO)
+        blocked = proof_blocked(p, seen, log, attention)   # gates ONLY the CI starters; every other page still runs
+        if slot_ci_phase(n, p, blocked, seen, log, attention):
             continue
         landing_head = n in unblock or not any(could_land(m) for m in slots[:i] if m in open_nums)
-        gate = sh(str(S / "ci-gate"), str(n))
-        if not gate.endswith("GREEN"):            # never stall silently: start_ci_or_report asks Actions itself
-            start_ci_or_report(n, p, gate, seen, log, attention)   # whether a run is live; outside apps'
-            continue                              # statuses (semgrep, CodeRabbit) are not CI
-        rv = r.hgetall(f"lg:pr:{n}")
-        unresolved = sum(1 for t in p["reviewThreads"]["nodes"] if not t["isResolved"])
-        if rv.get("review_verdict") != "approve" or not review_carries(rv.get("review_sha", ""), p["headRefOid"]):
-            k = f"{n}:review:{p['headRefOid']}"
-            if k not in seen:
-                seen[k] = int(time.time())
-                attention.append({"pr": n, "kind": "review", "owner": p["owner"], "owner_state": p["alive"],
-                                  "branch": p["headRefName"], "head": p["headRefOid"][:9]})
-        elif unresolved:
-            k = f"{n}:threads:{p['headRefOid']}:{unresolved}"   # say it once per head and count, not every tick
-            if k not in seen:
-                seen[k] = int(time.time())
-                log.append(f"#{n} green+approved but {unresolved} unresolved thread(s)")
-        elif str(n) in MIGRATION_GROUP and not migration_gate_ran(p["headRefOid"]):
-            k = f"{n}:migration-gate-skipped:{p['headRefOid']}"   # owner c3: the real-DB admin test skips
-            if k not in seen:                                        # without Postgres, so the gate must RUN
-                seen[k] = int(time.time())
-                log.append(f"#{n} green but run-migration-gate did not succeed at this head: no merge")
-        elif not landing_head:
-            k = f"{n}:fifo-wait:{p['headRefOid']}"
-            if k not in seen:
-                seen[k] = int(time.time())
-                log.append(f"#{n} green, waits for an older slot PR (FIFO)")
-        else:
-            log.append(f"merge #{n}")
-            if not DRY:
-                log.append(sh(str(S / "safe-merge"), str(n)))
+        slot_land_phase(n, p, landing_head, r, seen, log, attention)
 
     if not DRY:
         seen_path.write_text(json.dumps(seen), encoding="utf-8")
@@ -705,6 +771,8 @@ def degraded_tick(err):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--proof-check":
+        raise SystemExit(proof_check_cli(sys.argv[2]))
     try:
         main()
     except SystemExit as exc:

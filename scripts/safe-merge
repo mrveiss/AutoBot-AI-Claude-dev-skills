@@ -31,7 +31,9 @@ if [ -n "${merged:-}" ]; then
     sha=$(gh pr view "$nxt" --repo $REPO --json headRefOid -q .headRefOid 2>/dev/null)
     ids=$(gh api "repos/$REPO/actions/runs?head_sha=$sha&per_page=100" \
             -q '.workflow_runs[]|select(.conclusion=="cancelled")|.id' 2>/dev/null)
-    if [ -n "$ids" ]; then
+    if [ -n "$ids" ] && ! "$HOME/.claude/scripts/pr-coordinator" --proof-check "$nxt" 2>/dev/null; then
+      echo "#$nxt: not restarting cancelled runs (requirement-proof gate)"
+    elif [ -n "$ids" ]; then
       echo "#$nxt: restarting $(grep -c . <<<"$ids") cancelled run(s)"
       xargs -r -P4 -I{} gh run rerun {} --repo $REPO >/dev/null 2>&1 <<<"$ids"
     fi
