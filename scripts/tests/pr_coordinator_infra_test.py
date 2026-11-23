@@ -71,7 +71,7 @@ class Rerun(unittest.TestCase):
         self.log, self.seen = [], {}
 
     def pr(self, red):
-        ok = "## Requirement proofs\n\n| AC | Precondition | Postcondition | Establishing lines | Argument | Reviewer |\n|---|---|---|---|---|---|\n| 1 | a | b | c | d | e |"
+        ok = "## Requirement proofs\n\n| AC | Precondition | Postcondition | Establishing lines | Argument | Reviewer |\n|---|---|---|---|---|---|\n| 1 | a | b | c | d | e: holds |"
         return {"number": 9, "headRefOid": "abc", "body": ok, "red": red, "red_ids": {c: i for c, i in red_ids.items() if c in red}}
 
     def test_once_then_red(self):

@@ -34,6 +34,9 @@ except ValueError as exc:
     raise SystemExit(f"PR_COORDINATOR_PROOF_CUTOFF {PROOF_CUTOFF!r} is not an ISO-8601 instant with a timezone: {exc}")
 # A Reviewer cell holding one of these is a placeholder, not a sign-off (an empty cell is rejected earlier, as an empty cell).
 UNSIGNED_REVIEWER = {"", "pending", "tbd", "todo", "?", "-", "\u2014"}
+NEGATIVE_VERDICTS = ("fail", "fails", "failed", "does not hold", "doesn't hold", "not hold", "blocked",
+                     "request changes", "changes requested", "rejected")   # a Reviewer cell naming one is not a pass
+POSITIVE_VERDICT = re.compile(r"\bholds\b", re.I)                          # "holds" / "holds at <sha>"
 PROOF_COLUMNS = ["ac", "precondition", "postcondition", "establishing lines", "argument", "reviewer"]
 OWN_AUTHORS = {"mrveiss", "dependabot", "app/dependabot"}
 RED = {"FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ERROR", "ACTION_REQUIRED"}
@@ -494,6 +497,9 @@ def proof_table_reason(body):
             return f"row {k} has an empty cell or the wrong cell count"
         if cells[-1].lower() in UNSIGNED_REVIEWER:
             return f"row {k}: Reviewer not signed"
+        low = cells[-1].lower()
+        if any(t in low for t in NEGATIVE_VERDICTS) or not POSITIVE_VERDICT.search(low):
+            return f"row {k}: Reviewer verdict is not 'holds'"
     return ""
 
 
