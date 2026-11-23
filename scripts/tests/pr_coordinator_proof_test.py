@@ -52,10 +52,11 @@ class Table(unittest.TestCase):
     def test_reviewer_verdict(self):
         def reason(cell):
             return PC.proof_table_reason(body(HEAD + f"| AC1 | x | y | a.py:1 | z | {cell} |"))
-        for ok in ("reviewer: holds at abc123", "Holds", "REVIEWER: HOLDS AT abc"):
+        for ok in ("reviewer: holds at abc123", "Holds", "REVIEWER: HOLDS AT abc", "holds \u2014 failure path covered", "verified at abc",
+                   "reviewer: **verified**", "failsafe holds"):
             self.assertEqual(reason(ok), "", ok)
         for bad in ("autobot-dev-skills:reviewer \u2014 fails: x", "does not hold", "doesn't hold", "blocked",
-                    "changes requested", "reviewer: ok", "verified"):
+                    "changes requested", "reviewer: ok", "fails: x", "holds but fails on y", "verified but rejected"):
             self.assertIn("verdict is not 'holds'", reason(bad), bad)
 
     def test_missing_heading(self):
