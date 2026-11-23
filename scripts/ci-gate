@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# ci-gate PR... — one line per PR: strict required-context verdict at the exact head.
+# GREEN only when every required context has no pending run and its latest non-skipped
+# run is success (all-skipped counts as not-applicable). Caches verdicts in Redis db15.
+set -u
+REPO=mrveiss/AutoBot-AI
+MUST_RUN='smoke-test|python-suite'   # contexts that need a real success; all-skipped is RED, not N/A
+# python-suite (backend pytest + every repo_tests/ guard) is NOT in branch protection (#14353), yet
+# #17086 merged with its 12 shards never finished and main went red twice (#17124, glob guard).
+# Gate on it here until branch protection requires it.
+# migration-tests is likewise NOT in branch protection. 2026-09-30: #17772 merged with it
+# skipped, and five tests in autobot-backend/tests/migrations/ were red on main for a day.
+# Its skips are often legitimate (path-filtered), so it is consulted but not in MUST_RUN --
+# an all-skipped result shows as `skipped:migration-tests` rather than RED.
+EXTRA='python-suite|migration-tests'
+R=$( (gh api repos/$REPO/branches/main/protection/required_status_checks -q '.contexts[]' 2>/dev/null; tr '|' '\n' <<<"$EXTRA") | sort -u)
+for p in "$@"; do
+  s=$(gh pr view "$p" --repo $REPO --json headRefOid,state,isDraft 2>/dev/null) || { echo "#$p ?"; continue; }
+  sha=$(jq -r .headRefOid <<<"$s"); st=$(jq -r .state <<<"$s")
+  [ "$st" != OPEN ] && { echo "#$p $st"; continue; }
+  # #18208: after the one-workflow cutover every gate FAILS on a draft by design ("draft:
+  # mark ready for review"). A draft cannot merge either way, so it has no verdict; calling
+  # those failures RED would send someone hunting a defect that does not exist.
+  if [ "$(jq -r .isDraft <<<"$s")" = true ]; then
+    redis-cli --no-auth-warning -n 15 HSET "claude:gate:$p" sha "$sha" verdict DRAFT at "$(date +%s)" >/dev/null 2>&1
+    echo "#$p ${sha:0:9} DRAFT"; continue
+  fi
+  runs=$(gh api "repos/$REPO/commits/$sha/check-runs?per_page=100" -q '.check_runs[]|"\(.id)\t\(.name)\t\(.status)\t\(.conclusion)"' 2>/dev/null | sort -t$'\t' -k1,1nr)
+  sts=$(gh api "repos/$REPO/commits/$sha/status" -q '.statuses[]|"999999999999\t\(.context)\t\(if .state=="pending" then "queued" else "completed" end)\t\(.state)"' 2>/dev/null)
+  all=$(printf '%s\n%s\n' "$sts" "$runs"); red=""; wait=""; rerun=""; skipped=""; unset pend
+  while IFS= read -r ctx; do
+    [ -z "$ctx" ] && continue
+    rows=$(awk -F'\t' -v c="$ctx" '$2==c' <<<"$all")
+    # #18208: after the cutover the migration job reports as `run-migration-gate / ...`, so a
+    # bare `migration-tests` row never appears and waiting on it would wait forever. Safe in
+    # both shapes: the required `migration-matrix` gate fails unless that job succeeded.
+    if [ -z "$rows" ] && [ "$ctx" = migration-tests ]; then continue; fi
+    if [ -z "$rows" ]; then wait="$wait,$ctx"; continue; fi
+    if awk -F'\t' '$3!="completed"{f=1} END{exit !f}' <<<"$rows"; then wait="$wait,$ctx"; continue; fi
+    real=$(awk -F'\t' '$4!="skipped"{print $4; exit}' <<<"$rows")
+    # Owner rule 2026-09-19: nothing lands on main without passing the docker smoke test.
+    # smoke-test is reported by the real docker-smoke-test.yml job OR its path-filtered
+    # shim; if BOTH were skipped (path detection failed/cancelled), no smoke ran at all.
+    if [ -z "$real" ] && grep -qxE "$MUST_RUN" <<<"$ctx"; then
+      # A queued workflow run has no job check-runs yet, so "all skipped" can just mean the real
+      # job has not been created. WAIT while any run for this exact head is still pending.
+      # Count in-flight CHECK-RUNS too, not just workflow runs. 2026-09-26: #17529 was called
+      # RED "all-skipped" while three python-suite shards were mid-run -- the shim had already
+      # published `skipped` for the bare context and, in that instant, no *workflow run* was
+      # non-completed, so this read 0 and the drain abandoned the PR. A queued or running shard
+      # is direct evidence the real job exists; "no run pending YET" is not "nothing will run".
+      [ -z "${pend+x}" ] && pend=$(( $(gh api "repos/$REPO/actions/runs?head_sha=$sha&per_page=100" -q '[.workflow_runs[]|select(.status!="completed")]|length' 2>/dev/null || echo 0)
+                                   + $(awk -F'\t' '$3!="completed"' <<<"$all" | grep -c .) ))
+      if [ "${pend:-0}" -gt 0 ]; then wait="$wait,$ctx"; else red="$red,$ctx(all-skipped: no run reported success)"; fi
+      continue
+    fi
+    # An all-skipped required context is NOT a pass -- it is "no verdict", and it is the one
+    # state that reads as good news. 2026-09-30: #17772 merged with `migration-tests` skipped
+    # (the run rolled up to `success`), five tests had been red on main for a day, and this
+    # gate said GREEN. Not promoted to RED, because path-filtered skips are legitimate --
+    # surfaced instead, so no verdict line can hide one.
+    case "$real" in "") skipped="$skipped,$ctx";; success) ;; cancelled) rerun=1;; *) red="$red,$ctx($real)";; esac
+  done <<<"$R"
+  # A cancelled run only merits a rerun at a head that can merge. A PR that must update to
+  # main first (behind-ok UPDATE) gets its fresh run from that update — rerunning now just
+  # burns FIFO shard lanes (2026-09-19: reruns on five behind trains).
+  if [ -n "$rerun" ] && ~/.claude/scripts/behind-ok "$p" 2>/dev/null | grep -q ' UPDATE '; then
+    v="HOLD cancelled-runs; update-to-main-first (no rerun)"
+  # RERUN BEFORE RED, AND THE ORDER IS LOAD-BEARING -- do not "tidy" it.
+  # Cancelling a run cascades: a fail-closed gate whose upstream path-detection
+  # job was cancelled reports FAILURE, not CANCELLED, because it genuinely
+  # errored rather than being killed. 2026-10-02 #17865 carried 46 cancellations
+  # and three such FAILUREs (migration-matrix, smoke-test,
+  # verify-generated-types). They are #17126 working correctly -- refusing to
+  # guess -- not defects.
+  #
+  # So a cancellation ANYWHERE at this head voids the whole verdict: there is no
+  # way to tell a real red from cascade debris, and calling it RED sends someone
+  # to hunt a defect that does not exist. Red-before-rerun would have done
+  # exactly that on #17865.
+  elif [ -n "$rerun" ]; then v="RERUN cancelled-runs"; elif [ -n "$red" ]; then v="RED ${red#,}"; elif [ -n "$wait" ]; then v="WAIT $(tr ',' '\n' <<<"${wait#,}" | grep -c .)"; else v=GREEN; fi
+  # A conflicted PR can pass every required context and still not be mergeable, so GREEN alone
+  # would send it to a merge that fails. GitHub computes `mergeable` lazily: the first read after
+  # a base move returns UNKNOWN, which is neither MERGEABLE nor CONFLICTING -- re-read once, and
+  # if it is still UNKNOWN say so rather than guessing either way (2026-09-26: seven PRs read
+  # UNKNOWN on the first pass and MERGEABLE on the second).
+  [ -n "$skipped" ] && v="$v skipped:${skipped#,}"
+  if [ "$v" = GREEN ]; then
+    mg=$(gh pr view "$p" --repo $REPO --json mergeable -q .mergeable 2>/dev/null)
+    [ "$mg" = UNKNOWN ] && mg=$(gh pr view "$p" --repo $REPO --json mergeable -q .mergeable 2>/dev/null)
+    case "$mg" in
+      MERGEABLE|"") ;;
+      CONFLICTING)  v="RED conflicts-with-main" ;;
+      *)            v="GREEN (mergeable=$mg -- unconfirmed)" ;;
+    esac
+  fi
+  redis-cli --no-auth-warning -n 15 HSET "claude:gate:$p" sha "$sha" verdict "$v" at "$(date +%s)" >/dev/null 2>&1
+  echo "#$p ${sha:0:9} $v"
+done

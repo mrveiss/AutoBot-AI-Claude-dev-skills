@@ -1,0 +1,1530 @@
+#!/usr/bin/env python3
+"""hist: a local, searchable history of Claude Code AutoBot sessions, plus an idea graph. Nothing leaves the machine.
+
+Usage:  hist ingest [--limit N] [--files F...]      transcripts -> chunks (resumable; size+mtime tracked per file)
+        hist find "<query>" [-k 8] [--role R]       hybrid search: BM25 + local-embedding KNN, rank-fused
+        hist ideas [--limit N]                      local LLM idea extraction over idea-hint chunks (resumable)
+        hist link                                   issues/PRs (read-only gh) + graph edges
+        hist report | graph [--out F] | tune [--sample N]
+        hist evolution | planned-vs-built | docs-gaps
+        hist all                                    ingest -> ideas -> link -> report -> evolution -> planned-vs-built -> docs-gaps
+        hist stats                                  store counts and progress
+Store:  the private ix redis-stack instance (Unix socket only), keys hs:*, indexes hs:idx:*.
+Models: local Ollama only: nomic-embed-text (768-d) for embeddings, $HS_LLM_MODEL (gemma3:4b) for extraction.
+Repo:   read-only via git show/ls-tree/log on origin/main; GitHub read-only via gh list queries.
+"""
+import argparse, hashlib, json, os, re, struct, subprocess, sys, time, traceback, urllib.error, urllib.request
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+from importlib.machinery import SourceFileLoader
+import importlib.util
+from pathlib import Path
+
+CLAUDE = Path.home() / ".claude"
+OUT = Path(os.environ.get("HS_OUT") or CLAUDE / "hist")
+PROJECTS = CLAUDE / "projects"
+REPO = Path(os.environ.get("HS_REPO") or Path.home() / "AutoBot-Ai" / "AutoBot-AI")
+GH_REPO = os.environ.get("HS_GH_REPO", "mrveiss/AutoBot-AI")
+REF = os.environ.get("HS_REF", "origin/main")
+LLM_URL = os.environ.get("HS_LLM_URL", "http://127.0.0.1:11434/api/generate")
+LLM_MODEL = os.environ.get("HS_LLM_MODEL", "gemma3:4b")
+LLM_WORKERS = int(os.environ.get("HS_LLM_WORKERS", "2"))
+MAXMEM = os.environ.get("HS_MAXMEMORY", "3gb")
+CHUNK = int(os.environ.get("HS_CHUNK_CHARS", "1500"))
+BATCH = int(os.environ.get("HS_EMBED_BATCH", "32"))
+ISSUE_T = float(os.environ.get("HS_ISSUE_T", "0.86"))   # idea->issue "tracked" cutoff; tuned 2026-09-13 on 20 labelled pairs (acc 0.95, F1 0.86)
+IDEA_T = float(os.environ.get("HS_IDEA_T", "0.89"))     # idea<->idea cluster cutoff: in the sample, >= 0.89 was the same idea, 0.86-0.89 mixed
+EDGE_FLOOR = float(os.environ.get("HS_EDGE_FLOOR", "0.80"))  # similar_to edges kept above this, so IDEA_T can move without relinking
+DOC_T = float(os.environ.get("HS_DOC_T", "0.66"))       # feature->doc cutoff: weak signal; in a 15-PR check only <0.66 was reliably undocumented
+GH_MAX_AGE_H = float(os.environ.get("HS_GH_MAX_AGE_H", "12"))
+AUTO_EPS = set(filter(None, os.environ.get("HS_AUTOMATED_ENTRYPOINTS", "sdk-py,sdk-ts,sdk-cli").split(",")))  # headless review runs
+QTIMEOUT = 120000  # explicit per-query timeout: the server default (500 ms) silently returns partial results
+
+
+def _load_ix():
+    loader = SourceFileLoader("ix", str(CLAUDE / "scripts" / "ix"))
+    spec = importlib.util.spec_from_loader("ix", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+ix = _load_ix()
+TZ, DIM = ix.TZ, ix.DIM
+VEC = ["VECTOR", "FLAT", "6", "TYPE", "FLOAT32", "DIM", str(DIM), "DISTANCE_METRIC", "COSINE"]
+IDX = {
+    "hs:idx:chunk:v2": ("hs:chunk:", ["$.text", "AS", "text", "TEXT", "$.role", "AS", "role", "TAG", "$.project", "AS", "project", "TAG", "$.auto", "AS", "auto", "TAG",
+                                      "$.session", "AS", "session", "TAG", "$.ts", "AS", "ts", "NUMERIC", "SORTABLE",
+                                      "$.idea_hint", "AS", "hint", "TAG", "$.vec", "AS", "vec", *VEC]),
+    "hs:idx:idea:v1": ("hs:idea:", ["$.title", "AS", "title", "TEXT", "WEIGHT", "2", "$.summary", "AS", "summary", "TEXT",
+                                    "$.kind", "AS", "kind", "TAG", "$.component", "AS", "component", "TAG", "$.session", "AS", "session", "TAG",
+                                    "$.ts", "AS", "ts", "NUMERIC", "SORTABLE", "$.vec", "AS", "vec", *VEC]),
+    "hs:idx:issue:v1": ("hs:issue:", ["$.title", "AS", "title", "TEXT", "WEIGHT", "2", "$.body", "AS", "body", "TEXT", "$.state", "AS", "state", "TAG",
+                                      "$.reason", "AS", "reason", "TAG", "$.labels[*]", "AS", "labels", "TAG", "$.vec", "AS", "vec", *VEC]),
+    "hs:idx:edge:v1": ("hs:edge:", ["$.src", "AS", "src", "TAG", "$.dst", "AS", "dst", "TAG", "$.type", "AS", "type", "TAG",
+                                    "$.score", "AS", "score", "NUMERIC"]),
+    "hs:idx:doc:v1": ("hs:doc:", ["$.path", "AS", "path", "TAG", "$.text", "AS", "text", "TEXT", "$.vec", "AS", "vec", *VEC]),
+}
+I_CHUNK, I_IDEA, I_ISSUE, I_EDGE, I_DOC = IDX
+
+HINT = re.compile(r"(?i)\b(recommend\w*|propos\w*|follow-?ups?|we should|could we|would be good|ideas?|features?|later|out of scope|defer\w*|not doing|next steps?)\b")
+DROP_BLOCKS = re.compile(r"<(system-reminder|task-notification|local-command-stdout|local-command-stderr|local-command-caveat|command-name|command-message)>.*?</\1>", re.S)
+CMD_ARGS = re.compile(r"</?command-args>")
+XSESSION = re.compile(r"<cross-session-message[^>]*?from-name=\"([^\"]*)\"[^>]*>|<cross-session-message[^>]*>|</cross-session-message>")
+REFS = re.compile(r"(?<![\w/&])#(\d{3,6})\b")
+NOISE = re.compile(r"^\[Request interrupted|^Caveat: The messages below")
+
+
+# ---------- shared helpers ----------
+
+def log(msg: str) -> None:
+    print(f"[{datetime.now(TZ):%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
+
+
+def warn(msg: str) -> None:
+    print(f"[{datetime.now(TZ):%Y-%m-%d %H:%M:%S}] ERROR {msg}", file=sys.stderr, flush=True)
+
+
+def day(ts: float) -> str:
+    return datetime.fromtimestamp(float(ts), TZ).strftime("%Y-%m-%d") if ts else "?"
+
+
+def h(text: str, n: int = 20) -> str:
+    return hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()[:n]
+
+
+def pack(vec) -> bytes:
+    return struct.pack(f"{DIM}f", *vec)
+
+
+def one_line(s: str, n: int) -> str:
+    s = " ".join(s.split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def client():
+    r = ix.client()
+    _raise_maxmemory(r)
+    existing = set(r.execute_command("FT._LIST"))
+    for old in (x for x in existing if x.startswith("hs:idx:") and x not in IDX):
+        r.execute_command("FT.DROPINDEX", old)  # keeps the documents; the new schema re-indexes them
+        log(f"dropped superseded index {old}")
+    for name, (prefix, schema) in IDX.items():
+        if name not in existing:
+            r.execute_command("FT.CREATE", name, "ON", "JSON", "PREFIX", "1", prefix, "SCHEMA", *schema)
+    return r
+
+
+def _bytes(v: str) -> int:
+    m = re.fullmatch(r"(?i)(\d+)\s*([kmg]?b)?", v.strip())
+    if not m:
+        raise SystemExit(f"hist: HS_MAXMEMORY={v!r} is not a size like 3gb")
+    return int(m.group(1)) * {"gb": 1 << 30, "mb": 1 << 20, "kb": 1 << 10, "b": 1, "": 1}[(m.group(2) or "").lower()]
+
+
+def _raise_maxmemory(r) -> None:
+    cur, want = int(r.config_get("maxmemory")["maxmemory"]), _bytes(MAXMEM)
+    if cur and cur < want:
+        r.config_set("maxmemory", MAXMEM)
+        log(f"raised the private instance's maxmemory {cur >> 20} MB -> {MAXMEM} (runtime only; ix restarts reset it)")
+
+
+def search_keys(r, idx: str, query: str, sortby: str = None, page: int = 5000):
+    off = 0
+    while True:
+        args = [idx, query, "NOCONTENT"] + (["SORTBY", sortby, "ASC"] if sortby else [])
+        res = r.execute_command("FT.SEARCH", *args, "LIMIT", off, page, "DIALECT", 2, "TIMEOUT", QTIMEOUT)
+        keys = [k for k in res[1:] if isinstance(k, str)]
+        yield from keys
+        if len(keys) < page:
+            return
+        off += page
+
+
+def get_fields(r, keys, names):
+    """[{name: value}] for keys, reading only the named top-level fields (never the vectors unless asked)."""
+    out, paths = [], [f"$.{n}" for n in names]
+    for i in range(0, len(keys), 1000):
+        p = r.pipeline(transaction=False)
+        for k in keys[i:i + 1000]:
+            p.execute_command("JSON.GET", k, *paths, "$.__nonexistent__")  # >1 path always yields a {path: [..]} object
+        for k, raw in zip(keys[i:i + 1000], p.execute()):
+            d = json.loads(raw) if raw else {}
+            out.append({"_key": k, **{n: (d.get(f"$.{n}") or [None])[0] for n in names}})
+    return out
+
+
+def knn(r, idx: str, vec, k: int, filt: str = ""):
+    q = f"({filt})=>[KNN {k} @vec $B AS dist]" if filt else f"*=>[KNN {k} @vec $B AS dist]"
+    res = r.execute_command("FT.SEARCH", idx, q, "PARAMS", 2, "B", pack(vec), "SORTBY", "dist", "RETURN", 1, "dist",
+                            "LIMIT", 0, k, "DIALECT", 2, "TIMEOUT", QTIMEOUT)
+    return [(res[i], float(dict(zip(res[i + 1][::2], res[i + 1][1::2]))["dist"])) for i in range(1, len(res), 2)]
+
+
+def bm25(r, idx: str, query: str, filt: str, n: int) -> list:
+    words = [w for w in dict.fromkeys(re.findall(r"\w+", query) + ix.terms(query).split()) if len(w) > 1]
+    if not words:
+        return []
+    res = r.execute_command("FT.SEARCH", idx, f"({'|'.join(words)}) {filt}".strip(), "NOCONTENT", "SCORER", "BM25",
+                            "LIMIT", 0, n, "DIALECT", 2, "TIMEOUT", QTIMEOUT)
+    return [k for k in res[1:] if isinstance(k, str)]
+
+
+def rrf(*ranked) -> list:
+    score = defaultdict(float)
+    for lst in ranked:
+        for rank, key in enumerate(lst):
+            score[key] += 1.0 / (60 + rank)
+    return sorted(score, key=score.get, reverse=True)
+
+
+def post_json(url: str, body: dict, timeout: int) -> dict:
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"HTTP {e.code} from {url}: {e.read(300).decode('utf-8', 'replace')}") from e
+    except (OSError, ValueError) as e:
+        raise RuntimeError(f"{type(e).__name__} calling {url}: {e}") from e
+
+
+def embed_batch(texts, kind: str) -> list:
+    """One vector (or None) per text; a failed batch falls back to ix.embed per item, which halves on context errors."""
+    body = {"model": ix.EMBED_MODEL, "input": [f"{kind}: {t}" for t in texts], "keep_alive": "30m"}
+    try:
+        vecs = post_json(ix.EMBED_URL, body, 600)["embeddings"]
+        if len(vecs) == len(texts) and all(len(v) == DIM for v in vecs):
+            return vecs
+        warn(f"embed batch returned {len(vecs)} vectors for {len(texts)} inputs; retrying per item")
+    except (RuntimeError, KeyError) as e:
+        warn(f"embed batch of {len(texts)} failed ({e}); retrying per item")
+    return [ix.embed(t, kind) for t in texts]
+
+
+def run(cmd: list, timeout: int = 1800) -> str:
+    p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+    if p.returncode:
+        raise RuntimeError(f"{' '.join(cmd[:4])}… exited {p.returncode}: {p.stderr.strip()[:500]}")
+    return p.stdout
+
+
+def git(*args, timeout: int = 600) -> str:
+    return run(["git", "-C", str(REPO), *args], timeout)
+
+
+def num_docs(r, idx: str) -> int:
+    info = r.execute_command("FT.INFO", idx)
+    return int(info[info.index("num_docs") + 1])
+
+
+def rate(r, name: str, value: float) -> None:
+    r.hset("hs:rates", name, f"{value:.6g}")
+
+
+# ---------- ingest ----------
+
+def transcript_files(limit: int = 0, files=None) -> list:
+    if files:
+        return [Path(f) for f in files]
+    out = []
+    for d in sorted(os.scandir(PROJECTS), key=lambda e: e.name):
+        if d.is_dir() and "AutoBot" in d.name:
+            out += sorted(Path(d.path).glob("*.jsonl"))  # top level only: subagent transcripts live one level down
+    return out[:limit] if limit else out
+
+
+def _texts(content) -> list:
+    if isinstance(content, str):
+        return [content]
+    if isinstance(content, list):
+        return [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+    return []
+
+
+def clean(text: str, role: str) -> str:
+    text = CMD_ARGS.sub("", DROP_BLOCKS.sub("", text))
+    if role == "peer":
+        text = XSESSION.sub(lambda m: f"[peer: {m.group(1)}] " if m.group(1) else "", text)
+    return text.strip()
+
+
+def _role(d: dict, m: dict, text: str):
+    """user = the owner's own words; prompt = machine-built user turns of headless (SDK) review runs."""
+    role = m.get("role")
+    if role == "user" and d.get("isCompactSummary"):
+        return "compact"
+    if role == "user" and "<cross-session-message" in text[:400]:
+        return "peer"
+    if role == "user" and d.get("entrypoint") in AUTO_EPS:
+        return "prompt"
+    return role if role in ("user", "assistant") else None
+
+
+def _ts(d: dict, fallback: float) -> float:
+    try:
+        return datetime.fromisoformat(d["timestamp"].replace("Z", "+00:00")).timestamp()
+    except (KeyError, AttributeError, ValueError):
+        return fallback
+
+
+def records(path: Path, stats: Counter):
+    """(session, ts, role, text, auto) for each kept message; tool_use/tool_result/thinking/meta and injected blocks are dropped."""
+    last_ts = path.stat().st_mtime
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            try:
+                d = json.loads(line)
+            except ValueError:
+                stats["bad_json_lines"] += 1
+                continue
+            m = d.get("message") if isinstance(d, dict) else None
+            if not isinstance(m, dict) or d.get("isMeta"):
+                continue
+            raw = "\n\n".join(_texts(m.get("content")))
+            role = _role(d, m, raw)
+            text = clean(raw, role) if role else ""
+            last_ts = _ts(d, last_ts)
+            if len(text) >= 12 and not NOISE.match(text):
+                yield d.get("sessionId") or path.stem, last_ts, role, text, d.get("entrypoint") in AUTO_EPS
+
+
+def paragraphs(text: str, size: int):
+    for p in re.split(r"\n\s*\n", text):
+        p = p.strip()
+        while len(p) > size:  # an oversized paragraph is cut at the last newline/space before the limit
+            cut = max(p.rfind("\n", 0, size), p.rfind(" ", 0, size))
+            cut = cut if cut > size // 2 else size
+            yield p[:cut].rstrip()
+            p = p[cut:].lstrip()
+        if p:
+            yield p
+
+
+def chunk_text(text: str, size: int = CHUNK) -> list:
+    out, cur = [], ""
+    for para in paragraphs(text, size):
+        if cur and len(cur) + len(para) + 2 > size:
+            out.append(cur)
+            cur = para
+        else:
+            cur = f"{cur}\n\n{para}" if cur else para
+    return out + [cur] if cur else out
+
+
+def is_hint(role: str, text: str, auto: bool) -> bool:
+    if auto:  # headless review runs: their findings went to the PR itself; searchable, but not idea candidates
+        return False
+    if role == "user":
+        return len(text) >= 60
+    return role in ("assistant", "peer") and bool(HINT.search(text))
+
+
+class Ingest:
+    def __init__(self, r):
+        self.r, self.pending, self.seen, self.stats = r, [], set(), Counter()
+
+    def file(self, path: Path) -> None:
+        """Consecutive same-role turns of a session (tool calls between them are dropped) form one text before chunking."""
+        project, buf = path.parent.name, None
+        for session, ts, role, text, auto in records(path, self.stats):
+            if buf and buf[0] == session and buf[2] == role and role not in ("compact", "peer"):
+                buf[4].append(text)
+                continue
+            self.emit(project, buf)
+            buf = [session, ts, role, auto, [text]]
+        self.emit(project, buf)
+        self.flush()
+
+    def emit(self, project: str, buf) -> None:
+        if not buf:
+            return
+        session, ts, role, auto, texts = buf
+        for part in chunk_text(ix.redact("\n\n".join(texts))):
+            key = "hs:chunk:" + h(" ".join(part.split()))
+            if key in self.seen or self.r.exists(key):
+                self.stats["duplicates"] += 1
+                continue
+            self.seen.add(key)
+            self.pending.append((key, {"session": session, "project": project, "ts": ts, "role": role, "text": part,
+                                       "auto": "1" if auto else "0", "idea_hint": "1" if is_hint(role, part, auto) else "0",
+                                       "refs": sorted({int(n) for n in REFS.findall(part)})}))
+            if len(self.pending) >= BATCH:
+                self.flush()
+
+    def flush(self) -> None:
+        if not self.pending:
+            return
+        vecs = embed_batch([d["text"] for _, d in self.pending], "search_document")
+        p = self.r.pipeline(transaction=False)
+        for (key, doc), vec in zip(self.pending, vecs):
+            if vec:
+                doc["vec"] = vec
+            else:
+                p.sadd("hs:novec", key)
+                self.stats["embed_failed"] += 1
+            p.execute_command("JSON.SET", key, "$", json.dumps(doc))
+            self.stats[f"chunks_{doc['role']}"] += 1
+            self.stats["hint_chunks"] += doc["idea_hint"] == "1"
+        p.execute()
+        self.stats["chunks_new"] += len(self.pending)
+        self.pending = []
+
+
+def backfill_vectors(r) -> int:
+    keys = sorted(r.smembers("hs:novec"))
+    for i in range(0, len(keys), BATCH):
+        part = keys[i:i + BATCH]
+        docs = get_fields(r, part, ["text"])
+        for d, vec in zip(docs, embed_batch([d["text"] or "" for d in docs], "search_document")):
+            if vec:
+                r.execute_command("JSON.SET", d["_key"], "$.vec", json.dumps(vec))
+                r.srem("hs:novec", d["_key"])
+    left = r.scard("hs:novec")
+    if keys:
+        log(f"vector backfill: {len(keys) - left} filled, {left} still without a vector")
+    return left
+
+
+def cmd_ingest(a) -> int:
+    r, files = client(), transcript_files(a.limit, a.files)
+    todo = [f for f in files if r.hget("hs:files", str(f)) != _sig(f)]
+    total_mb = sum(f.stat().st_size for f in todo) / 1e6
+    log(f"ingest: {len(files)} transcripts found, {len(todo)} new or changed ({total_mb:.1f} MB)")
+    ing, t0 = Ingest(r), time.time()
+    for n, f in enumerate(todo, 1):
+        ing.file(f)
+        r.hset("hs:files", str(f), _sig(f))
+        if n % 20 == 0 or n == len(todo):
+            el = time.time() - t0
+            log(f"ingest: {n}/{len(todo)} files · {ing.stats['chunks_new']} new chunks · {ing.stats['chunks_new'] / max(el, 1e-6):.1f} chunks/s")
+    _ingest_rates(r, ing.stats, total_mb, time.time() - t0)
+    left = backfill_vectors(r)
+    log(f"ingest done: {dict(sorted(ing.stats.items()))}; store has {num_docs(r, I_CHUNK)} chunks")
+    return 1 if left else 0
+
+
+def _sig(f: Path) -> str:
+    st = f.stat()
+    return f"{st.st_size}:{int(st.st_mtime)}"
+
+
+def _ingest_rates(r, stats: Counter, mb: float, secs: float) -> None:
+    if stats["chunks_new"] >= 50 and mb > 0:
+        rate(r, "ingest_chunks_per_s", stats["chunks_new"] / secs)
+        rate(r, "chunks_per_mb", stats["chunks_new"] / mb)
+        rate(r, "hint_frac", stats["hint_chunks"] / stats["chunks_new"])
+
+
+# ---------- find ----------
+
+def snippet(text: str, query: str, n: int = 200) -> str:
+    low = text.lower()
+    hits = [low.find(w.lower()) for w in re.findall(r"\w{3,}", query)]
+    i = min([x for x in hits if x >= 0], default=0)
+    start = max(0, i - 60)
+    return ("…" if start else "") + one_line(text[start:], n)
+
+
+def cmd_find(a) -> int:
+    r = client()
+    # default: skip headless review-run prompts (diff-heavy noise); --role all searches everything
+    filt = "" if a.role == "all" else (f"@role:{{{a.role}}}" if a.role else "-@role:{prompt}")
+    kw = bm25(r, I_CHUNK, a.query, filt, a.k * 3)
+    vec = ix.embed(a.query, "search_query")
+    vk = [k for k, _ in knn(r, I_CHUNK, vec, a.k * 3, filt)] if vec else []
+    top = rrf(kw, vk)[:a.k]
+    for d in get_fields(r, top, ["ts", "session", "role", "text"]):
+        print(f"{datetime.fromtimestamp(d['ts'], TZ):%Y-%m-%d %H:%M}  {d['session'][:8]}  {d['role']:<9} {snippet(d['text'], a.query)}")
+    half = "skipped, embedder unreachable" if vec is None else f"{len(vk)} hits"
+    print(f"{len(top) or 'no'} shown · keyword half: {len(kw)} hits · vector half: {half}")
+    return 0
+
+
+# ---------- ideas ----------
+
+KINDS = ("feature", "improvement", "process", "bug", "question")
+COMPONENTS = ("backend", "frontend", "slm", "infra", "ci", "agents", "knowledge", "devtools", "other")
+IDEA_PROMPT = """You extract engineering ideas from one snippet of a software project's chat history (project: AutoBot, an AI platform).
+An idea is something NOT yet done that someone explicitly proposes, requests, defers, flags as a problem to fix, or asks about.
+Most snippets contain no idea: progress narration, summaries of finished work, test results, and tool chatter are NOT ideas. Return {"ideas":[]} for those.
+Components:
+- backend: the main FastAPI backend and its APIs, chat, auth, voice
+- frontend: the main Vue web UI
+- slm: ONLY the SLM fleet-management server and its admin UI (remote node fleet, monitoring, provisioning)
+- infra: deployment, hosts, Ansible, Redis/database operations, updates, hardware
+- ci: GitHub workflows, tests, guards, ratchets, pre-commit hooks, code-quality gates
+- agents: LLM agents, orchestration, prompts, MCP, tools
+- knowledge: knowledge base, RAG, memory, document ingest, search
+- devtools: Claude Code setup, skills, scripts, git and worktree tooling, developer workflow rules
+- other: anything else
+Reply with JSON only, exactly this shape:
+{"ideas":[{"title":"at most 12 words","kind":"feature|improvement|process|bug|question","component":"one component name","summary":"one or two sentences"}]}
+At most 3 ideas. Every idea needs a non-empty summary saying what should change and why.
+
+SNIPPET (speaker: ROLE):
+TEXT"""
+
+
+def llm(prompt: str, temperature: float, num_predict: int = 600) -> str:
+    body = {"model": LLM_MODEL, "prompt": prompt, "format": "json", "stream": False, "keep_alive": "30m",
+            "options": {"temperature": temperature, "num_predict": num_predict, "num_ctx": 4096}}
+    return post_json(LLM_URL, body, 600).get("response", "")
+
+
+def _norm_idea(i):
+    if not isinstance(i, dict) or not str(i.get("title", "")).strip():
+        return None
+    kind, comp = str(i.get("kind", "")).lower().strip(), str(i.get("component", "")).lower().strip()
+    return {"title": " ".join(str(i["title"]).split()[:12]), "kind": kind if kind in KINDS else "improvement",
+            "component": comp if comp in COMPONENTS else "other",
+            "summary": one_line(str(i.get("summary") or i.get("description") or i.get("details") or ""), 400)}
+
+
+def parse_ideas(raw: str):
+    """A list (possibly empty) of normalised ideas, or None when the reply is not the requested shape."""
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    items = data.get("ideas", [data] if "title" in data else None) if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return None
+    return [x for x in map(_norm_idea, items[:6]) if x]
+
+
+def extract(text: str, role: str):
+    prompt = IDEA_PROMPT.replace("ROLE", role).replace("TEXT", text)
+    for temp in (0.0, 0.4):  # one retry, warmer, before the chunk is skipped as bad JSON
+        ideas = parse_ideas(llm(prompt, temp))
+        if ideas is not None:
+            return ideas
+    return None
+
+
+def _try_extract(doc: dict):
+    try:
+        ideas = extract(doc["text"] or "", doc["role"] or "assistant")
+        return ("bad", None) if ideas is None else ("ok", ideas)
+    except RuntimeError as e:
+        return "err", str(e)
+
+
+class Progress:
+    def __init__(self, r, name: str, total: int, every: int = 50):
+        self.r, self.name, self.total, self.every, self.n, self.t0, self.fails = r, name, total, every, 0, time.time(), 0
+
+    def tick(self, k: int = 1) -> None:
+        before, self.n = self.n, self.n + k
+        if self.n // self.every > before // self.every or self.n == self.total:
+            el = time.time() - self.t0
+            per = el / max(self.n, 1)
+            rate(self.r, f"{self.name}_s_per_item", per)
+            eta = datetime.now(TZ) + timedelta(seconds=per * (self.total - self.n))
+            log(f"{self.name}: {self.n}/{self.total} · {60 / per:.1f}/min · ETA {eta:%Y-%m-%d %H:%M} Riga · {self.status()}")
+
+    def status(self) -> str:
+        st = self.r.hgetall("hs:ideas:stats") if self.name == "ideas" else {}
+        return ", ".join(f"{k}={v}" for k, v in sorted(st.items()))
+
+
+def pending_hint_chunks(r) -> list:
+    done = r.smembers("hs:ideas:done")
+    return [k for k in search_keys(r, I_CHUNK, "@hint:{1}", sortby="ts") if k not in done]
+
+
+def store_ideas(r, doc: dict, ideas: list) -> None:
+    for i in ideas:  # a title-only vector is a hub that pulls unrelated short ideas together; ground it in the source text
+        if not i["summary"]:
+            i["summary"], i["summary_from_source"] = best_sentence(doc["text"] or "", i["title"], 300), True
+            r.hincrby("hs:ideas:stats", "no_summary", 1)
+    vecs = embed_batch([f"{i['title']}. {i['summary']}" for i in ideas], "clustering") if ideas else []
+    p = r.pipeline(transaction=False)
+    for i, vec in zip(ideas, vecs):
+        iid = h(doc["_key"] + i["title"], 16)
+        rec = {**i, "id": iid, "chunk": doc["_key"], "session": doc["session"], "project": doc["project"], "ts": doc["ts"],
+               "role": doc["role"], "refs": doc["refs"] or []}
+        if vec:
+            rec["vec"] = vec
+        else:
+            p.hincrby("hs:ideas:stats", "embed_failed", 1)
+        p.execute_command("JSON.SET", f"hs:idea:{iid}", "$", json.dumps(rec))
+    p.hincrby("hs:ideas:stats", "ideas", len(ideas))
+    p.hincrby("hs:ideas:stats", "empty" if not ideas else "with_ideas", 1)
+    p.sadd("hs:ideas:done", doc["_key"])
+    p.execute()
+
+
+def record_result(r, doc: dict, res, prog: Progress) -> None:
+    status, val = res
+    if status == "err":
+        prog.fails += 1
+        r.hincrby("hs:ideas:stats", "llm_errors", 1)
+        warn(f"ideas: LLM call failed for {doc['_key']} ({val}); left pending for the next run")
+        if prog.fails >= 10:
+            raise SystemExit("hist ideas: 10 consecutive LLM failures; is Ollama up? Re-run to resume.")
+        return
+    prog.fails = 0
+    if status == "bad":
+        r.hincrby("hs:ideas:stats", "bad_json", 1)
+        r.sadd("hs:ideas:bad", doc["_key"])
+        r.sadd("hs:ideas:done", doc["_key"])
+        warn(f"ideas: unparseable reply twice for {doc['_key']}; skipped and counted")
+        return
+    store_ideas(r, doc, val)
+
+
+def cmd_ideas(a) -> int:
+    r = client()
+    todo = pending_hint_chunks(r)[: a.limit or None]
+    log(f"ideas: {len(todo)} idea-hint chunks pending · model {LLM_MODEL} · {LLM_WORKERS} workers")
+    prog = Progress(r, "ideas", len(todo))
+    with ThreadPoolExecutor(LLM_WORKERS) as pool:
+        for i in range(0, len(todo), 8 * LLM_WORKERS):
+            docs = get_fields(r, todo[i:i + 8 * LLM_WORKERS], ["session", "project", "ts", "role", "text", "refs"])
+            for doc, res in zip(docs, pool.map(_try_extract, docs)):
+                record_result(r, doc, res, prog)
+                prog.tick()
+    log(f"ideas done: {prog.status()}")
+    return 0
+
+
+# ---------- link ----------
+
+UNWIRED = re.compile(r"(?i)no production caller|never wired|not[- ]wired|unwired|built but not wired")
+CLOSES = re.compile(r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b[:\s]+((?:#\d+(?:[,\s]+(?:and\s+)?)?)+)")
+
+
+def iso_ts(s) -> float:
+    return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp() if s else 0.0
+
+
+def gh_list(kind: str, state: str, fields: str) -> list:
+    cache = OUT / f"gh_{kind}_{state}.json"
+    if cache.exists() and time.time() - cache.stat().st_mtime < GH_MAX_AGE_H * 3600:
+        return json.loads(cache.read_text(encoding="utf-8"))
+    t0 = time.time()
+    out = run(["gh", kind, "list", "-R", GH_REPO, "--state", state, "--limit", "20000", "--json", fields], timeout=3600)
+    cache.write_text(out, encoding="utf-8")
+    os.chmod(cache, 0o600)
+    data = json.loads(out)
+    log(f"gh {kind} list --state {state}: {len(data)} fetched in {time.time() - t0:.0f}s (cached {GH_MAX_AGE_H:g}h)")
+    return data
+
+
+def issue_doc(i: dict) -> dict:
+    body, labels = i.get("body") or "", [lb["name"] for lb in i.get("labels") or []]
+    return {"number": i["number"], "title": i["title"], "state": i["state"].lower(), "reason": (i.get("stateReason") or "").lower(),
+            "labels": labels, "body": ix.redact(body[:600]), "created": iso_ts(i.get("createdAt")), "closed": iso_ts(i.get("closedAt")),
+            "ac_done": len(re.findall(r"(?m)^\s*[-*]\s*\[[xX]\]", body)), "ac_total": len(re.findall(r"(?m)^\s*[-*]\s*\[[ xX]\]", body)),
+            "unwired": "1" if "not-wired" in labels or UNWIRED.search(i["title"] + "\n" + body) else "0"}
+
+
+def sync_issues(r) -> int:
+    docs = {d["number"]: d for d in map(issue_doc, gh_list("issue", "all", "number,title,state,stateReason,labels,body,createdAt,closedAt"))}
+    have = {int(k.split(":")[-1]) for k in r.scan_iter("hs:issue:*", count=2000)}
+    sigs = {d["_key"]: d["sig"] for d in get_fields(r, [f"hs:issue:{n}" for n in have], ["sig"])}
+    todo = [d for n, d in docs.items() if sigs.get(f"hs:issue:{n}") != h(json.dumps(d, sort_keys=True))]
+    for i in range(0, len(todo), BATCH):
+        part = todo[i:i + BATCH]
+        vecs = embed_batch([f"{d['title']}\n{d['body']}" for d in part], "clustering")
+        p = r.pipeline(transaction=False)
+        for d, vec in zip(part, vecs):
+            rec = {**d, "sig": h(json.dumps(d, sort_keys=True)), **({"vec": vec} if vec else {})}
+            p.execute_command("JSON.SET", f"hs:issue:{d['number']}", "$", json.dumps(rec))
+        p.execute()
+    gone = have - set(docs)
+    if gone:
+        r.delete(*[f"hs:issue:{n}" for n in gone])
+    log(f"issues: {len(docs)} total · {len(todo)} new/changed embedded · {len(gone)} no longer listed, removed")
+    return len(todo) + len(gone)
+
+
+def pr_doc(p: dict) -> dict:
+    text = f"{p['title']}\n{p.get('body') or ''}"
+    closes = {int(n) for grp in CLOSES.findall(p.get("body") or "") for n in re.findall(r"#(\d+)", grp)}
+    refs = {int(n) for n in REFS.findall(text)} - closes - {p["number"]}
+    return {"number": p["number"], "title": p["title"], "merged": iso_ts(p.get("mergedAt")),
+            "labels": [lb["name"] for lb in p.get("labels") or []], "closes": sorted(closes), "refs": sorted(refs)}
+
+
+def sync_prs(r) -> int:
+    """Unchanged PRs are left alone, so the title vectors docs-gaps caches on them survive a re-link."""
+    prs = [pr_doc(p) for p in gh_list("pr", "merged", "number,title,mergedAt,labels,body")]
+    sigs = {d["_key"]: d["sig"] for d in get_fields(r, [f"hs:pr:{d['number']}" for d in prs], ["sig"])}
+    todo = [d for d in prs if sigs.get(f"hs:pr:{d['number']}") != h(json.dumps(d, sort_keys=True))]
+    p = r.pipeline(transaction=False)
+    for d in todo:
+        p.execute_command("JSON.SET", f"hs:pr:{d['number']}", "$", json.dumps({**d, "sig": h(json.dumps(d, sort_keys=True))}))
+    p.execute()
+    log(f"merged PRs: {len(prs)} total · {len(todo)} new/changed stored")
+    return len(todo)
+
+
+def edge(src: str, dst: str, typ: str, score: float):
+    return f"hs:edge:{h(f'{src}|{dst}|{typ}', 16)}", {"src": src, "dst": dst, "type": typ, "score": round(score, 4)}
+
+
+def idea_edges(r, d: dict, known: dict) -> tuple:
+    src, out, best = f"idea:{d['id']}", [edge(f"idea:{d['id']}", f"session:{d['session']}", "mentioned_in", 1.0)], None
+    out += [edge(src, f"{known[n]}:{n}", "refs", 1.0) for n in d["refs"] or [] if n in known]
+    if not d.get("vec"):
+        return out, [], None
+    for key, dist in knn(r, I_ISSUE, d["vec"], 3):
+        n, sim = int(key.split(":")[-1]), 1 - dist
+        out.append(edge(src, f"issue:{n}", "likely_tracked_by", sim))
+        best = best or {"issue": n, "score": round(sim, 4)}
+    pairs = [edge(*sorted((src, "idea:" + k.split(":")[-1])), "similar_to", 1 - dist)
+             for k, dist in knn(r, I_IDEA, d["vec"], 11) if k != d["_key"] and 1 - dist >= EDGE_FLOOR]
+    return out, pairs, best
+
+
+def link_batch(r, keys: list, known: dict) -> Counter:
+    c, p = Counter(), r.pipeline(transaction=False)
+    for d in get_fields(r, keys, ["id", "session", "refs", "vec", "edges"]):
+        for old in d["edges"] or []:
+            p.delete(old)
+        own, pairs, best = idea_edges(r, d, known)
+        for key, e in own + pairs:
+            p.execute_command("JSON.SET", key, "$", json.dumps(e))
+            c[e["type"]] += 1
+        p.execute_command("JSON.SET", d["_key"], "$.edges", json.dumps([k for k, _ in own]))
+        p.execute_command("JSON.SET", d["_key"], "$.best", json.dumps(best))
+        p.sadd("hs:link:done", d["_key"])
+        c["no_vector"] += not d.get("vec")
+    p.execute()
+    return c
+
+
+def known_numbers(r) -> dict:
+    """#N -> 'issue' or 'pr' (a PR number is also a valid explicit reference)."""
+    known = {int(k.split(":")[-1]): "pr" for k in r.scan_iter("hs:pr:*", count=2000)}
+    known.update({int(k.split(":")[-1]): "issue" for k in r.scan_iter("hs:issue:*", count=2000)})
+    return known
+
+
+def cmd_link(a) -> int:
+    r = client()
+    changed = sync_issues(r)
+    sync_prs(r)
+    if changed or a.relink:
+        r.delete("hs:link:done")
+        log(f"link: {'issues changed' if changed else '--relink'}, so every idea is re-linked")
+    done = r.smembers("hs:link:done")
+    todo, known, total = [k for k in search_keys(r, I_IDEA, "*") if k not in done], known_numbers(r), Counter()
+    prog = Progress(r, "link", len(todo), every=500)
+    for i in range(0, len(todo), 200):
+        total += link_batch(r, todo[i:i + 200], known)
+        prog.tick(len(todo[i:i + 200]))
+    log(f"link done: {len(todo)} ideas linked · edges written {dict(total)}")
+    return 0
+
+
+# ---------- clusters, report, tune, graph ----------
+
+def load_ideas(r) -> dict:
+    keys = list(search_keys(r, I_IDEA, "*"))
+    return {d["_key"]: d for d in get_fields(r, keys, ["id", "title", "summary", "kind", "component", "session", "ts", "chunk", "refs", "best", "role"])}
+
+
+def load_issues(r) -> dict:
+    keys = list(r.scan_iter("hs:issue:*", count=2000))
+    fields = ["number", "title", "state", "reason", "labels", "ac_done", "ac_total", "unwired", "created", "closed"]
+    return {d["number"]: d for d in get_fields(r, keys, fields) if d["number"]}
+
+
+def load_prs(r) -> dict:
+    keys = list(r.scan_iter("hs:pr:*", count=2000))
+    return {d["number"]: d for d in get_fields(r, keys, ["number", "title", "merged", "labels", "closes", "refs"]) if d["number"]}
+
+
+def similar_pairs(r) -> list:
+    keys = list(search_keys(r, I_EDGE, "@type:{similar_to}"))
+    return [(d["src"], d["dst"], d["score"]) for d in get_fields(r, keys, ["src", "dst", "score"])]
+
+
+def clusters(ideas: dict, pairs: list, t: float = IDEA_T) -> dict:
+    """Leader clustering in time order: an idea joins its most similar earlier leader at >= t, so chains never merge."""
+    nb, by_id = defaultdict(dict), {"idea:" + d["id"]: k for k, d in ideas.items()}
+    for s, d, sc in pairs:
+        if sc >= t and s in by_id and d in by_id:
+            nb[s][d] = nb[d][s] = sc
+    leader_of, groups = {}, defaultdict(list)
+    for key in sorted(ideas, key=lambda k: ideas[k]["ts"] or 0):
+        iid = "idea:" + ideas[key]["id"]
+        best = max(((sc, lead) for lead, sc in nb[iid].items() if leader_of.get(lead) == lead), default=None)
+        leader_of[iid] = best[1] if best else iid
+        groups[leader_of[iid]].append(key)
+    return groups
+
+
+def cluster_info(members: list, ideas: dict, known: dict) -> dict:
+    ms = [ideas[k] for k in members]
+    bests = [m["best"] for m in ms if m.get("best")]
+    return {"lead": ms[0], "n": len(ms), "sessions": len({m["session"] for m in ms}), "first": min(m["ts"] for m in ms),
+            "last": max(m["ts"] for m in ms), "component": Counter(m["component"] for m in ms).most_common(1)[0][0],
+            "refs": sorted({n for m in ms for n in m["refs"] or [] if n in known}), "members": ms,
+            "best": max(bests, key=lambda b: b["score"]) if bests else None}
+
+
+def all_clusters(r):
+    ideas, known = load_ideas(r), known_numbers(r)
+    infos = [cluster_info(ms, ideas, known) for ms in clusters(ideas, similar_pairs(r)).values()]
+    return ideas, known, infos
+
+
+def is_left_out(c: dict) -> bool:
+    return not c["refs"] and (c["best"] is None or c["best"]["score"] < ISSUE_T)
+
+
+def provenance(r, c: dict, k: int = 2) -> list:
+    picks, seen = [], set()
+    for m in sorted(c["members"], key=lambda m: m["ts"]):
+        if m["session"] not in seen and len(picks) < k:
+            seen.add(m["session"])
+            picks.append(m)
+    texts = {d["_key"]: d["text"] or "" for d in get_fields(r, [m["chunk"] for m in picks], ["text"])}
+    return [(m, best_sentence(texts.get(m["chunk"], ""), m["title"])) for m in picks]
+
+
+def best_sentence(text: str, title: str, n: int = 180) -> str:
+    words = {w.lower() for w in re.findall(r"\w{4,}", title)}
+    sents = [s for s in re.split(r"(?<=[.!?])\s+|\n+", text) if len(s.strip()) > 20] or [text]
+    return one_line(max(sents, key=lambda s: len(words & {w.lower() for w in re.findall(r"\w{4,}", s)})), n)
+
+
+def issue_label(issues: dict, best) -> str:
+    if not best:
+        return "no issue vectors to compare"
+    i = issues.get(best["issue"]) or {}
+    state = f"{i.get('state', '?')}{'/' + i['reason'] if i.get('reason') else ''}"
+    return f"#{best['issue']} “{one_line(i.get('title', '?'), 80)}” ({best['score']:.2f}, {state})"
+
+
+def report_cluster(r, n: int, c: dict, issues: dict) -> list:
+    lead = c["lead"]
+    out = [f"### {n}. {lead['title']}", f"{lead['summary']}", "",
+           f"- {c['sessions']} sessions · {c['n']} mentions · {lead['kind']} · first {day(c['first'])} · last {day(c['last'])} (Riga)",
+           f"- best matching issue: {issue_label(issues, c['best'])}"]
+    out += [f"- > “{snip}” ({day(m['ts'])}, session `{m['session'][:8]}`, {m['role']})" for m, snip in provenance(r, c)]
+    return out + [""]
+
+
+def not_planned_section(infos: list, issues: dict) -> list:
+    rows = []
+    for c in infos:
+        for n in c["refs"]:
+            i = issues.get(n)
+            if i and i["state"] == "closed" and i["reason"] == "not_planned":
+                rows.append(f"| {one_line(c['lead']['title'], 70)} | #{n} {one_line(i['title'], 70)} | {day(c['first'])} | {c['sessions']} |")
+    head = ["## Ideas referencing issues closed as not planned", "", f"{len(rows)} idea clusters.", "",
+            "| idea | issue | first seen | sessions |", "|---|---|---|---|"]
+    return head + rows + [""]
+
+
+def tune_section(r) -> list:
+    t = r.hgetall("hs:tune")
+    if not t:
+        return ["## Threshold", "", f"Tracked cutoff {ISSUE_T:.2f} (no labelled sample recorded; run `hist tune --sample 20`).", ""]
+    return ["## Threshold", "", f"Tracked cutoff in use: **{ISSUE_T:.2f}** (env HS_ISSUE_T). Labelled sample: {t.get('n')} pairs, "
+            f"best cutoff {t.get('best')} at accuracy {t.get('acc')} (F1 {t.get('f1')}); labelled {t.get('when')}.", ""]
+
+
+def cmd_report(a) -> int:
+    r = client()
+    ideas, known, infos = all_clusters(r)
+    issues, st = load_issues(r), r.hgetall("hs:ideas:stats")
+    left = sorted((c for c in infos if is_left_out(c)), key=lambda c: (-c["sessions"], -c["n"], -c["last"]))
+    by_comp = defaultdict(list)
+    for c in left:
+        by_comp[c["component"]].append(c)
+    lines = ["# Left-out idea candidates", "",
+             f"Generated {datetime.now(TZ):%Y-%m-%d %H:%M} Riga · {len(ideas)} ideas in {len(infos)} clusters (cluster cutoff {IDEA_T:.2f}) · "
+             f"{len(left)} left-out clusters · extraction stats: {', '.join(f'{k}={v}' for k, v in sorted(st.items()))}", "",
+             f"Left-out = no explicit `#N` issue/PR reference in any source chunk AND best issue similarity < {ISSUE_T:.2f}.", ""]
+    lines += tune_section(r)
+    for comp in sorted(by_comp, key=lambda k: -sum(c["sessions"] for c in by_comp[k])):
+        cs = by_comp[comp]
+        lines += [f"## {comp} ({len(cs)} clusters)", ""] + [x for n, c in enumerate(cs[:40], 1) for x in report_cluster(r, n, c, issues)]
+        lines += [f"_…{len(cs) - 40} more {comp} clusters not shown._", ""] if len(cs) > 40 else []
+    lines += not_planned_section(infos, issues)
+    write_md(OUT / "report.md", lines)
+    return 0
+
+
+def write_md(path: Path, lines: list) -> None:
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.chmod(path, 0o600)
+    log(f"wrote {path} ({len(lines)} lines)")
+
+
+def cmd_tune(a) -> int:
+    r, path = client(), OUT / "tune.tsv"
+    if a.sample:
+        return tune_sample(r, path, a.sample)
+    rows = [ln.split("\t") for ln in path.read_text(encoding="utf-8").splitlines()[1:] if ln.strip()]
+    lab = [(float(x[1]), x[0].strip().lower() == "y") for x in rows if x[0].strip().lower() in ("y", "n")]
+    if not lab:
+        raise SystemExit(f"hist tune: no y/n labels in the first column of {path}")
+    best = max((_score(lab, t / 100) + (t / 100,) for t in range(50, 100)), key=lambda x: (x[0], x[1], -abs(x[2] - 0.8)))
+    r.hset("hs:tune", mapping={"n": len(lab), "best": f"{best[2]:.2f}", "acc": f"{best[0]:.2f}", "f1": f"{best[1]:.2f}", "when": f"{datetime.now(TZ):%Y-%m-%d}"})
+    for t in (0.70, 0.75, 0.78, 0.80, 0.82, 0.85):
+        print(f"cutoff {t:.2f}: accuracy {_score(lab, t)[0]:.2f} F1 {_score(lab, t)[1]:.2f}")
+    print(f"best cutoff {best[2]:.2f} (accuracy {best[0]:.2f}, F1 {best[1]:.2f}) over {len(lab)} labels")
+    return 0
+
+
+def _score(lab: list, t: float) -> tuple:
+    tp = sum(1 for s, y in lab if s >= t and y)
+    fp = sum(1 for s, y in lab if s >= t and not y)
+    fn = sum(1 for s, y in lab if s < t and y)
+    return (sum(1 for s, y in lab if (s >= t) == y) / len(lab), 2 * tp / max(2 * tp + fp + fn, 1))
+
+
+def tune_sample(r, path: Path, n: int) -> int:
+    ideas, issues = load_ideas(r), load_issues(r)
+    scored = sorted((d for d in ideas.values() if d.get("best")), key=lambda d: d["best"]["score"])
+    pick = [scored[int(i * (len(scored) - 1) / max(n - 1, 1))] for i in range(n)] if scored else []
+    rows = ["label(y/n)\tscore\tidea\tidea_title\tidea_summary\tissue\tissue_title"]
+    rows += [f"\t{d['best']['score']:.3f}\t{d['id']}\t{d['title']}\t{one_line(d['summary'], 200)}\t#{d['best']['issue']}\t"
+             f"{(issues.get(d['best']['issue']) or {}).get('title', '?')}" for d in pick]
+    path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    os.chmod(path, 0o600)
+    print(f"wrote {len(pick)} score-stratified idea->issue pairs to {path}; fill column 1 with y/n, then run `hist tune`")
+    return 0
+
+
+def graph_nodes(ideas: dict, groups: dict, issues: dict, prs: dict, edges: list) -> dict:
+    lead = {ideas[k]["id"]: ideas[ms[0]]["id"] for ms in groups.values() for k in ms}
+    nodes = {f"idea:{d['id']}": {"id": f"idea:{d['id']}", "type": "idea", "title": d["title"], "kind": d["kind"], "component": d["component"],
+                                 "ts": d["ts"], "cluster": f"idea:{lead[d['id']]}"} for d in ideas.values()}
+    for e in edges:
+        for end in (e["src"], e["dst"]):
+            if end not in nodes:
+                typ, _, ident = end.partition(":")
+                meta = issues.get(int(ident)) if typ == "issue" else prs.get(int(ident)) if typ == "pr" else None
+                nodes[end] = {"id": end, "type": typ, **({"title": meta["title"], "state": meta.get("state", "merged"),
+                                                           "reason": meta.get("reason", "")} if meta else {})}
+    return nodes
+
+
+def cmd_graph(a) -> int:
+    r = client()
+    ideas = load_ideas(r)
+    groups = clusters(ideas, similar_pairs(r))
+    edges = [{k: d[k] for k in ("src", "dst", "type", "score")} for d in get_fields(r, list(search_keys(r, I_EDGE, "*")), ["src", "dst", "type", "score"])]
+    nodes = graph_nodes(ideas, groups, load_issues(r), load_prs(r), edges)
+    out = Path(os.path.expanduser(a.out))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({"generated": datetime.now(TZ).isoformat(), "cluster_cutoff": IDEA_T, "tracked_cutoff": ISSUE_T,
+                               "nodes": list(nodes.values()), "edges": edges}), encoding="utf-8")
+    os.chmod(out, 0o600)
+    log(f"graph: {len(nodes)} nodes, {len(edges)} edges -> {out}")
+    return 0
+
+
+# ---------- evolution ----------
+
+DECISION = re.compile(r"(?i)\b(from now on|going forward|decided|decision|always|never|don'?t|do not|we will|we'll|should be|must(?: not)?|no more|stop \w+ing|instead of|the rule|make sure)\b")
+STRONG = re.compile(r"(?i)\b(from now on|going forward|decided|the rule|always|never|must)\b")
+SHIFT_WORDS = re.compile(r"(?i)\b(migrat\w*|renam\w*|replac\w*|deprecat\w*|consolidat\w*|extract\w*|unif\w*|split\w*|switch\w* to|move[sd]? to|remov\w*|introduc\w*|adopt\w*)\b")
+NAMED_SHIFTS = [
+    ("default branch renamed Dev_new_gui -> main", re.compile(r"(?i)\brenam\w*\b[^.\n]{0,80}\b(Dev_new_gui|default branch)\b|\bDev_new_gui\b[^.\n]{0,60}\brenam\w*")),
+    ("built-but-not-wired theme", UNWIRED),
+]
+THEME_PROMPT = """Here are the idea titles discussed and the pull requests merged during one week of an AI platform project (AutoBot).
+Summarise the week's main themes as 3 to 5 short phrases (at most 10 words each).
+Reply with JSON only: {"themes":["..."]}
+
+IDEAS DISCUSSED:
+IDEAS
+MERGED PRS:
+PRS"""
+DECIDE_PROMPT = """Below are numbered sentences the owner of a software project wrote to an AI coding assistant.
+Which of them set a lasting rule, policy, convention, or direction for the project (for example "from now on ...", "never ...", "always ...", "we will ...")?
+Exclude one-off task instructions, questions, status remarks and complaints.
+Reply with JSON only: {"keep":[sentence numbers]}
+
+SENTENCES:
+LIST"""
+
+
+def week_of(ts: float) -> str:
+    y, w, _ = datetime.fromtimestamp(float(ts), TZ).isocalendar()
+    return f"{y}-W{w:02d}"
+
+
+def week_span(wk: str) -> str:
+    monday = datetime.strptime(wk + "-1", "%G-W%V-%u")
+    return f"{monday:%Y-%m-%d} → {monday + timedelta(days=6):%Y-%m-%d}"
+
+
+def load_chunks(r, query: str = "*") -> list:
+    return get_fields(r, list(search_keys(r, I_CHUNK, query)), ["session", "ts", "role", "text"])
+
+
+def commits() -> list:
+    rows = git("log", REF, "--format=%h%x09%ad%x09%s", "--date=short").splitlines()
+    return [(sha, datetime.strptime(d, "%Y-%m-%d").replace(hour=12, tzinfo=TZ).timestamp(), s)
+            for sha, d, s in (ln.split("\t", 2) for ln in rows if ln.count("\t") >= 2)]
+
+
+def fetch_origin() -> None:
+    try:
+        git("fetch", "origin", "--quiet", timeout=300)
+    except (RuntimeError, subprocess.TimeoutExpired) as e:
+        warn(f"git fetch origin failed ({e}); using the last fetched {REF}")
+    log(f"{REF} at {git('log', '-1', '--format=%h %cd', '--date=short', REF).strip()}")
+
+
+def llm_pick(prompt: str, key: str):
+    """The JSON list at `key`, or None after two unparseable replies."""
+    for temp in (0.0, 0.4):
+        try:
+            data = json.loads(llm(prompt, temp, 400))
+        except ValueError:
+            continue
+        if isinstance(data, dict) and isinstance(data.get(key), list):
+            return data[key]
+    return None
+
+
+def decision_candidates(chunks: list) -> dict:
+    by_week, seen = defaultdict(list), set()
+    for c in chunks:
+        for s in re.split(r"(?<=[.!?])\s+|\n+", c["text"] or ""):
+            s = " ".join(s.split())
+            if 25 <= len(s) <= 260 and DECISION.search(s) and h(s.lower()) not in seen:
+                seen.add(h(s.lower()))
+                by_week[week_of(c["ts"])].append({"quote": s, "ts": c["ts"], "session": c["session"],
+                                                  "score": 2 * len(STRONG.findall(s)) + len(DECISION.findall(s))})
+    return by_week
+
+
+def filter_decisions(r, wk: str, cands: list) -> list:
+    cands = sorted(cands, key=lambda c: -c["score"])[:40]
+    sig, cached = h(wk + json.dumps([c["quote"] for c in cands])), r.get(f"hs:evo:dec:{wk}")
+    if cached and json.loads(cached)["sig"] == sig:
+        return json.loads(cached)["kept"]
+    kept = []
+    for i in range(0, len(cands), 20):
+        part = cands[i:i + 20]
+        picks = llm_pick(DECIDE_PROMPT.replace("LIST", "\n".join(f"{n}. {c['quote']}" for n, c in enumerate(part, 1))), "keep")
+        if picks is None:
+            warn(f"evolution: decision filter reply unparseable twice for {wk}; keeping its strong-phrase matches, marked regex-only")
+            kept += [{**c, "verified": False} for c in part if STRONG.search(c["quote"])]
+            continue
+        kept += [{**part[n - 1], "verified": True} for n in {int(x) for x in picks if str(x).isdigit()} if 1 <= n <= len(part)]
+    r.set(f"hs:evo:dec:{wk}", json.dumps({"sig": sig, "kept": kept}))
+    return kept
+
+
+def week_themes(r, wk: str, idea_titles: list, pr_titles: list) -> list:
+    if not idea_titles and not pr_titles:
+        return []
+    body = THEME_PROMPT.replace("IDEAS", "\n".join(f"- {t}" for t in idea_titles) or "- (none)")
+    body = body.replace("PRS", "\n".join(f"- {t}" for t in pr_titles) or "- (none)")
+    sig, cached = h(body), r.get(f"hs:evo:themes:{wk}")
+    if cached and json.loads(cached)["sig"] == sig:
+        return json.loads(cached)["themes"]
+    themes = llm_pick(body, "themes")
+    if themes is None:
+        warn(f"evolution: theme reply unparseable twice for {wk}; week listed without themes")
+        return []
+    themes = [one_line(str(t), 90) for t in themes[:5]]
+    r.set(f"hs:evo:themes:{wk}", json.dumps({"sig": sig, "themes": themes}))
+    return themes
+
+
+def pr_rank(title: str) -> int:
+    return 0 if re.match(r"(?i)(feat|security)\b", title) else 1 if re.match(r"(?i)(refactor|perf)\b", title) else 2
+
+
+class Weeks:
+    """Every per-week aggregate the evolution page needs, gathered in one pass."""
+
+    def __init__(self, r):
+        self.r, self.chunks = r, load_chunks(r)
+        self.prs, self.issues, self.commits = load_prs(r), load_issues(r), commits()
+        ideas, _, self.infos = all_clusters(r)
+        self.count = defaultdict(Counter)
+        self.sessions, self.pr_titles, self.cluster_week = defaultdict(set), defaultdict(list), defaultdict(Counter)
+        self._tally()
+
+    def _tally(self) -> None:
+        for c in self.chunks:
+            wk = week_of(c["ts"])
+            self.sessions[wk].add(c["session"])
+            self.count[wk]["chunks"] += 1
+            self.count[wk]["owner_msgs"] += c["role"] == "user"
+        for p in self.prs.values():
+            self.count[week_of(p["merged"])]["prs"] += 1
+            self.pr_titles[week_of(p["merged"])].append(p["title"])
+        for i in self.issues.values():
+            self.count[week_of(i["created"])]["issues_opened"] += 1
+            if i["closed"]:
+                self.count[week_of(i["closed"])]["issues_closed"] += 1
+        for _, ts, _ in self.commits:
+            self.count[week_of(ts)]["commits"] += 1
+        for c in self.infos:
+            for m in c["members"]:
+                self.cluster_week[week_of(m["ts"])][c["lead"]["title"]] += 1
+
+    def shift_timeline(self, rx) -> Counter:
+        tl = Counter()
+        for c in self.chunks:
+            tl[week_of(c["ts"])] += bool(rx.search(c["text"] or ""))
+        for p in self.prs.values():
+            tl[week_of(p["merged"])] += bool(rx.search(p["title"]))
+        for i in self.issues.values():
+            tl[week_of(i["created"])] += bool(rx.search(i["title"]) or (rx is UNWIRED and i["unwired"] == "1"))
+        return +tl
+
+
+def shift_lines(wks: Weeks) -> list:
+    out = ["## Named architecture shifts", "", "| shift | first week | peak week | mentions (chunks + PR/issue titles) |", "|---|---|---|---|"]
+    tls = {}
+    for label, rx in NAMED_SHIFTS:
+        tl = tls[label] = wks.shift_timeline(rx)
+        first = min(tl) if tl else "—"
+        peak = max(tl, key=tl.get) if tl else "—"
+        out.append(f"| {label} | {first} | {peak} | {sum(tl.values())} |")
+    tl = tls["built-but-not-wired theme"]
+    out += ["", "Built-but-not-wired mentions per week: " + (" · ".join(f"{w} {n}" for w, n in sorted(tl.items())) or "none"), ""]
+    return out
+
+
+def week_lines(wk: str, wks: Weeks, themes: list, decisions: list) -> list:
+    c = wks.count[wk]
+    prs = sorted(wks.pr_titles[wk], key=pr_rank)
+    shifts = [t for t in prs if SHIFT_WORDS.search(t) and pr_rank(t) < 2][:5]
+    out = [f"### {wk} ({week_span(wk)})", "",
+           f"sessions {len(wks.sessions[wk])} · owner messages {c['owner_msgs']} · chunks {c['chunks']} · PRs merged {c['prs']} · "
+           f"issues opened {c['issues_opened']} / closed {c['issues_closed']} · commits on main {c['commits']}", ""]
+    out += ["**Themes:** " + "; ".join(themes), ""] if themes else []
+    out += ["**Notable merged PRs:**"] + [f"- {one_line(t, 110)}" for t in prs[:5]] + [""] if prs else []
+    out += ["**Shift candidates:**"] + [f"- {one_line(t, 110)}" for t in shifts] + [""] if shifts else []
+    if decisions:
+        out += ["**Decisions:**"] + [f"- {day(d['ts'])} · `{d['session'][:8]}` · “{one_line(d['quote'], 200)}”{'' if d['verified'] else ' (regex-only)'}"
+                                     for d in sorted(decisions, key=lambda d: d["ts"])[:20]] + [""]
+    return out
+
+
+def store_decisions(r, decisions: dict) -> int:
+    """hs:decision:* is a projection of this run's filter; it is replaced, never accumulated."""
+    old = list(r.scan_iter("hs:decision:*", count=2000))
+    for i in range(0, len(old), 1000):
+        r.delete(*old[i:i + 1000])
+    p, n = r.pipeline(transaction=False), 0
+    for wk, ds in decisions.items():
+        for d in ds:
+            p.execute_command("JSON.SET", f"hs:decision:{h(d['quote'].lower(), 16)}", "$", json.dumps({**d, "week": wk}))
+            n += 1
+    p.execute()
+    return n
+
+
+def cmd_evolution(a) -> int:
+    r = client()
+    fetch_origin()
+    wks = Weeks(r)
+    weeks = sorted(set(wks.count) | set(wks.sessions))
+    cands = decision_candidates([c for c in wks.chunks if c["role"] == "user"])
+    log(f"evolution: {len(weeks)} weeks · {sum(map(len, cands.values()))} decision candidates · LLM themes + decision filter per week")
+    with ThreadPoolExecutor(LLM_WORKERS) as pool:
+        themes = dict(zip(weeks, pool.map(lambda w: week_themes(r, w, [t for t, _ in wks.cluster_week[w].most_common(8)],
+                                                                   sorted(wks.pr_titles[w], key=pr_rank)[:12]), weeks)))
+        decisions = dict(zip(weeks, pool.map(lambda w: filter_decisions(r, w, cands[w]) if cands.get(w) else [], weeks)))
+    n_dec = store_decisions(r, decisions)
+    lines = ["# AutoBot evolution", "",
+             f"Generated {datetime.now(TZ):%Y-%m-%d %H:%M} Riga · {len(weeks)} weekly buckets (ISO weeks, Riga) · {len(wks.chunks)} session chunks · "
+             f"{len(wks.prs)} merged PRs · {len(wks.issues)} issues · {len(wks.commits)} commits on {REF} · {n_dec} owner decisions kept", ""]
+    lines += shift_lines(wks) + ["## Weeks (newest first)", ""]
+    for wk in reversed(weeks):
+        lines += week_lines(wk, wks, themes[wk], decisions[wk])
+    write_md(OUT / "evolution.md", lines)
+    return 0
+
+
+# ---------- planned vs built ----------
+
+BUCKETS = ("BUILT", "PARTIAL", "BUILT-BUT-UNWIRED", "DROPPED", "OPEN-NOT-STARTED", "CLOSED-NO-PR", "NEVER-FILED")
+COMP_RULES = [("slm", r"\bslm\b"), ("frontend", r"frontend|\bgui\b|\bvue\b|\bui\b|\bux\b|i18n|css|typescript|javascript|accessib|visuali"),
+              ("ci", r"\bci\b|ci-gates|test-suite|testing|\btests?\b|github|lint|guard|ratchet|pre-commit"),
+              ("knowledge", r"knowledge|\bkb\b|\brag\b|chroma|memory|document|retriev|search"),
+              ("agents", r"agent|\bllm\b|ai-ml|orchestr|\bmcp\b|approval|prompt"),
+              ("infra", r"infra|deploy|docker|ansible|devops|network|redis|database|\bnpu\b|\bgpu\b|hardware|startup|updat|systemd|backup"),
+              ("devtools", r"devtools|tooling|\bhooks?\b|\bscripts?\b|\bskills?\b|claude|git-hygiene|worktree"),
+              ("backend", r"backend|\bapi\b|router|auth|rbac|secret|security|chat|voice|websocket|events|config|fastapi|workflow")]
+
+
+def issue_component(i: dict) -> str:
+    scope = re.match(r"^\w+\(([^)]*)\)", i["title"] or "")
+    for text in (scope.group(1) if scope else "", " ".join(i["labels"] or []), i["title"] or ""):
+        for comp, rx in COMP_RULES:
+            if re.search(rx, text, re.I):
+                return comp
+    return "other"
+
+
+def pr_links(prs: dict) -> dict:
+    links = defaultdict(lambda: {"closes": set(), "refs": set()})
+    for p in prs.values():
+        for n in p["closes"] or []:
+            links[n]["closes"].add(p["number"])
+        for n in p["refs"] or []:
+            links[n]["refs"].add(p["number"])
+    return links
+
+
+def classify_issue(i: dict, link: dict) -> str:
+    closed = i["state"] == "closed"
+    if closed and i["reason"] == "not_planned":
+        return "DROPPED"
+    if not closed and i["unwired"] == "1":
+        return "BUILT-BUT-UNWIRED"
+    if closed and (link["closes"] or link["refs"]):
+        return "BUILT"
+    if not closed and ((i["ac_done"] or 0) > 0 or link["refs"] or link["closes"]):
+        return "PARTIAL"
+    return "CLOSED-NO-PR" if closed else "OPEN-NOT-STARTED"
+
+
+def classify_cluster(c: dict, issues: dict, links: dict) -> tuple:
+    cands = [n for n in c["refs"] if n in issues]
+    if cands:
+        n = c["best"]["issue"] if c["best"] and c["best"]["issue"] in cands else cands[0]
+        return classify_issue(issues[n], links[n]), n, "ref"
+    if c["refs"]:
+        return "BUILT", c["refs"][0], "merged PR ref"
+    if c["best"] and c["best"]["score"] >= ISSUE_T and c["best"]["issue"] in issues:
+        n = c["best"]["issue"]
+        return classify_issue(issues[n], links[n]), n, f"similar {c['best']['score']:.2f}"
+    return "NEVER-FILED", None, ""
+
+
+def count_table(title: str, rows: list) -> list:
+    comps = sorted({c for c, _ in rows})
+    cnt = Counter(rows)
+    out = [f"## {title}", "", "| component | " + " | ".join(BUCKETS) + " | total |", "|---" * (len(BUCKETS) + 2) + "|"]
+    for comp in comps:
+        out.append(f"| {comp} | " + " | ".join(str(cnt[(comp, b)]) for b in BUCKETS) + f" | {sum(cnt[(comp, b)] for b in BUCKETS)} |")
+    out.append("| **all** | " + " | ".join(str(sum(cnt[(c, b)] for c in comps)) for b in BUCKETS) + f" | {len(rows)} |")
+    return out + [""]
+
+
+def cmd_planned_vs_built(a) -> int:
+    r = client()
+    issues, prs = load_issues(r), load_prs(r)
+    links = pr_links(prs)
+    _, _, infos = all_clusters(r)
+    ib = {n: (issue_component(i), classify_issue(i, links[n])) for n, i in issues.items()}
+    cb = [(c, *classify_cluster(c, issues, links)) for c in infos]
+    demand = Counter()
+    for c, _, n, _ in cb:
+        if n in issues:
+            demand[n] += c["sessions"]
+    lines = ["# Planned vs built", "",
+             f"Generated {datetime.now(TZ):%Y-%m-%d %H:%M} Riga · {len(issues)} issues · {len(prs)} merged PRs · {len(infos)} idea clusters · "
+             f"tracked cutoff {ISSUE_T:.2f}. Component is a heuristic over the title scope, labels, then title words.", "",
+             "Buckets: BUILT = closed and a merged PR references it · PARTIAL = open with ticked ACs or a merged PR reference · "
+             "BUILT-BUT-UNWIRED = open with the not-wired label or 'never wired'/'no production caller' phrasing · DROPPED = closed not planned · "
+             "OPEN-NOT-STARTED · CLOSED-NO-PR = closed completed/duplicate with no merged-PR reference · NEVER-FILED = idea with no ref and low similarity.", ""]
+    lines += count_table("Issues by component", list(ib.values()))
+    lines += count_table("Idea clusters by component", [(c["component"], b) for c, b, _, _ in cb])
+    lines += top_items(issues, ib, demand, cb)
+    write_md(OUT / "planned_vs_built.md", lines)
+    return 0
+
+
+def top_items(issues: dict, ib: dict, demand: Counter, cb: list) -> list:
+    out = []
+    for b in BUCKETS:
+        nums = sorted((n for n, (_, bb) in ib.items() if bb == b), key=lambda n: (-demand[n], -(issues[n]["created"] or 0)))[:12]
+        cls = sorted((x for x in cb if x[1] == b), key=lambda x: -x[0]["sessions"])[:12]
+        if not nums and not cls:
+            continue
+        out += [f"## {b}", ""]
+        out += [f"- #{n} {one_line(issues[n]['title'], 100)} · {ib[n][0]} · idea demand {demand[n]} sessions" for n in nums]
+        out += [f"- idea: {one_line(c['lead']['title'], 90)} · {c['component']} · {c['sessions']} sessions"
+                + (f" · #{n} ({how})" if n else "") for c, _, n, how in cls] + [""]
+    return out
+
+
+# ---------- docs gaps ----------
+
+DOC_RX = re.compile(r"^docs/.*\.md$|(^|/)[^/]*README[^/]*\.md$|(^|/)CLAUDE[^/]*\.md$")
+REF_SPAN = re.compile(r"`([^`\n]{3,200})`|\]\(([^)\s]{3,200})\)")
+PATHISH = re.compile(r"^(?:[\w.@-]+/)*[\w.@-]+\.(?:py|ts|tsx|js|mjs|vue|sh|md|ya?ml|json|toml|ini|cfg|sql|j2|service|conf)$")
+SKIP_REF = re.compile(r"(?i)^(https?:|/|~|\$|\.\./\.\./\.\./)|[*<>{}]|\.\.\.|example|your[_-]|\bfoo\b|\bbar\b|xxx|yyyy|timestamp|path/to")
+BARE_CODE = re.compile(r"\.(py|vue|ts|tsx|sh|md)$")  # a bare `name.conf` is usually a host file, not a repo path
+HISTORICAL = re.compile(r"(^|/)(archives?|plans|superpowers|reports)/")
+REMOVED = [re.compile(r"(?i)\b(removed|deleted|renamed|retired|deprecated|dropped)\b[^.\n`]{0,50}`([^`\s]{4,80})`"),
+           re.compile(r"(?i)`([^`\s]{4,80})`[^.\n`]{0,40}\b(?:was|is|has been|have been|got|are|were)\s+(?:now\s+)?(removed|deleted|renamed|retired|deprecated|dropped)\b")]
+USER_FACING = re.compile(r"(?i)\b(ui|gui|user|chat|voice|i18n|dashboard|page|view|button|panel|settings|frontend|onboarding|login)\b")
+SECURITY = re.compile(r"(?i)security|threat|auth|secret|rbac|egress|vuln|cve|redact")
+
+
+def repo_tree() -> dict:
+    out = git("ls-tree", "-r", "-z", REF)
+    return {path: meta.split()[2] for meta, path in (e.split("\t", 1) for e in out.split("\0") if "\t" in e)}
+
+
+def doc_text(path: str) -> str:
+    return git("show", f"{REF}:{path}")
+
+
+def sync_docs(r, docs: dict) -> dict:
+    """path -> text for every doc; re-embeds only docs whose blob changed since the last run."""
+    stored, texts, changed = r.hgetall("hs:docsha"), {}, 0
+    for path in [p for p in stored if p not in docs]:
+        _drop_doc(r, path)
+    for path, sha in docs.items():
+        texts[path] = doc_text(path)
+        if stored.get(path) != sha:
+            _drop_doc(r, path)
+            _embed_doc(r, path, texts[path])
+            r.hset("hs:docsha", path, sha)
+            changed += 1
+    log(f"docs: {len(docs)} on {REF} · {changed} (re)embedded · index holds {num_docs(r, I_DOC)} doc chunks")
+    return texts
+
+
+def _drop_doc(r, path: str) -> None:
+    keys = list(r.smembers(f"hs:docchunks:{path}"))
+    if keys:
+        r.delete(*keys)
+    r.delete(f"hs:docchunks:{path}")
+    r.hdel("hs:docsha", path)
+
+
+def _embed_doc(r, path: str, text: str) -> None:
+    parts = chunk_text(text)
+    for i in range(0, len(parts), BATCH):
+        seg = parts[i:i + BATCH]
+        vecs = embed_batch([f"{path}\n{t}" for t in seg], "search_document")
+        p = r.pipeline(transaction=False)
+        for j, (t, vec) in enumerate(zip(seg, vecs)):
+            key = f"hs:doc:{h(f'{path}|{i + j}|{t}')}"
+            p.execute_command("JSON.SET", key, "$", json.dumps({"path": path, "i": i + j, "text": t, **({"vec": vec} if vec else {})}))
+            p.sadd(f"hs:docchunks:{path}", key)
+        p.execute()
+
+
+def doc_importance(path: str) -> int:
+    """0 = historical (plans, archives, reports): stale references there are expected and ranked last."""
+    return 0 if HISTORICAL.search(path) else importance(path)
+
+
+def importance(text: str, labels=()) -> int:
+    lab = " ".join(labels)
+    return 3 if SECURITY.search(text) or "security" in lab else 2 if USER_FACING.search(text) or "user-facing" in lab else 1
+
+
+def pr_vector(r, p: dict):
+    got = r.execute_command("JSON.GET", f"hs:pr:{p['number']}", "$.vec")
+    if got and json.loads(got):
+        return json.loads(got)[0]
+    title = re.sub(r"^\w+(\([^)]*\))?!?:\s*|\s*\(#\d+\)", "", p["title"])
+    vec = ix.embed(title, "search_query")
+    if vec:
+        r.execute_command("JSON.SET", f"hs:pr:{p['number']}", "$.vec", json.dumps(vec))
+    return vec
+
+
+def undocumented(r, prs: dict, decisions: list) -> tuple:
+    feats = [p for p in prs.values() if re.match(r"(?i)(feat|security)(\([^)]*\))?!?:", p["title"])]
+    rows, drows = [], []
+    for p in feats:
+        vec = pr_vector(r, p)
+        hit = knn(r, I_DOC, vec, 1) if vec else []
+        sim, path = (1 - hit[0][1], r.execute_command("JSON.GET", hit[0][0], "$.path")) if hit else (0.0, None)
+        if sim < DOC_T:
+            rows.append((importance(p["title"], p["labels"] or []), sim, p, json.loads(path)[0] if path else "—"))
+    for d in decisions:
+        vec = ix.embed(d["quote"], "search_query")
+        hit = knn(r, I_DOC, vec, 1) if vec else []
+        if not hit or 1 - hit[0][1] < DOC_T:
+            drows.append((1 - hit[0][1] if hit else 0.0, d))
+    rows.sort(key=lambda x: (-x[0], x[1], -(x[2]["merged"] or 0)))
+    return feats, rows, sorted(drows, key=lambda x: x[0])
+
+
+def ref_exists(tok: str, doc: str, files: set, basenames: set, suffixes: set) -> bool:
+    if "/" not in tok:
+        return tok in basenames
+    tok = tok[2:] if tok.startswith("./") else tok
+    return tok in files or os.path.normpath(os.path.join(os.path.dirname(doc), tok)) in files or tok in suffixes
+
+
+def stale_refs(texts: dict, files: set) -> list:
+    basenames = {f.rsplit("/", 1)[-1] for f in files}
+    suffixes = {"/".join(p[i:]) for f in files for p in [f.split("/")] for i in range(1, len(p))}
+    out = []
+    for doc, text in texts.items():
+        missing = []
+        for m in REF_SPAN.finditer(text):
+            tok = re.sub(r"(#.*|:\d+(-\d+)?)$", "", (m.group(1) or m.group(2)).strip())
+            bare_ok = "/" in tok or BARE_CODE.search(tok)
+            if PATHISH.match(tok) and bare_ok and not SKIP_REF.search(tok) and not ref_exists(tok, doc, files, basenames, suffixes):
+                missing.append(tok)
+        if missing:
+            out.append((doc_importance(doc), doc, sorted(set(missing))))
+    return sorted(out, key=lambda x: (-x[0], -len(x[2])))
+
+
+def removal_claims(r, files: set) -> dict:
+    claims = {}
+    for c in sorted(load_chunks(r, "@role:{assistant|user|peer}"), key=lambda c: c["ts"]):
+        for rx in REMOVED:
+            for m in rx.finditer(c["text"] or ""):
+                tok = m.group(2) if rx is REMOVED[0] else m.group(1)
+                if claim_token(tok) and tok not in claims:
+                    if not (PATHISH.match(tok) and (tok in files or any(f.endswith("/" + tok) for f in files))):
+                        claims[tok] = {"ts": c["ts"], "session": c["session"], "quote": one_line(m.group(0), 160)}
+    return claims
+
+
+def claim_token(tok: str) -> bool:
+    """A name worth looking for in docs: identifier- or path-shaped, not a branch/worktree name or a placeholder."""
+    return (bool(re.search(r"[_./-]|[a-z][A-Z]", tok)) and not tok.startswith(("-", "#", "http"))
+            and not re.match(r"(?i)(issue|hotfix|fix|feat|chore)[-_]\d", tok) and not re.search(r"(?i)example|existing|foo|dummy", tok))
+
+
+def stale_mentions(texts: dict, claims: dict) -> list:
+    out = []
+    for doc, text in texts.items():
+        hits = [t for t in claims if t in text]
+        if hits:
+            changed = float(git("log", "-1", "--format=%ct", REF, "--", doc).strip() or 0)
+            older = [t for t in hits if changed < claims[t]["ts"]]
+            out.append((doc_importance(doc), len(older), doc, hits, older, changed))
+    return sorted(out, key=lambda x: (-x[0], -x[1], -len(x[3])))
+
+
+def docs_lines(feats: list, rows: list, drows: list, stale: list, mentions: list, claims: dict, n_docs: int) -> list:
+    out = ["# Documentation gaps", "",
+           f"Generated {datetime.now(TZ):%Y-%m-%d %H:%M} Riga · {n_docs} docs on {REF} (docs/**/*.md, *README*.md, CLAUDE*.md) · "
+           f"documented cutoff {DOC_T:.2f} (best doc-chunk cosine)", "",
+           f"Counts: (a) {len(rows)} of {len(feats)} merged feat/security PRs undocumented, {len(drows)} owner decisions without a matching doc · "
+           f"(b) {len(stale)} docs with {sum(len(x[2]) for x in stale)} references to paths missing on {REF} · "
+           f"(c) {len(mentions)} docs mentioning {len({t for m in mentions for t in m[3]})} names sessions said were removed/renamed", "",
+           "## (a) Merged features with no matching doc (security, then user-facing, first)", ""]
+    out += [f"- [{'security' if imp == 3 else 'user-facing' if imp == 2 else 'internal'}] #{p['number']} {one_line(p['title'], 100)} "
+            f"· merged {day(p['merged'])} · nearest doc {path} ({sim:.2f})" for imp, sim, p, path in rows[:80]]
+    out += ["", "### Owner decisions with no matching doc", ""]
+    out += [f"- {day(d['ts'])} · “{one_line(d['quote'], 160)}” ({sim:.2f})" for sim, d in drows[:60]]
+    out += ["", f"## (b) Stale docs: references to paths that do not exist on {REF}", ""]
+    labels = {3: "security", 2: "user-facing", 1: "internal", 0: "historical"}
+    out += [f"- [{labels[imp]}] `{doc}` ({len(miss)}): " + ", ".join(f"`{t}`" for t in miss[:6]) for imp, doc, miss in stale[:80]]
+    out += ["", "## (c) Docs still naming things sessions said were removed or renamed", "",
+            "Identifiers are not verified against code; path-like names that still exist on the tree are excluded.", ""]
+    for _, n_old, doc, hits, older, changed in mentions[:80]:
+        t = (older or hits)[0]
+        out.append(f"- `{doc}` (last changed {day(changed)}; {n_old} claims newer than the doc) · `{t}` — “{claims[t]['quote']}” "
+                   f"({day(claims[t]['ts'])})" + (f" · +{len(hits) - 1} more" if len(hits) > 1 else ""))
+    return out + [""]
+
+
+def cmd_docs_gaps(a) -> int:
+    r = client()
+    fetch_origin()
+    tree = repo_tree()
+    files = set(tree)
+    texts = sync_docs(r, {p: s for p, s in tree.items() if DOC_RX.search(p)})
+    decisions = get_fields(r, list(r.scan_iter("hs:decision:*", count=2000)), ["quote", "ts", "session"])
+    feats, rows, drows = undocumented(r, load_prs(r), decisions)
+    claims = removal_claims(r, files)
+    lines = docs_lines(feats, rows, drows, stale_refs(texts, files), stale_mentions(texts, claims), claims, len(texts))
+    write_md(OUT / "doc_gaps.md", lines)
+    return 0
+
+
+# ---------- all, stats, main ----------
+
+STEPS = [("ingest", lambda: cmd_ingest(argparse.Namespace(limit=0, files=None))), ("ideas", lambda: cmd_ideas(argparse.Namespace(limit=0))),
+         ("link", lambda: cmd_link(argparse.Namespace(relink=False))), ("report", lambda: cmd_report(None)),
+         ("evolution", lambda: cmd_evolution(None)), ("planned-vs-built", lambda: cmd_planned_vs_built(None)),
+         ("docs-gaps", lambda: cmd_docs_gaps(None)), ("graph", lambda: cmd_graph(argparse.Namespace(out=str(OUT / "graph.json"))))]
+
+
+def estimate(r) -> float:
+    rt = {k: float(v) for k, v in r.hgetall("hs:rates").items()}
+    todo = [f for f in transcript_files() if r.hget("hs:files", str(f)) != _sig(f)]
+    mb = sum(f.stat().st_size for f in todo) / 1e6
+    chunks = mb * rt.get("chunks_per_mb", 10.0)
+    hints = len(pending_hint_chunks(r)) + chunks * rt.get("hint_frac", 0.5)
+    st = r.hgetall("hs:ideas:stats")
+    processed = int(st.get("with_ideas", 0)) + int(st.get("empty", 0))
+    per_chunk = int(st.get("ideas", 0)) / processed if processed else 2.0
+    parts = {"ingest": chunks / rt.get("ingest_chunks_per_s", 40.0) + mb / 20, "ideas": hints * rt.get("ideas_s_per_item", 3.0),
+             "link": (num_docs(r, I_IDEA) + hints * per_chunk) * rt.get("link_s_per_item", 0.05) + 16700 / 40 * (num_docs(r, I_ISSUE) < 1000)}
+    parts.update({k: rt.get(f"step_{k}_s", 600.0) for k in ("report", "evolution", "planned-vs-built", "docs-gaps", "graph")})
+    log(f"ESTIMATE: {len(todo)} transcripts to ingest ({mb:.0f} MB) -> ~{chunks:.0f} new chunks, ~{hints:.0f} idea-hint chunks, ~{per_chunk:.2f} ideas/chunk")
+    for k, v in parts.items():
+        log(f"ESTIMATE:   {k:<17} {v / 3600:6.2f} h")
+    total = sum(parts.values())
+    log(f"ESTIMATE: total ~{total / 3600:.1f} h -> done around {datetime.now(TZ) + timedelta(seconds=total):%Y-%m-%d %H:%M} Riga "
+        f"(rates measured: {', '.join(f'{k}={v:.3g}' for k, v in sorted(rt.items()))})")
+    return total
+
+
+def cmd_all(a) -> int:
+    r = client()
+    estimate(r)
+    for name, fn in STEPS:
+        log(f"=== {name} ===")
+        t0 = time.time()
+        try:
+            rc = fn()
+        except (Exception, SystemExit) as e:
+            warn(f"step {name} failed: {e}\n{traceback.format_exc()}")
+            log("stopped; re-run `hist all` to resume from where it left off")
+            return 1
+        rate(r, f"step_{name}_s", time.time() - t0)
+        log(f"=== {name} finished in {(time.time() - t0) / 60:.1f} min (rc {rc}) ===")
+        if name == "ingest":
+            estimate(r)
+    return 0
+
+
+def cmd_stats(a) -> int:
+    r = client()
+    print(f"transcripts ingested {r.hlen('hs:files')} · chunks {num_docs(r, I_CHUNK)} · ideas {num_docs(r, I_IDEA)} · issues {num_docs(r, I_ISSUE)} · "
+          f"edges {num_docs(r, I_EDGE)} · doc chunks {num_docs(r, I_DOC)} · idea-hint chunks done {r.scard('hs:ideas:done')} · "
+          f"ideas linked {r.scard('hs:link:done')} · chunks without vector {r.scard('hs:novec')}")
+    print("idea stats: " + ", ".join(f"{k}={v}" for k, v in sorted(r.hgetall("hs:ideas:stats").items())))
+    print("rates: " + ", ".join(f"{k}={v}" for k, v in sorted(r.hgetall("hs:rates").items())))
+    print(f"redis used {r.info('memory')['used_memory_human']} of maxmemory {r.config_get('maxmemory')['maxmemory']}")
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(prog="hist", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("ingest"); p.add_argument("--limit", type=int, default=0); p.add_argument("--files", nargs="*"); p.set_defaults(fn=cmd_ingest)
+    p = sub.add_parser("find"); p.add_argument("query"); p.add_argument("-k", type=int, default=8)
+    p.add_argument("--role", choices=["user", "assistant", "peer", "compact", "prompt", "all"], help="default: all roles except prompt"); p.set_defaults(fn=cmd_find)
+    p = sub.add_parser("ideas"); p.add_argument("--limit", type=int, default=0); p.set_defaults(fn=cmd_ideas)
+    p = sub.add_parser("link"); p.add_argument("--relink", action="store_true"); p.set_defaults(fn=cmd_link)
+    p = sub.add_parser("tune"); p.add_argument("--sample", type=int, default=0); p.set_defaults(fn=cmd_tune)
+    p = sub.add_parser("graph"); p.add_argument("--out", default=str(OUT / "graph.json")); p.set_defaults(fn=cmd_graph)
+    for name, fn in (("report", cmd_report), ("evolution", cmd_evolution), ("planned-vs-built", cmd_planned_vs_built),
+                     ("docs-gaps", cmd_docs_gaps), ("all", cmd_all), ("stats", cmd_stats)):
+        sub.add_parser(name).set_defaults(fn=fn)
+    return ap
+
+
+def main() -> int:
+    OUT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    a = parser().parse_args()
+    t0 = time.time()
+    rc = a.fn(a)
+    if a.cmd in ("report", "evolution", "planned-vs-built", "docs-gaps", "graph"):
+        rate(client(), f"step_{a.cmd}_s", time.time() - t0)  # measured wall time feeds the `all` estimate
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

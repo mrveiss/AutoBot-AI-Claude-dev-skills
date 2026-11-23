@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# pr-tag [--apply] — give untagged open PRs the milestone and type labels of the issues they
+# close (or, failing that, the #N issues named in the title). Dry run unless --apply.
+# Never invents: a PR with no linked issue is reported as NO-LINK and left alone.
+set -u
+REPO=mrveiss/AutoBot-AI; APPLY=${1:-}
+SKIP='^(in-progress|blocked|needs-decision|land-next|good first issue|help wanted|duplicate|wontfix|question)$'
+gh pr list --repo $REPO --state open --limit 200 --json number,title,milestone,labels,closingIssuesReferences \
+  -q '.[]|select(.milestone==null or (.labels|length)==0)|"\(.number)\u001f\(.milestone.title // "")\u001f\(.labels|length)\u001f\([.closingIssuesReferences[].number]|map(tostring)|join(","))\u001f\(.title)"' |
+while IFS=$'\u001f' read -r n ms nl closes title; do
+  iss=$closes; [ -z "$iss" ] && iss=$(grep -oE '#[0-9]{4,6}' <<<"$title" | tr -d '#' | tr '\n' ',' | sed 's/,$//')
+  [ -z "$iss" ] && { echo "#$n NO-LINK (left alone): ${title:0:60}"; continue; }
+  mss=""; labs=""
+  for i in ${iss//,/ }; do
+    j=$(gh issue view "$i" --repo $REPO --json milestone,labels 2>/dev/null) || continue
+    mss="$mss$(jq -r '.milestone.title // empty' <<<"$j")"$'\n'
+    labs="$labs$(jq -r '.labels[].name' <<<"$j" | grep -vE "$SKIP")"$'\n'
+  done
+  want_ms=$(grep -v '^$' <<<"$mss" | sort | uniq -c | sort -rn | awk 'NR==1{$1="";sub(/^ /,"");print}')
+  want_lb=$(grep -v '^$' <<<"$labs" | sort -u | paste -sd, -)
+  act=""
+  [ -z "$ms" ] && [ -n "$want_ms" ] && act="$act milestone=$want_ms"
+  [ "$nl" = 0 ] && [ -n "$want_lb" ] && act="$act labels=$want_lb"
+  [ -z "$act" ] && { echo "#$n nothing derivable from #${iss}"; continue; }
+  echo "#$n from #${iss}:$act"
+  if [ "$APPLY" = --apply ]; then
+    args=(); [ -z "$ms" ] && [ -n "$want_ms" ] && args+=(--milestone "$want_ms")
+    [ "$nl" = 0 ] && [ -n "$want_lb" ] && args+=(--add-label "$want_lb")
+    gh pr edit "$n" --repo $REPO "${args[@]}" >/dev/null 2>&1 || echo "  #$n edit FAILED"
+  fi
+done

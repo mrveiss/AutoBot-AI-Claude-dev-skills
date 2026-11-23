@@ -1,0 +1,551 @@
+#!/usr/bin/env python3
+"""pr-coordinator [--dry] — one tick of the cross-session PR traffic light (owner rules 2026-11-18).
+
+  1 FIFO: PRs land in submission order (createdAt). A PR that is draft, conflicting or red keeps
+    its place but gets no CI slot; once fixed it is ahead of everything submitted after it.
+    The release promotion (#19456) is always last. Outside-contributor PRs are reported, not slotted.
+  2 At most WIDTH (2) PRs hold CI. Slots are ledger holds `ci-slot:N` (other sessions' holds count).
+    Every other PR's in-flight Actions runs are cancelled through ci-cancel. A slot PR that is behind
+    main is updated (update-branch); its cancelled runs are re-run. Only the oldest slot PR may land.
+  3 CodeRabbit threads awaiting a reply are reported for EVERY open PR, at once, regardless of CI.
+  4 A red check at a PR's head cancels that PR's remaining runs and pages its creator session.
+No active trainmaster is assumed; when one is active (ledger hold `trainmaster`), this tool reports only.
+Prints the queue + an ATTENTION block (JSON lines) the coordinator session relays to owners.
+State: ~/.claude/state/pr-coordinator/ (notified keys, queue.md).
+"""
+import importlib.machinery, importlib.util, json, subprocess, sys, time
+from pathlib import Path
+
+REPO, WIDTH, LAST = "mrveiss/AutoBot-AI", 2, {19456}
+ME = "pr-coordinator"
+SLOT_LABEL = "land-next"   # marks slot PRs; the sync workflow merges main only into these (owner 2026-11-18)
+PROTECTED = {"main", "release", "master"}   # a promotion PR's head is main: its runs are main's own CI
+S = Path.home() / ".claude/scripts"
+STATE = Path.home() / ".claude/state/pr-coordinator"
+DRY = "--dry" in sys.argv
+OWN_AUTHORS = {"mrveiss", "dependabot", "app/dependabot"}
+RED = {"FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ERROR", "ACTION_REQUIRED"}
+# Contexts that go red BECAUSE a PR is parked: ci-dispatch-watchdog fails any head with no executed CI
+# (#12823/#13045). For a parked PR that is the queue working, not a defect; counting it as red would bar
+# the PR from ever getting the slot that would clear it.
+PARKING_ARTIFACTS = {"ci-dispatch-watchdog"}
+# Contexts that fail on MAIN itself because of a tracked defect: {context: fix PR}. A PR red only on these
+# is not at fault and must not lose its FIFO place; once it next holds a slot it is updated to main and
+# reruns. Remove an entry once its fix has landed and the stale reds have cycled through.
+_bd = Path.home() / ".claude/state/pr-coordinator/base-defects.json"
+BASE_DEFECTS = json.loads(_bd.read_text(encoding="utf-8")) if _bd.exists() else {}
+# {"<pr>": "<head sha[:9]>"}: a red at exactly that head is known stale (e.g. a run made while the PR was a
+# draft, #18106) and must not bar the PR from the slot that gives it a fresh run. A new head ends the override.
+_rc = Path.home() / ".claude/state/pr-coordinator/recheck.json"
+RECHECK = json.loads(_rc.read_text(encoding="utf-8")) if _rc.exists() else {}
+# {"<pr>": "<review_sha[:9]>"}: the owner asked to keep CI running at a review-blocked head for signal
+# (e.g. "does this move a ratchet baseline"). It may hold a slot but still never lands until approved.
+_sr = Path.home() / ".claude/state/pr-coordinator/signal-run.json"
+SIGNAL_RUN = json.loads(_sr.read_text(encoding="utf-8")) if _sr.exists() else {}
+ACTIVE = {"QUEUED", "IN_PROGRESS", "WAITING", "PENDING", "REQUESTED"}
+
+Q = """query($c:String){repository(owner:"mrveiss",name:"AutoBot-AI"){pullRequests(states:OPEN,first:100,after:$c){
+pageInfo{hasNextPage endCursor} nodes{number title createdAt updatedAt isDraft changedFiles headRefName headRefOid mergeable author{login}}}}}"""
+THREADS = """reviewThreads(first:60){nodes{id isResolved comments(first:1){nodes{author{login}}}
+  last:comments(last:1){nodes{author{login} createdAt url}}}}"""
+CHECKS = """commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{
+  ... on CheckRun{name status conclusion startedAt databaseId} ... on StatusContext{context state createdAt}}}}}}}"""
+DETAIL_CHUNK = 8   # GraphQL cost scales with requested nodes; small aliased batches stay under the per-minute limit
+
+
+MIGRATION_GROUP = set(json.loads((STATE / "migration-siblings.json").read_text(encoding="utf-8"))
+                      .get("members", {})) if (STATE / "migration-siblings.json").exists() else set()
+
+
+def migration_gate_ran(head):
+    """True when a run-migration-gate job concluded success (not skipped) in a CI run at this head."""
+    out = sh("gh", "api", f"repos/{REPO}/actions/runs?head_sha={head}&per_page=50", "--jq",
+             '.workflow_runs[]|select(.path==".github/workflows/ci.yml")|.id')
+    for rid in out.split():
+        jobs = sh("gh", "api", f"repos/{REPO}/actions/runs/{rid}/jobs?per_page=100", "--jq",
+                  '.jobs[]|select(.name|test("migration-gate|migration_gate"))|.conclusion')
+        if "success" in jobs.split():
+            return True
+    return False
+
+
+def sh(*cmd, check=False):
+    p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
+    if check and p.returncode:
+        raise SystemExit(f"{cmd[0]} failed: {p.stderr.strip()[:300]}")
+    return p.stdout.strip()
+
+
+def ledger_mod():
+    path = str(S / "ledger")
+    loader = importlib.machinery.SourceFileLoader("ledger", path)
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("ledger", loader))
+    loader.exec_module(mod)
+    return mod
+
+
+def gql(query, **var):
+    args = ["gh", "api", "graphql", "-f", f"query={query}"] + [x for k, v in var.items() for x in ("-f", f"{k}={v}")]
+    for attempt in range(3):                  # a heavy page can come back truncated; retry before failing
+        try:
+            return json.loads(sh(*args, check=True))["data"]
+        except (ValueError, KeyError, TypeError, SystemExit):
+            if attempt == 2:
+                raise
+            time.sleep(5)
+
+
+def fetch_prs():
+    """Light list of every open PR, then threads (non-draft) and checks (slot candidates) in small batches."""
+    prs, cur = [], None
+    while True:
+        page = gql(Q, **({"c": cur} if cur else {}))["repository"]["pullRequests"]
+        prs += page["nodes"]
+        if not page["pageInfo"]["hasNextPage"]:
+            break
+        cur = page["pageInfo"]["endCursor"]
+    # Threads change only when the PR's updatedAt does: cache them per (number, updatedAt). Checks are fetched
+    # fresh, but only for slot candidates. Fetching both for ~90 PRs every tick spent the whole 5000-point
+    # GraphQL hour on 2026-11-18.
+    cache_path = STATE / "threads-cache.json"
+    cache = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.exists() else {}
+    new_cache = {}
+    want = []
+    for p in prs:
+        p["reviewThreads"], p["commits"] = {"nodes": []}, {"nodes": []}
+        if p["isDraft"]:
+            continue
+        hit = cache.get(str(p["number"]))
+        threads = not (hit and hit["updatedAt"] == p["updatedAt"])
+        if not threads:
+            p["reviewThreads"] = hit["threads"]
+        checks = p["mergeable"] != "CONFLICTING" and p["changedFiles"] > 0
+        if threads or checks:
+            want.append((p, threads, checks))
+    for i in range(0, len(want), DETAIL_CHUNK):
+        chunk = want[i:i + DETAIL_CHUNK]
+        parts = [f'p{p["number"]}:pullRequest(number:{p["number"]}){{{THREADS if t else ""} {CHECKS if c else ""}}}'
+                 for p, t, c in chunk]
+        data = gql('{repository(owner:"mrveiss",name:"AutoBot-AI"){' + " ".join(parts) + "}}")["repository"]
+        for p, _, _ in chunk:
+            p.update({k: v for k, v in (data.get(f'p{p["number"]}') or {}).items()})
+    for p in prs:
+        if not p["isDraft"]:
+            new_cache[str(p["number"])] = {"updatedAt": p["updatedAt"], "threads": p["reviewThreads"]}
+    if not DRY:
+        cache_path.write_text(json.dumps(new_cache), encoding="utf-8")
+    return prs
+
+
+def ci_state(pr):
+    """Latest attempt per context: (red names, active count, total contexts)."""
+    nodes = pr["commits"]["nodes"]
+    ctx = (nodes[0]["commit"]["statusCheckRollup"] or {}).get("contexts", {}).get("nodes", []) if nodes else []
+    latest, ids = {}, {}
+    for c in ctx:
+        name = c.get("name") or c.get("context")
+        stamp = c.get("startedAt") or c.get("createdAt") or ""
+        if name and (name not in latest or stamp >= latest[name][0]):
+            latest[name] = (stamp, c.get("conclusion") or c.get("state"), c.get("status"))
+            ids[name] = c.get("databaseId")
+    active = sum(1 for n, (_, concl, st) in latest.items() if n not in PARKING_ARTIFACTS
+                 and (st in ACTIVE or concl in ACTIVE or (st is None and concl is None)))
+    red = sorted(n for n, (_, concl, _) in latest.items() if concl in RED and n not in PARKING_ARTIFACTS)
+    if red and set(red) <= set(BASE_DEFECTS) and not any(contains_fix(pr["headRefOid"], BASE_DEFECTS[n]) for n in red):
+        red = []                                  # red only on a main defect whose fix this head predates
+    if red and not pr.get("isDraft") and all(ids.get(n) and draft_gated(ids[n]) for n in red):
+        red = []                                  # every failure is the #18106 draft gate: stale once ready
+    if red and RECHECK.get(str(pr["number"])) == pr["headRefOid"][:9]:
+        red = []                                  # owner-verified stale red at exactly this head: rerun in a slot
+    return red, active, len(latest)
+
+
+_DRAFT_CACHE = {}
+DRAFT_GATE_TEXT = "draft: mark ready for review"   # the #18106 draft gate's error line
+
+
+def draft_gated(check_id):
+    """True when this failed check run's only story is the draft gate (it never ran the work)."""
+    if check_id not in _DRAFT_CACHE:
+        notes = sh("gh", "api", f"repos/{REPO}/check-runs/{check_id}/annotations", "--jq", "[.[].message]|join(\"\\n\")")
+        _DRAFT_CACHE[check_id] = bool(notes) and DRAFT_GATE_TEXT in notes
+    return _DRAFT_CACHE[check_id]
+
+
+def contains_fix(head, fix):
+    """True when the head already contains the base-defect fix (merged commit sha); an open fix PR (int) is in no head."""
+    if not isinstance(fix, str):
+        return False
+    return sh("gh", "api", f"repos/{REPO}/compare/{fix}...{head}", "--jq", ".status") in ("ahead", "identical")
+
+
+
+
+def rabbit_threads(pr):
+    """Unresolved threads opened by CodeRabbit whose last word is CodeRabbit's (awaiting a reply)."""
+    out = []
+    for t in pr["reviewThreads"]["nodes"]:
+        first = (t["comments"]["nodes"] or [{}])[0].get("author") or {}
+        last = (t["last"]["nodes"] or [{}])[0]
+        if not t["isResolved"] and "coderabbit" in (first.get("login") or "") \
+                and "coderabbit" in ((last.get("author") or {}).get("login") or ""):
+            out.append((t["id"], last.get("createdAt", ""), last.get("url", "")))
+    return out
+
+
+GHOST_AGE_H = 12   # a run still queued/running after this is a GitHub-side ghost (cancel accepted, never applied)
+
+
+def _ghost_cutoff():
+    """Runs created before this are ghosts: cancelling them again only burns the per-tick cancel budget that
+    live non-slot runs need (2026-11-19: 30-day-old runs ate all 50 cancels every tick)."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - GHOST_AGE_H * 3600))
+
+
+# Post-merge bookkeeping that runs when a PR closes and carries no test load: the PR is already gone from the
+# queue, so rule 2 would cancel it and the landing note would be lost (ci-enforce.sh, 2026-11-06). "train-content-gate"
+# was exempted there too but only matters for merge trains, which are retired, so it is not ported.
+EXEMPT_WORKFLOWS = {"Issue landing notes"}
+
+
+def actions_runs():
+    runs = []
+    for status in ("in_progress", "queued", "waiting", "pending"):
+        raw = sh("gh", "api", f"repos/{REPO}/actions/runs?status={status}&per_page=100",
+                 "--jq", f'.workflow_runs[]|select(.created_at > "{_ghost_cutoff()}")|[.id,.head_branch,.head_sha,.event,.name]|@tsv')
+        runs += [line.split("\t") for line in raw.splitlines() if line]
+    return [r[:4] for r in {r[0]: r for r in runs}.values() if (r[4:5] or [""])[0] not in EXEMPT_WORKFLOWS]   # a run can appear under two status filters
+
+
+def owner_of(r, lg, pr):
+    name = r.hget(f"lg:pr:{pr['number']}", "owner") or ""
+    if not name:
+        name = (r.hgetall(f"lg:claim:worktree:{pr['headRefName']}") or r.hgetall(
+            f"lg:claim:branch:{pr['headRefName']}")).get("owner", "")
+    return (name, lg.alive(r, name)) if name else ("-", "unknown")
+
+
+MAX_CANCELS = 50   # 1 POST/s stays under the ~80/min write limit; 25 could not drain a 175-run queue (2026-11-18)
+RECENT = {}   # run id -> epoch of our cancel; a cancelled run stays in_progress for minutes
+
+
+def cancel(run_id, branch, n, reason, log):
+    if time.time() - RECENT.get(run_id, 0) < 600:
+        return
+    if sum(1 for line in log if line.startswith("cancel ")) >= MAX_CANCELS:
+        return                                # secondary rate limit: the rest go next tick
+    RECENT[run_id] = time.time()
+    log.append(f"cancel run {run_id} #{n}: {reason}")
+    if not DRY:
+        time.sleep(1)
+        sh(str(S / "ci-cancel"), run_id, ME, reason, branch, str(n))
+
+
+def start_ci_or_report(n, p, gate, seen, log, attention):
+    """A `[skip ci]` sync head never gets its required checks: ask the sync to start CI once per head (#21577)."""
+    parts = gate.split()
+    if len(parts) >= 2 and not p["headRefOid"].startswith(parts[1]):
+        return                                    # the head moved mid-tick (sync push): next tick sees it
+    queued = sh("gh", "api", f"repos/{REPO}/actions/runs?head_sha={p['headRefOid']}&per_page=100",
+                "--jq", '[.workflow_runs[]|select(.status!="completed")]|length')
+    if queued not in ("", "0"):                   # an Actions run is live (queued or running): CI is underway
+        return
+    k = f"{n}:start-ci:{p['headRefOid']}"
+    msg = sh("gh", "api", f"repos/{REPO}/commits/{p['headRefOid']}", "--jq", ".commit.message")
+    if "[skip ci]" in msg:
+        if k not in seen:
+            seen[k] = int(time.time())
+            log.append(f"start-ci #{n} (head is a [skip ci] sync merge)")
+            if not DRY:
+                sh("gh", "workflow", "run", "sync-branches-with-main.yml", "--repo", REPO, "-f", f"start_ci_for_pr={n}")
+        return
+    log.append(f"#{n} slot idle, ci-gate: {gate or 'no answer (rate limit?)'}")
+    if not p["total"] and k not in seen:
+        seen[k] = int(time.time())
+        attention.append({"pr": n, "kind": "no-ci", "owner": p["owner"], "owner_state": p["alive"],
+                          "branch": p["headRefName"], "head": p["headRefOid"][:9]})
+
+
+def merges_only_main(others):
+    """A merge brings in only main when every non-first parent is already in main. Judged by ancestry,
+    not by the commit title: sync bot, update-branch and hand merges word it three different ways."""
+    for sha in others:
+        status = sh("gh", "api", f"repos/{REPO}/compare/{sha}...main", "--jq", ".status")
+        if status not in ("ahead", "identical"):
+            return False
+    return True
+
+
+def review_carries(review_sha, head):
+    """Owner 2026-11-18: an approval carries forward across commits that are ONLY auto-sync merges of main
+    or empty (0-file) start-CI commits. Any real commit, or a rewritten history, needs a new review."""
+    if not review_sha:
+        return False
+    if head.startswith(review_sha):
+        return True
+    cur = head                                # walk FIRST parents only: main's commits merged in are not the PR's
+    for _ in range(40):
+        if cur.startswith(review_sha) or review_sha.startswith(cur):
+            return True
+        raw = sh("gh", "api", f"repos/{REPO}/commits/{cur}",
+                 "--jq", '[.sha, (.parents|map(.sha)|join(",")), (.files|length), (.commit.message|split("\n")[0])]|@tsv')
+        if not raw:
+            return False
+        sha, parents, nfiles, subject = raw.split("\t", 3)
+        parents = parents.split(",")
+        ok = (len(parents) >= 2 and merges_only_main(parents[1:])) or (len(parents) == 1 and nfiles == "0")
+        if not ok:
+            return False
+        cur = parents[0]
+    return False
+
+
+def main():
+    lg = ledger_mod()
+    r = lg.conn()
+    STATE.mkdir(parents=True, exist_ok=True)
+    seen_path = STATE / "notified.json"
+    seen = json.loads(seen_path.read_text(encoding="utf-8")) if seen_path.exists() else {}
+    recent_path = STATE / "recent-cancels.json"
+    if recent_path.exists():
+        RECENT.update({k: v for k, v in json.loads(recent_path.read_text(encoding="utf-8")).items()
+                       if time.time() - v < 600})
+    if r.exists("lg:hold:trainmaster"):
+        print("trainmaster active — train rules apply; pr-coordinator reports only")
+        globals()["DRY"] = True
+
+    prs = sorted(fetch_prs(), key=lambda p: (p["number"] in LAST, p["createdAt"], p["number"]))
+    by_branch = {p["headRefName"]: p for p in prs if p["headRefName"] not in PROTECTED}
+    runs = actions_runs()
+    held = {int(k.rsplit(":", 1)[1]): r.hgetall(k) for k in r.scan_iter("lg:hold:ci-slot:*")}
+    open_nums = {p["number"] for p in prs}
+    log, attention, rows, eligible = [], [], [], []
+    deps_path = STATE / "deps.json"                # {"<pr>": [<pr it must land after>, ...]}, set by the coordinator
+    deps = json.loads(deps_path.read_text(encoding="utf-8")) if deps_path.exists() else {}
+    open_now = {p["number"] for p in prs}
+
+    for p in prs:
+        n, red, active, total = p["number"], *ci_state(p)
+        p["red"], p["active"], p["total"] = red, active, total
+        p["owner"], p["alive"] = owner_of(r, lg, p)
+        author = (p["author"] or {}).get("login", "")
+        rvb = r.hgetall(f"lg:pr:{n}")
+        if rvb.get("review_verdict") == "blocked" and p["headRefOid"].startswith(rvb.get("review_sha", "-")) \
+                and SIGNAL_RUN.get(str(n)) != rvb.get("review_sha", "")[:9]:
+            p["why"] = "review BLOCKED at this head: changes requested, so no slot until a new head"
+        elif r.exists(f"lg:hold:pr:{n}"):       # a session's `ledger hold pr:<n>` parks it: no slot, no merge
+            p["why"] = "held: " + (r.hget(f"lg:hold:pr:{n}", "reason") or "")[:60]
+        elif p["isDraft"]:
+            p["why"] = "draft"
+        elif p["headRefName"].startswith("dependabot/") or n in LAST:   # owner 2026-11-18: "release and dependabots can wait"
+            p["why"] = "parked by owner (dependabot / release promotion): report only, no slot"
+        elif p["headRefName"].startswith("train-") and not r.exists("lg:hold:trainmaster"):
+            p["why"] = "old merge train: no slot without an active trainmaster"   # owner 2026-11-18
+        elif author not in OWN_AUTHORS:
+            p["why"] = f"external ({author})"
+        elif p["mergeable"] == "CONFLICTING":
+            p["why"] = "conflicts with main"
+        elif p["changedFiles"] == 0:              # nothing to land: a full suite here buys nothing
+            p["why"] = "empty diff vs main"
+        elif any(d in open_now for d in deps.get(str(n), [])):   # declared order: lands after its dependency
+            p["why"] = "waits for #" + ", #".join(str(d) for d in deps[str(n)] if d in open_now)
+        elif red:
+            p["why"] = "red"
+        elif f"{n}:red:{p['headRefOid']}" in seen:   # paged red at THIS head; a later cancel must not hide it
+            p["why"] = "red at this head (owner paged); waits for a new head"
+        else:
+            p["why"] = ""
+            eligible.append(n)
+        def page(kind, key, **extra):
+            k = f"{n}:{kind}:{key}"
+            if k not in seen:
+                seen[k] = int(time.time())
+                attention.append({"pr": n, "kind": kind, "owner": p["owner"], "owner_state": p["alive"],
+                                  "branch": p["headRefName"], "head": p["headRefOid"][:9], "title": p["title"][:70], **extra})
+        if p["why"] == "conflicts with main":     # a conflict makes every other verdict moot
+            page("conflict", p["headRefOid"])
+        elif red:                                 # rule 4
+            page("red", p["headRefOid"], checks=red)
+        fresh = [(tid, ts, url) for tid, ts, url in rabbit_threads(p) if f"{n}:coderabbit:{tid}:{ts}" not in seen]
+        if fresh:                                 # rule 3: one page per PR, every new thread marked seen
+            for tid, ts, _ in fresh[1:]:
+                seen[f"{n}:coderabbit:{tid}:{ts}"] = int(time.time())
+            page("coderabbit", f"{fresh[0][0]}:{fresh[0][1]}", threads=len(fresh), url=fresh[0][2])
+
+    # rule 2 + 1: slots = live holds by others first, then FIFO-eligible up to WIDTH
+    slots = [n for n in sorted(held, key=lambda x: next((i for i, p in enumerate(prs) if p["number"] == x), 999))
+             if n in open_nums and held[n].get("by") != ME]
+    # no pre-emption: a slot this tool granted is kept until the PR lands, goes red or conflicts;
+    # only FREE slots are filled in FIFO order (a reopened older PR must not cancel a running suite)
+    slots += [n for n in eligible if held.get(n, {}).get("by") == ME and n not in slots][:max(0, WIDTH - len(slots))]
+    # unblocker lane (owner 2026-11-18): a PR that fixes main itself or stops data loss takes the next
+    # FREE slot ahead of FIFO and may land ahead of older slot PRs; it never pre-empts a running slot.
+    # Marked with `ledger set <pr> --batch unblocker`.
+    unblock = {n for n in eligible if r.hget(f"lg:pr:{n}", "batch") == "unblocker"}
+    eligible = [n for n in eligible if n in unblock] + [n for n in eligible if n not in unblock]
+    for n in eligible:
+        if len(slots) >= WIDTH:
+            break
+        if n not in slots:
+            slots.append(n)
+    for n, h in held.items():
+        if h.get("by") == ME and n not in slots:
+            log.append(f"unhold ci-slot:{n}")
+            if not DRY:
+                sh(str(S / "ledger"), "--as", ME, "unhold", f"ci-slot:{n}")
+                if n in open_nums:                # owner 2026-11-18: only slot PRs are synced with main
+                    sh("gh", "pr", "edit", str(n), "--repo", REPO, "--remove-label", SLOT_LABEL)
+    for n in slots:
+        if n not in held:
+            log.append(f"hold ci-slot:{n}")
+            if not DRY:
+                sh(str(S / "ledger"), "--as", ME, "hold", f"ci-slot:{n}", "FIFO slot (pr-coordinator)", "--ttl", "6h")
+                sh("gh", "pr", "edit", str(n), "--repo", REPO, "--add-label", SLOT_LABEL)
+
+    pmap0 = {p["number"]: p for p in prs}
+    slot_branches = {pmap0[n]["headRefName"] for n in slots if n in pmap0}
+    for rid, branch, sha, event in runs:
+        if branch in PROTECTED:                   # main/release runs are main's own CI: never touched
+            continue
+        p = by_branch.get(branch)
+        if not p:                                 # a closed PR's or PR-less branch: it holds no slot (rule 2)
+            if branch not in slot_branches:
+                cancel(rid, branch, "-", "rule2: branch has no open PR and no CI slot", log)
+            continue
+        if p["red"]:
+            cancel(rid, branch, p["number"], f"rule4: red at head ({', '.join(p['red'][:3])})", log)
+        elif p["number"] not in slots:
+            cancel(rid, branch, p["number"], "rule2: no CI slot (FIFO)", log)
+
+    pmap = {p["number"]: p for p in prs}
+    def could_land(m):
+        """An older slot PR blocks a newer one only if it could land itself (owner: a not-ready PR keeps its
+        place but does not block): approved at a head the approval carries to, and 0 unresolved threads."""
+        q, rv_m = pmap[m], r.hgetall(f"lg:pr:{m}")
+        if any(not t["isResolved"] for t in q["reviewThreads"]["nodes"]):
+            return False
+        return rv_m.get("review_verdict") == "approve" and review_carries(rv_m.get("review_sha", ""), q["headRefOid"])
+
+    for i, n in enumerate(slots):
+        p = pmap[n]
+        if n in held and held[n].get("by") != ME:
+            continue                              # another session drives its own slot
+        bo = sh(str(S / "behind-ok"), str(n))
+        if " UPDATE " in f" {bo} " or "UPDATE" in bo.split()[1:2]:
+            log.append(f"update-branch #{n} ({bo})")
+            if not DRY:
+                sh("gh", "api", "-X", "PUT", f"repos/{REPO}/pulls/{n}/update-branch",
+                   "-f", f"expected_head_sha={p['headRefOid']}")
+            continue
+        runs_here = sh("gh", "api", f"repos/{REPO}/actions/runs?head_sha={p['headRefOid']}&per_page=100",
+                       "--jq", '.workflow_runs[]|[.id, .status, (.conclusion // "")]|@tsv').splitlines()
+        cancelled = [r.split("\t")[0] for r in runs_here if r.endswith("\tcancelled")]
+        if RECHECK.get(str(n)) == p["headRefOid"][:9] and any(r.endswith("\tfailure") for r in runs_here):
+            # A rerun replays the ORIGINAL event payload (labels/draft as they were), so a metadata-only fix never
+            # clears by rerun. A fresh head does: ask the sync for its empty start-CI commit, once per head.
+            k = f"{n}:recheck-start-ci:{p['headRefOid']}"
+            if k not in seen:
+                seen[k] = int(time.time())
+                log.append(f"start-ci #{n} (stale red at a recheck head: fresh event needed)")
+                if not DRY:
+                    sh("gh", "workflow", "run", "sync-branches-with-main.yml", "--repo", REPO,
+                       "-f", f"start_ci_for_pr={n}")
+            continue
+        live = any(r.split("\t")[1] != "completed" for r in runs_here if r)
+        if cancelled and not live:                # judge by Actions runs only: outside apps (semgrep) are not CI
+            log.append(f"rerun {len(cancelled)} cancelled run(s) #{n}")
+            if not DRY:
+                for rid in cancelled:
+                    sh("gh", "run", "rerun", rid, "--repo", REPO)
+            continue
+        landing_head = n in unblock or not any(could_land(m) for m in slots[:i] if m in open_nums)
+        gate = sh(str(S / "ci-gate"), str(n))
+        if not gate.endswith("GREEN"):            # never stall silently: start_ci_or_report asks Actions itself
+            start_ci_or_report(n, p, gate, seen, log, attention)   # whether a run is live; outside apps'
+            continue                              # statuses (semgrep, CodeRabbit) are not CI
+        rv = r.hgetall(f"lg:pr:{n}")
+        unresolved = sum(1 for t in p["reviewThreads"]["nodes"] if not t["isResolved"])
+        if rv.get("review_verdict") != "approve" or not review_carries(rv.get("review_sha", ""), p["headRefOid"]):
+            k = f"{n}:review:{p['headRefOid']}"
+            if k not in seen:
+                seen[k] = int(time.time())
+                attention.append({"pr": n, "kind": "review", "owner": p["owner"], "owner_state": p["alive"],
+                                  "branch": p["headRefName"], "head": p["headRefOid"][:9]})
+        elif unresolved:
+            k = f"{n}:threads:{p['headRefOid']}:{unresolved}"   # say it once per head and count, not every tick
+            if k not in seen:
+                seen[k] = int(time.time())
+                log.append(f"#{n} green+approved but {unresolved} unresolved thread(s)")
+        elif str(n) in MIGRATION_GROUP and not migration_gate_ran(p["headRefOid"]):
+            k = f"{n}:migration-gate-skipped:{p['headRefOid']}"   # owner c3: the real-DB admin test skips
+            if k not in seen:                                        # without Postgres, so the gate must RUN
+                seen[k] = int(time.time())
+                log.append(f"#{n} green but run-migration-gate did not succeed at this head: no merge")
+        elif not landing_head:
+            k = f"{n}:fifo-wait:{p['headRefOid']}"
+            if k not in seen:
+                seen[k] = int(time.time())
+                log.append(f"#{n} green, waits for an older slot PR (FIFO)")
+        else:
+            log.append(f"merge #{n}")
+            if not DRY:
+                log.append(sh(str(S / "safe-merge"), str(n)))
+
+    if not DRY:
+        seen_path.write_text(json.dumps(seen), encoding="utf-8")
+        recent_path.write_text(json.dumps(RECENT), encoding="utf-8")
+        sh("redis-cli", "--no-auth-warning", "-n", "15", "DEL", "claude:landing-order")
+        if eligible:
+            sh("redis-cli", "--no-auth-warning", "-n", "15", "RPUSH", "claude:landing-order", *map(str, eligible))
+    for pos, p in enumerate(prs, 1):
+        slot = "SLOT" if p["number"] in slots else ""
+        ci = "red" if p["red"] else ("running" if p["active"] else ("none" if not p["total"] else "done"))
+        rows.append(f"| {pos} | #{p['number']} | {p['createdAt'][:16]} | {slot} | {ci} | {p['why'] or 'ready'} "
+                    f"| {p['owner']} ({p['alive']}) | {p['title'][:55]} |")
+    table = "| # | PR | submitted (UTC) | slot | CI | state | owner | title |\n|---|---|---|---|---|---|---|---|\n" + "\n".join(rows)
+    (STATE / "queue.md").write_text(f"# PR queue — {time.strftime('%F %T')} (dry={DRY})\n\n{table}\n", encoding="utf-8")
+    print(f"slots={slots} eligible={len(eligible)} open={len(prs)} dry={DRY}")
+    for line in log:
+        print("ACTION", line)
+    if not DRY and attention:                 # the coordinator session drains this and pages owners
+        with open(STATE / "attention.jsonl", "a", encoding="utf-8") as fh:
+            fh.writelines(json.dumps({"ts": int(time.time()), **a}) + "\n" for a in attention)
+    for a in attention:
+        print("ATTENTION", json.dumps(a))
+
+
+def degraded_tick(err):
+    """GraphQL refused (secondary rate limit): keep rule 2 alive on REST alone. Slots stay as held;
+    every other open PR's runs are cancelled. No pages, no slot moves, no merges until GraphQL returns."""
+    lg = ledger_mod()
+    r = lg.conn()
+    STATE.mkdir(parents=True, exist_ok=True)
+    recent_path = STATE / "recent-cancels.json"
+    if recent_path.exists():
+        RECENT.update({k: v for k, v in json.loads(recent_path.read_text(encoding="utf-8")).items()
+                       if time.time() - v < 600})
+    held = {k.rsplit(":", 1)[1] for k in r.scan_iter("lg:hold:ci-slot:*")}
+    raw = sh("gh", "api", "--paginate", f"repos/{REPO}/pulls?state=open&per_page=100",
+             "--jq", ".[]|[.number,.head.ref]|@tsv")
+    by_branch = {b: n for n, b in (line.split("\t") for line in raw.splitlines() if line) if b not in PROTECTED}
+    log = []
+    for rid, branch, _sha, _event in actions_runs():
+        if branch in PROTECTED:
+            continue
+        n = by_branch.get(branch)
+        if n not in held:                         # an open PR without a slot, or a closed-PR / PR-less branch
+            cancel(rid, branch, n or "-", "rule2: no CI slot (FIFO, degraded tick)", log)
+    if not DRY:
+        recent_path.write_text(json.dumps(RECENT), encoding="utf-8")
+    print(f"DEGRADED tick ({err[:80]}): slots held={sorted(held)}")
+    for line in log:
+        print("ACTION", line)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit as exc:
+        if "rate limit" not in str(exc):
+            raise
+        degraded_tick(str(exc))

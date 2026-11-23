@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""dahl-ask: offload a bulk, PUBLIC-ONLY text task to the Dahl inference API to save Claude tokens.
+
+Usage:  dahl-ask "question" [< input.txt]    (stdin is appended as the material to analyse)
+        DAHL_MODEL=<id> dahl-ask ...          (default: DeepSeek V4 Flash)
+        DAHL_MAX_INFLIGHT / DAHL_FALLBACK_INFLIGHT (default 7 / 3): Dahl caps parallel requests per key at ~12 total,
+        split across two model pools of slot locks shared by every job; a call runs on the model whose slot it holds.
+        DAHL_DEADLINE (default 280s): total wall clock per call, so callers' 300s timeouts never fire.
+Key:    $DAHL_API_KEY, else ~/.config/dahl/api_key (0600, outside every repo).
+Rules:  public content only (the AutoBot repo, public GitHub issues/PRs/CI logs). Never secrets, memory
+        files, live-system logs, or internal hosts; a guard refuses obvious cases. Output is a HINT to verify.
+"""
+import json
+import fcntl, random, time, os, re, sys, urllib.error, urllib.request
+
+URL = "https://inference.dahl.global/v1/chat/completions"
+MODEL = os.environ.get("DAHL_MODEL", "deepseek-ai/DeepSeek-V4-Flash-0731")
+MAX_INPUT = int(os.environ.get("DAHL_MAX_INPUT_CHARS", "400000"))
+GUARD = [
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"), "a private key"),
+    (re.compile(r"\b(?:10|127)\.\d{1,3}\.\d{1,3}\.\d{1,3}\b|\b192\.168\.\d{1,3}\.\d{1,3}\b|\b172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b"), "a private IP address"),
+    (re.compile(r"(?i)\b(?:authorization:\s*bearer|api[_-]?key\s*[:=]|password\s*[:=]|secret\s*[:=])\s*\S{8,}"), "a credential-looking assignment"),
+    (re.compile(r"\b(?:ghp|gho|ghs|github_pat|sk|dahl)_[A-Za-z0-9_]{16,}"), "an access token"),
+    (re.compile(r"/\.claude/projects/|/opt/autobot/|/var/log/autobot/"), "an internal path (memory or live system)"),
+]
+
+
+def key() -> str:
+    k = os.environ.get("DAHL_API_KEY")
+    if k:
+        return k.strip()
+    with open(os.path.expanduser("~/.config/dahl/api_key"), encoding="utf-8") as fh:
+        return fh.read().strip()
+
+
+FALLBACK = os.environ.get("DAHL_FALLBACK_MODEL", "MiniMaxAI/MiniMax-M2.7")
+RETRIES = int(os.environ.get("DAHL_RETRIES", "5"))
+_THROTTLED = ("admitted first", "Top up", "rate limit", "in-flight streams")
+SLOTS = int(os.environ.get("DAHL_MAX_INFLIGHT", "7"))
+FALLBACK_SLOTS = int(os.environ.get("DAHL_FALLBACK_INFLIGHT", "3"))
+DEADLINE = time.monotonic() + float(os.environ.get("DAHL_DEADLINE", "280"))
+SLOT_DIR = os.path.expanduser(os.environ.get("DAHL_SLOT_DIR", "~/.cache/dahl-ask"))
+
+
+def _remaining() -> float:
+    return DEADLINE - time.monotonic()
+
+
+def _pools():
+    """(model, slot-file prefix, size) per model, primary first."""
+    pools = [(MODEL, "slot", SLOTS)]
+    if FALLBACK and FALLBACK != MODEL:
+        pools.append((FALLBACK, "fallback-slot", FALLBACK_SLOTS))
+    return pools
+
+
+def acquire_slot():
+    """Hold a free slot in the first model pool that has one (released when this process exits); (None, None) near the deadline."""
+    os.makedirs(SLOT_DIR, mode=0o700, exist_ok=True)
+    while _remaining() > 30:
+        for model, prefix, size in _pools():
+            for i in range(size):
+                fd = os.open(os.path.join(SLOT_DIR, f"{prefix}-{i}.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return fd, model
+                except BlockingIOError:
+                    os.close(fd)
+        time.sleep(1.0 + random.random())
+    return None, None
+
+
+def _post(model: str, prompt: str) -> dict:
+    body = json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}]}).encode()
+    req = urllib.request.Request(URL, data=body, headers={"Authorization": f"Bearer {key()}", "Content-Type": "application/json", "Accept": "application/json", "User-Agent": "dahl-ask/1.0 (+curl-compatible)"})
+    with urllib.request.urlopen(req, timeout=max(5.0, min(float(os.environ.get("DAHL_TIMEOUT", "180")), _remaining() - 5))) as r:
+        data = json.load(r)
+    _record_usage(model, data.get("usage") or {})
+    return data
+
+
+def _record_usage(model: str, usage: dict) -> None:
+    """Tally Dahl tokens per day in Redis db15 (claude:dahl:usage:<YYYY-MM-DD>), so offload is
+    measurable against the token-conservation goal. Best-effort: a Redis failure never fails a call."""
+    import subprocess
+    day = time.strftime("%Y-%m-%d")
+    for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        n = int(usage.get(field) or 0)
+        if n:
+            subprocess.run(["redis-cli", "--no-auth-warning", "-n", "15", "HINCRBY", f"claude:dahl:usage:{day}", field, str(n)],
+                           capture_output=True, timeout=5, check=False)
+    subprocess.run(["redis-cli", "--no-auth-warning", "-n", "15", "HINCRBY", f"claude:dahl:usage:{day}", f"calls:{model}", "1"],
+                   capture_output=True, timeout=5, check=False)
+
+
+def _wait_for(e: urllib.error.HTTPError, attempt: int) -> float:
+    """Seconds to wait before retrying: the server's Retry-After if given, else backoff; capped at 60."""
+    try:
+        return min(60.0, float(e.headers.get("Retry-After", "")))
+    except ValueError:
+        return min(60.0, 5.0 * (attempt + 1))
+
+
+def ask_with_retry(prompt: str, model: str):
+    """Retry a throttled (429) or gateway-timeout (5xx) request on the model whose slot this process holds, within the deadline."""
+    for attempt in range(RETRIES):
+        if _remaining() < 20:
+            print(f"dahl-ask: deadline reached before attempt {attempt + 1} on {model}", file=sys.stderr)
+            return None, model
+        try:
+            return _post(model, prompt), model
+        except urllib.error.HTTPError as e:
+            detail = e.read(300).decode("utf-8", "replace")
+            retryable = e.code == 429 or e.code >= 500 or any(t in detail for t in _THROTTLED)
+            print(f"dahl-ask: HTTP {e.code} on {model} (attempt {attempt + 1}): {detail[:160]}", file=sys.stderr)
+            if not retryable:
+                return None, model
+            time.sleep(max(0.0, min(_wait_for(e, attempt), _remaining() - 20)))
+        except (urllib.error.URLError, TimeoutError) as e:
+            print(f"dahl-ask: {type(e).__name__} on {model} (attempt {attempt + 1}): {e}", file=sys.stderr)
+            time.sleep(max(0.0, min(5.0 * (attempt + 1), _remaining() - 20)))
+    return None, model
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print(__doc__, file=sys.stderr)
+        return 2
+    question = sys.argv[1]
+    material = "" if sys.stdin.isatty() else sys.stdin.read()
+    if len(material) > MAX_INPUT:
+        print(f"dahl-ask: input {len(material)} chars exceeds DAHL_MAX_INPUT_CHARS={MAX_INPUT}", file=sys.stderr)
+        return 2
+    for rx, what in GUARD:
+        if rx.search(question) or rx.search(material):
+            print(f"dahl-ask: refused, the input contains {what}; public-only content may be sent", file=sys.stderr)
+            return 3
+    prompt = question if not material else f"{question}\n\n---- MATERIAL ----\n{material}"
+    slot, model = acquire_slot()
+    if slot is None:
+        print("dahl-ask: no free slot in any model pool before the deadline; retry later", file=sys.stderr)
+        return 4
+    d, used = ask_with_retry(prompt, model)
+    if d is None:
+        return 4
+    text = (d.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+    print(text)
+    u = d.get("usage") or {}
+    print(f"[dahl-ask {used}: {u.get('prompt_tokens')} in / {u.get('completion_tokens')} out]", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

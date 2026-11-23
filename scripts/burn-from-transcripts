@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""Measure ACTUAL Claude token burn per hour from the session transcripts, independent of
+~/.claude.json's cachedUsageUtilization (which can sit stale for hours and then report a
+fabricated-looking 0.0%/day). Every assistant turn records message.usage; sum it per hour.
+
+Weighted cost approximates what the weekly window charges: cache reads are cheap, cache
+writes and fresh input cost more, output most. The absolute number is not the quota; the
+HOUR-OVER-HOUR SHAPE is the evidence -- it shows whether the cut-backs changed behaviour."""
+import datetime as dt
+import json
+import pathlib
+import sys
+
+HOURS = int(sys.argv[1]) if len(sys.argv) > 1 else 12
+W = {"input_tokens": 1.0, "output_tokens": 5.0, "cache_creation_input_tokens": 1.25, "cache_read_input_tokens": 0.1}
+root = pathlib.Path.home() / ".claude" / "projects"
+now = dt.datetime.now(dt.timezone.utc)
+cut = now - dt.timedelta(hours=HOURS)
+buckets: dict[str, dict] = {}
+
+for f in root.rglob("*.jsonl"):
+    if f.stat().st_mtime < cut.timestamp() - 7200:
+        continue
+    try:
+        text = f.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        continue
+    for line in text.splitlines():
+        if '"usage"' not in line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        ts = rec.get("timestamp")
+        usage = ((rec.get("message") or {}).get("usage")) or {}
+        if not ts or not usage:
+            continue
+        when = dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if when < cut:
+            continue
+        key = when.astimezone().strftime("%m-%d %H:00")
+        b = buckets.setdefault(key, {"cost": 0.0, "raw": 0, "turns": 0, "sessions": set()})
+        b["cost"] += sum(W[k] * (usage.get(k) or 0) for k in W)
+        b["raw"] += sum((usage.get(k) or 0) for k in W)
+        b["turns"] += 1
+        b["sessions"].add(f.stem[:8])
+
+print(f"window: {cut.astimezone():%m-%d %H:%M} -> {now.astimezone():%m-%d %H:%M} local (tz={now.astimezone().tzname()})")
+print(f"{'hour (local)':<14}{'turns':>7}{'sessions':>10}{'raw tok':>12}{'weighted':>12}")
+for key in sorted(buckets):
+    b = buckets[key]
+    print(f"{key:<14}{b['turns']:>7}{len(b['sessions']):>10}{b['raw']:>12,}{int(b['cost']):>12,}")

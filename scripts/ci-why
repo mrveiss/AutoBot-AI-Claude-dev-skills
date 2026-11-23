@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# ci-why PR [check-name] — one-line cause of each failing check at the PR head, via dahl-ask.
+# PUBLIC CI logs only (the repo and its CI are public). The answer is a HINT: verify before acting.
+set -u
+REPO=mrveiss/AutoBot-AI; p=$1; want=${2:-}
+sha=$(gh pr view "$p" --repo $REPO --json headRefOid -q .headRefOid) || exit 1
+gh api "repos/$REPO/commits/$sha/check-runs?per_page=100" \
+  -q '.check_runs[]|select(.conclusion=="failure" or .conclusion=="timed_out")|"\(.id)\t\(.name)"' |
+while IFS=$'\t' read -r id name; do
+  [ -n "$want" ] && [ "$name" != "$want" ] && continue
+  log=$(gh run view --repo $REPO --job "$id" --log 2>/dev/null | sed 's/^[^Z]*Z //' | grep -vE '^\s*$' | tail -400)
+  [ -z "$log" ] && { echo "$name: log not available yet"; continue; }
+  ans=$(printf '%s\n' "$log" | ~/.claude/scripts/dahl-ask "This is the tail of a failed GitHub Actions job named '$name'. In ONE line: the failing file(s) and the exact reason. No preamble." 2>/dev/null | head -c 400)
+  echo "$name: $ans"
+done

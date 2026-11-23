@@ -108,7 +108,35 @@ plugins/autobot-dev-skills/
   skills/<meta>/SKILL.md                    router (decision table)
   skills/<meta>/references/<workflow>.md   full workflow, read on demand
   agents/<role>.md                         model-pinned role agent (auto-discovered)
+scripts/                                   the shared dev tools (ledger, pr-coordinator, ci-gate, ...) -- ONE copy
+scripts/measure/                           re-runnable measurement tools
+scripts/check-no-forks                     fails on a .bak* file or a second copy of a tool
 ```
+
+## Installing the shared scripts
+
+`scripts/` is the only copy of the shared dev tools. The Claude Code config's scripts directory is
+an install of it, never edited in place: it is a symlink to this clone's `scripts/`.
+
+```bash
+# once per machine; the clone can live anywhere
+CLONE=/path/to/AutoBot-AI-Claude-dev-skills
+[ -e ~/.claude/scripts ] && [ ! -L ~/.claude/scripts ] && mv ~/.claude/scripts ~/.claude/scripts.pre-install  # keep, then check-no-forks flags it
+ln -s "$CLONE/scripts" ~/.claude/scripts
+```
+
+Do the swap when no session is running a tool from that directory (the ledger and the PR coordinator
+run from it). Edit a tool in a worktree of this repo and open a PR; never in `~/.claude/scripts`
+(that edits the clone's checkout in place) and never leave a `.bak-*` copy -- git is the history.
+
+Tools read their paths from the environment: `$HOME`, the git top level, or an override
+(`AUTOBOT_REPO`, `CLAUDE_CONFIG_DIR`).
+
+`scripts/check-no-forks` fails if a `*.bak*` file, or a second file sharing a `scripts/` tool's
+name, exists under `~/.claude/scripts` or `~/.claude/state` (not `state/4e-artifacts-*`,
+`state/drift-removed-*`, `*/tree/*`). `check-no-forks --repo-only` checks the repo's own
+`scripts/` for duplicate names and needs no install; run it before every PR that touches `scripts/`
+(this repo has no CI workflow yet to run it).
 
 ## Updating
 

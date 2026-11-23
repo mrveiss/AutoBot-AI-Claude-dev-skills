@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Watch one PR to an all-reported verdict. Two traps this encodes, both paid for
+# on 2026-10-03 and both of which make an UNFINISHED suite look GREEN:
+#
+#   1. statusCheckRollup carries EVERY attempt, not every context. Group by name
+#      and take the latest by startedAt, or a superseded red reads as live.
+#   2. SKIPPED is reported but did not run. A PR whose checks all skipped has
+#      fail=0 and nothing pending, so "all reported, green" is true of a suite
+#      that executed nothing. Require a floor of actual SUCCESSes too.
+#   3. A rollup entry with status==null AND conclusion==null is NOT-YET-REPORTED.
+#      Counting only IN_PROGRESS/QUEUED treats it as neither pending nor failing,
+#      so "no failures and nothing running" is true of a suite that has not started.
+#      #17868 carried 16 such entries while reporting 5 "running".
+#
+# Plus a reach floor: right after a push the rollup holds a handful of entries and
+# the required checks are ABSENT. Absence of a required check is not a pass.
+PR="${1:?usage: pr-watch <pr> [floor] [iters]}"
+FLOOR="${2:-40}"
+ITERS="${3:-38}"
+OKFLOOR="${4:-15}"   # minimum actual SUCCESSes; guards the all-skipped case
+REPO="${PR_WATCH_REPO:-mrveiss/AutoBot-AI}"
+# An UNSTARTED attempt has startedAt=null, and in jq null sorts BEFORE any string --
+# so `sort_by(.startedAt) | last` returns the COMPLETED attempt and hides the queued
+# replacement. `// ""` makes it worse: it maps null to "", which also sorts first.
+# That reported a cancelled context as terminal while its re-run sat queued, on the
+# very PR the cancellation was meant to clear a path for.
+#
+# Rank explicitly instead: a live attempt (no conclusion) always outranks a finished
+# one, and only among equals does startedAt decide. 1 = live, 0 = finished.
+LATEST='[.statusCheckRollup[]] | group_by(.name // .context)
+        | map(sort_by([ (if (.conclusion // "") == "" then 1 else 0 end), (.startedAt // "") ]) | last)'
+prev=""
+for _ in $(seq 1 "$ITERS"); do
+  l=$(gh pr view "$PR" --repo "$REPO" --json statusCheckRollup 2>/dev/null | jq -c "$LATEST" 2>/dev/null)
+  tot=$(printf '%s' "$l" | jq 'length' 2>/dev/null || echo 0)
+  f=$(printf '%s' "$l" | jq '[.[]|select(.conclusion=="FAILURE")]|length' 2>/dev/null || echo "?")
+  n=$(printf '%s' "$l" | jq '[.[]|select(.status=="IN_PROGRESS" or .status=="QUEUED" or (.status==null and .conclusion==null))]|length' 2>/dev/null || echo "?")
+  ok=$(printf '%s' "$l" | jq '[.[]|select(.conclusion=="SUCCESS")]|length' 2>/dev/null || echo 0)
+  cur="checks=$tot ok=$ok fail=$f unreported=$n"
+  [ "$cur" != "$prev" ] && { echo "#$PR: $cur"; prev="$cur"; }
+  if [ "$tot" -ge "$FLOOR" ] 2>/dev/null && [ "$n" = "0" ]; then
+    if [ "$f" = "0" ] && [ "$ok" -lt "$OKFLOOR" ] 2>/dev/null; then
+      echo "#$PR ALL REPORTED but only $ok SUCCESS of $tot (floor $OKFLOOR) -- skipped is not run"
+    elif [ "$f" = "0" ]; then
+      echo "#$PR ALL REPORTED, GREEN ($tot checks, $ok success)"
+    else
+      echo "#$PR RED with $f of $tot:"
+      printf '%s' "$l" | jq -r '.[]|select(.conclusion=="FAILURE")|(.name//.context)'
+    fi
+    exit 0
+  fi
+  sleep 45
+done
+echo "#$PR still unresolved after $ITERS polls: $prev"

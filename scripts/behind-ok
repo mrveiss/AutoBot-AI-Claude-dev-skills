@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# behind-ok PR... — owner ruling 2026-09-19: a strict-GREEN PR may merge while behind main
+# ONLY if the commits it is missing touch none of the files the PR changes.
+# Prints one line per PR: "OK behind=0" | "UPDATE behind=N reason=... | overlap=<files>".
+#
+# OWNER RULE 2026-10-02: "if a branch is behind you update it so it's 0 behind."
+# NOTHING merges behind any more, so the disjointness allowance is WITHDRAWN as a
+# merge verdict. Every behind>0 now returns UPDATE.
+#
+# The allowance is still COMPUTED and reported in the reason, because it answers a
+# question that is still worth asking -- "would base's changes collide with mine?"
+# -- and that is useful when judging how risky a refresh is. It is simply no longer
+# the question "may this merge?", and conflating the two is what this change fixes.
+# Reported 2026-10-02: the tool kept returning "OK behind=5 (disjoint)" after the
+# rule changed, so a reader following it got a superseded answer with nothing in the
+# output marking that a rule had moved under it.
+set -u
+REPO=mrveiss/AutoBot-AI
+for p in "$@"; do
+  br=$(gh pr view "$p" --repo $REPO --json headRefName -q .headRefName) || { echo "#$p ?"; continue; }
+  c=$(gh api "repos/$REPO/compare/$br...main" 2>/dev/null) || { echo "#$p ?"; continue; }
+  behind=$(jq -r .ahead_by <<<"$c")
+  [ "$behind" = 0 ] && { echo "#$p OK behind=0"; continue; }
+  mainfiles=$(jq -r '.files[].filename' <<<"$c" | sort -u)
+  prfiles=$(gh pr view "$p" --repo $REPO --json files -q '.files[].path' | sort -u)
+  # A migration chain is never file-disjoint: two PRs adding different files under
+  # migrations/versions/ can share a down_revision and fork alembic into two heads
+  # (#17072 + #17125 both on 20260916_093, 2026-09-19). Such a PR must be 0 behind.
+  if grep -qE '(^|/)migrations/versions/' <<<"$prfiles"; then
+    echo "#$p UPDATE behind=$behind reason=adds-migration (must be 0 behind to prove a single alembic head)"; continue
+  fi
+  # Owner ruling 2026-09-19 (after #17124: three green PRs merged minutes apart turned a whole-tree
+  # guard red): any PR touching source must be 0 behind. Only docs-only / test-only PRs (plus the
+  # hub files every PR regenerates) keep the disjoint allowance below.
+  # "Source" = the product trees .github/filters/docker-paths.yml sends to the docker smoke test,
+  # minus test files and the generated api.ts. CI config, baselines and repo_tests/ are not source.
+  SRC='^(autobot-[a-z0-9-]+/|autobot_shared/|libs/|plugins/|docker/|constraints/|requirements-ci/|[^/]*requirements[^/]*\.txt$|docker-compose|[^ ]*Dockerfile)'
+  TESTISH='((^|/)tests?/|_test\.py$|(^|/)test_[^/]*\.py$|\.(spec|test)\.ts$|\.md$|^autobot-frontend/src/types/generated/api\.ts$)'
+  code=$(grep -E "$SRC" <<<"$prfiles" | grep -vE "$TESTISH" | head -3 | tr '\n' ' ')
+  if [ -n "$code" ]; then
+    echo "#$p UPDATE behind=$behind reason=code-pr (owner rule: source changes merge only at 0 behind; e.g. $code)"; continue
+  fi
+  ov=$(comm -12 <(echo "$mainfiles") <(echo "$prfiles") | tr '\n' ' ')
+  # Was: OK (disjoint). Now UPDATE -- disjointness no longer licenses a merge.
+  [ -z "$ov" ] && { echo "#$p UPDATE behind=$behind reason=behind-at-all (owner rule 2026-10-02: no PR merges behind; file-disjoint, so this refresh is low risk)"; continue; }
+  # Owner ruling 2026-09-19: hub files that nearly every PR touches are exempt from the overlap
+  # check when GitHub reports the PR conflict-free; main's post-merge types/ratchet gates backstop.
+  EXEMPT='^(autobot-frontend/src/types/generated/api\.ts|repo_tests/python_file_size_ratchet_baseline\.py|scripts/python_file_size_known_large\.py)$'
+  real=$(tr ' ' '\n' <<<"$ov" | grep -v '^$' | grep -vE "$EXEMPT" | tr '\n' ' ')
+  mg=UNKNOWN; for _ in 1 2 3 4 5; do mg=$(gh pr view "$p" --repo $REPO --json mergeable -q .mergeable 2>/dev/null); [ "$mg" != UNKNOWN ] && break; sleep 3; done
+  if [ -z "$real" ] && [ "$mg" = MERGEABLE ]; then echo "#$p UPDATE behind=$behind reason=behind-at-all (owner rule 2026-10-02; hub-only overlap and conflict-free, so this refresh is low risk)"
+  else echo "#$p UPDATE behind=$behind overlap=${real:-$ov} mergeable=$mg"; fi
+done

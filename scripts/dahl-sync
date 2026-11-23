@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# dahl-sync SRC DEST [SECONDS]: copy Dahl job outputs out of a session scratchpad every SECONDS (default 300).
+# Additive only (never removes anything from DEST), so results survive a /tmp wipe or the session ending.
+set -u
+SRC=${1:?source dir}; DEST=${2:?dest dir}; EVERY=${3:-300}
+mkdir -p "$DEST"; chmod 700 "$DEST"
+while true; do
+  [ -d "$SRC" ] && rsync -a --exclude '__pycache__' "$SRC"/ "$DEST"/ && date '+%F %T synced' > "$DEST/.last_sync"
+  sleep "$EVERY"
+done
