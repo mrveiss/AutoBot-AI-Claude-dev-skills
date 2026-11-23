@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""Absolute weekly utilization, derived instead of read, when the client's cache has gone stale.
+
+`claude-usage` reads ~/.claude.json's cachedUsageUtilization, which the CLIENT refreshes; when it
+sits hours stale every figure from it is fiction (see the memory gotcha). But the cached blob still
+carries a TRUSTWORTHY PAST FACT: utilization U% as of fetchedAtMs. Transcripts carry actual usage
+per turn. So calibrate:
+
+    rate  = U% / weighted(window_start -> fetchedAt)      <- %-per-weighted-token, measured
+    now%  = U% + rate * weighted(fetchedAt -> now)
+
+Systematic error in the weighting largely cancels, because the same model is used on both sides of
+the calibration -- it only has to be roughly PROPORTIONAL to what Anthropic bills, not equal to it.
+That holds while the request mix (output vs cache-read share) stays similar across the two spans;
+it is the main assumption and it is stated in the output, not hidden.
+
+Exit 2 if the transcripts do not cover the calibration span -- an uncovered span silently
+understates the divisor and would overstate the headroom, which is the dangerous direction.
+"""
+import datetime as dt
+import json
+import pathlib
+import sys
+
+W = {"input_tokens": 1.0, "output_tokens": 5.0,
+     "cache_creation_input_tokens": 1.25, "cache_read_input_tokens": 0.1}
+ROOT = pathlib.Path.home() / ".claude" / "projects"
+
+
+def weighted_between(start: dt.datetime, end: dt.datetime) -> tuple[float, int, dt.datetime | None]:
+    total, turns, earliest = 0.0, 0, None
+    for f in ROOT.rglob("*.jsonl"):
+        if f.stat().st_mtime < start.timestamp() - 7200:
+            continue
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if '"usage"' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            ts, usage = rec.get("timestamp"), ((rec.get("message") or {}).get("usage")) or {}
+            if not ts or not usage:
+                continue
+            when = dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if earliest is None or when < earliest:
+                earliest = when
+            if start <= when < end:
+                total += sum(W[k] * (usage.get(k) or 0) for k in W)
+                turns += 1
+    return total, turns, earliest
+
+
+d = json.loads((pathlib.Path.home() / ".claude.json").read_text(encoding="utf-8"))["cachedUsageUtilization"]
+w = (d.get("utilization") or {}).get("seven_day") or {}
+if w.get("utilization") is None:
+    print("no seven_day utilization in the cached blob; nothing to calibrate against")
+    raise SystemExit(2)
+
+now = dt.datetime.now(dt.timezone.utc)
+fetched = dt.datetime.fromtimestamp(d["fetchedAtMs"] / 1000, dt.timezone.utc)
+reset = dt.datetime.fromisoformat(w["resets_at"])
+start = reset - dt.timedelta(days=7)
+used = float(w["utilization"])
+
+print(f"anchor: {used:.0f}% used as of {fetched.astimezone():%m-%d %H:%M} local "
+      f"({int((now - fetched).total_seconds() // 60)} min ago)")
+print(f"window: {start.astimezone():%m-%d %H:%M} -> {reset.astimezone():%m-%d %H:%M} local")
+
+before, turns_b, earliest = weighted_between(start, fetched)
+after, turns_a, _ = weighted_between(fetched, now)
+
+if earliest is None or earliest > start + dt.timedelta(hours=1):
+    have = f"{earliest.astimezone():%m-%d %H:%M}" if earliest else "nothing"
+    print(f"\nCANNOT DERIVE: transcripts start at {have}, after the window opened.")
+    print("The calibration divisor would miss real usage, overstating headroom. Refresh via /usage.")
+    raise SystemExit(2)
+if before <= 0:
+    print("\nCANNOT DERIVE: no measured usage before the anchor to calibrate against.")
+    raise SystemExit(2)
+
+rate = used / before
+projected = used + rate * after
+left_h = (reset - now).total_seconds() / 3600
+burn_day = (rate * after) / max((now - fetched).total_seconds() / 86400, 1e-6)
+allowed_day = (100 - projected) / max(left_h / 24, 1e-6)
+
+print(f"\nmeasured {before:,.0f} weighted before the anchor ({turns_b:,} turns)"
+      f" -> {rate * 1e6:.4f}% per million weighted")
+print(f"measured {after:,.0f} weighted since the anchor ({turns_a:,} turns)"
+      f" -> +{rate * after:.1f}%")
+print(f"\nPROJECTED NOW: {projected:.1f}% used, {100 - projected:.1f}% left, {left_h:.1f} h to reset")
+print(f"burn since the anchor {burn_day:.1f}%/day vs {allowed_day:.1f}%/day affordable")
+verdict = "ON TRACK" if burn_day <= allowed_day else "WILL RUN OUT"
+print(f"VERDICT: {verdict}")
+print("\nAssumes the request mix is similar either side of the anchor; this is a projection from"
+      "\nmeasured transcripts, not a reading from Anthropic. /usage still gives the authoritative one.")

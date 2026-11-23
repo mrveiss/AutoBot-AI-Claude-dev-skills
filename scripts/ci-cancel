@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# ci-cancel RUN_ID SOURCE REASON [BRANCH] [PR] — the one way to cancel a workflow run: cancels it and, on
+# success, appends who and why to ~/.claude/logs/ci-cancels.log, so a cancel is never unattributed (owner
+# 2026-11-01). Columns: UTC time, run id, head branch, PR or -, source, reason. Source: pr-queue-gate,
+# ci-priority, branch-refresh or hand. Prints ok or fail; exit status is the cancel's.
+# Fallback (owner 2026-11-16): a 409 on a queued/waiting/pending run is retried via /force-cancel; logged method=force-cancel.
+set -u
+REPO=mrveiss/AutoBot-AI
+LOG="${CI_CANCEL_LOG:-$HOME/.claude/logs/ci-cancels.log}"
+[ $# -ge 3 ] || { echo "usage: ci-cancel RUN_ID SOURCE REASON [BRANCH] [PR]" >&2; exit 2; }
+run=$1 source=$2 reason=${3//$'\t'/ } branch=${4:-} pr=${5:-}
+[ -n "$branch" ] || branch=$(gh api "repos/$REPO/actions/runs/$run" --jq .head_branch 2>/dev/null)
+[ -n "$pr" ] || pr=$(gh pr list --repo $REPO --head "$branch" --state open --json number --jq '.[0].number // empty' 2>/dev/null)
+if ! out=$(gh api -X POST "repos/$REPO/actions/runs/$run/cancel" 2>&1); then
+  case $out in *"HTTP 409"*) st=$(gh api "repos/$REPO/actions/runs/$run" -q .status 2>/dev/null) ;; *) st= ;; esac
+  case $st in
+    queued|waiting|pending)
+      gh api -X POST "repos/$REPO/actions/runs/$run/force-cancel" >/dev/null 2>&1 || { echo fail; exit 1; }
+      reason="$reason method=force-cancel" ;;
+    *) echo fail; exit 1 ;;
+  esac
+fi
+printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$run" "${branch:--}" "${pr:--}" "$source" "$reason" >>"$LOG"
+echo ok

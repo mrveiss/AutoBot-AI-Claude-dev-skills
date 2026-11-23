@@ -1,0 +1,504 @@
+#!/usr/bin/env bash
+# pr-queue-gate — decide WHICH PRs may hold CI, so the queue neither congests nor starves.
+#
+# Two pressures pull opposite ways and a single rule cannot serve both:
+#   congestion  -> fewer PRs on the runner at once
+#   the 4h SLA  -> a PR must not sit unreviewed waiting for a slot
+#
+# ADMISSION IS BY READINESS FIRST, DEADLINE SECOND (owner rule 2026-10-02: "run all
+# PRs in correct order, there is no use for running PRs that will fail anyway").
+#
+# The earlier version sorted by deadline alone, which admitted PRs whose run could
+# not produce a usable answer however overdue they were. A run is only worth
+# starting if its verdict will still be true when it lands. Three things make a
+# verdict void on arrival, and none of them is visible in the deadline:
+#
+#   unresolved review threads -> a fix is already owed, so the suite is spent twice
+#   an open blocking PR       -> its base moves when the blocker merges
+#   red on current base       -> needs a person; a runner changes nothing
+#
+# So those are RANKED BEHIND everything runnable and never admitted. Deadline then
+# orders the PRs that remain, which is what it was always good for.
+#
+# WHY THE DEFAULT WIDTH IS 2. Owner rule 2026-11-01: two CI slots. Every merge still
+# puts the other run behind, so it merges main and re-runs; the owner accepts that
+# cost, because at width 1 one stuck PR or train holds every landing.
+#
+# Parks by default: cancels runs for PRs it did NOT admit. --dry is read-only.
+set -u
+REPO=mrveiss/AutoBot-AI
+WIDTH="${PR_GATE_WIDTH:-2}"       # concurrent PRs allowed to hold CI (see header)
+SLA_H="${PR_GATE_SLA_HOURS:-4}"    # review SLA
+# PARKING IS THE DEFAULT (owner rule 2026-10-02: "there are 2 PR CI running at
+# the same time, one of them should be canceled since it will need to update and
+# run again — this is a must have rule when more than one is running").
+#
+# It was opt-in via --park, which meant the rule held only when whoever ran the
+# sweep remembered the flag. I then broke it myself within the hour: pushed to a
+# non-admitted PR and put 22 runs alongside the one PR actually landing. A
+# must-have rule enforced by remembering is not enforced.
+#
+# --dry restores the old read-only behaviour for inspection. --park still works
+# and is now a no-op synonym.
+# Owner 2026-11-05: "we do not cancel ci runs". Two PRs run their full CI with no limit
+# inside a PR; a third waits as a whole PR (#20825), never by cancelling its runs. The gate
+# ranks and reports only. `--park` is the explicit opt-in, kept for a human to run by hand.
+PARK=0; [ "${1:-}" = "--park" ] && PARK=1
+
+now=$(date +%s)
+rows=$(gh api graphql -f query='{repository(owner:"mrveiss",name:"AutoBot-AI"){pullRequests(states:OPEN,first:60){nodes{
+  number isDraft createdAt headRefName
+  reviews(last:10){nodes{submittedAt}}
+  reviewThreads(first:100){nodes{isResolved comments(first:20){nodes{author{login}}}}}}}}}' --jq '
+  .data.repository.pullRequests.nodes[]
+  | [ .number, .headRefName, .createdAt,
+      ((.reviews.nodes|map(.submittedAt)|sort|last) // "NONE"),
+      ([.reviewThreads.nodes[]|select(.isResolved==false)|select([.comments.nodes[].author.login]|map(test("coderabbit|github-actions";"i"))|all)]|length),
+      (.isDraft|tostring) ] | @tsv' 2>/dev/null)
+[ -z "$rows" ] && { echo "no open PRs"; exit 0; }
+
+# age, hours-since-review, and hours until the SLA bites
+tmp=$(mktemp)
+while IFS=$'\t' read -r n br created rev unres draft; do
+  [ -z "$n" ] && continue
+  c=$(date -d "$created" +%s 2>/dev/null) || continue
+  age=$(( (now-c)/3600 ))
+  if [ "$rev" = "NONE" ]; then since=$age; else
+    r=$(date -d "$rev" +%s 2>/dev/null) || r=$c; since=$(( (now-r)/3600 )); fi
+  left=$(( SLA_H - since ))                       # negative = already breached
+  g=$(~/.claude/scripts/ci-gate "$n" 2>/dev/null | tail -1)
+  verdict=$(awk '{print $3}' <<<"$g")
+  bo=$(~/.claude/scripts/behind-ok "$n" 2>/dev/null | tail -1)
+  bh=$(grep -oE 'behind=[0-9]+' <<<"$bo" | cut -d= -f2)
+  # behind-ok's verdict, not the raw count: it knows which PRs may merge behind
+  # (disjoint docs) and which may not (owner rule: source changes merge at 0 behind).
+  # Retained as a DIAGNOSTIC column only. Since the owner rule of 2026-10-02 it is
+  # no longer an input to any decision -- behind>0 routes to UPDATE regardless of
+  # what behind-ok permits. Kept because it still records WHY behind-ok would have
+  # allowed a merge, which is useful when a verdict is disputed; never key on it.
+  case "$bo" in *" UPDATE "*) needs_update=1;; *) needs_update=0;; esac
+  # ci-gate judges ONLY REQUIRED contexts, which is right for "may this merge?" and
+  # wrong for "is anything red?". On 2026-10-02 it reported #17707 and #17708 GREEN
+  # while `Dependency Security Scan` was failing on both -- that check is not a
+  # required context, so a base-wide red was invisible to the gate for a day and the
+  # two PRs were offered as merge-now. "Red CI never merges" is not scoped to
+  # required checks. So count EVERY failing check and let it veto rank 0.
+  # LATEST ATTEMPT PER CONTEXT NAME, not every attempt. statusCheckRollup carries
+  # the cancelled/failed attempt AND its replacement as separate entries, so a
+  # conclusion-keyed count reports a red that a later attempt already turned green.
+  # Measured on #17902 (2026-10-03): 67 rollup entries against 51 distinct names --
+  # `Detect changed paths` appears 7 times, 10 others twice. `gh pr checks` does not
+  # fully dedupe either (61 vs 67). Counting every attempt would have declared a
+  # FIX-rank red on the PR that was unblocking base, and sent a whole-run rerun after
+  # checks that were already green -- which #17764 can turn into a real false RED.
+  rollup=$(gh pr view "$n" --repo $REPO --json statusCheckRollup 2>/dev/null)
+  _latest='[.statusCheckRollup[]] | group_by(.name // .context) | map(sort_by(.startedAt // "") | last)'
+  fails=$(printf '%s' "$rollup" | jq "$_latest | map(select(.conclusion==\"FAILURE\")) | length" 2>/dev/null)
+  # GitHub's reviewDecision, NOT the ledger's. On 2026-10-03 the ledger recorded
+  # review=approve for #17898 while GitHub held REVIEW_REQUIRED, and the queue plan
+  # treated it as approved for hours. The ledger records a SESSION's verdict; the
+  # merge gate reads GitHub. Zero of four open PRs were approved when swept. A green
+  # PR offered as merge-now without this column is offered against a gate nobody checked.
+  rev=$(gh pr view "$n" --repo $REPO --json reviewDecision --jq '.reviewDecision // "NONE"' 2>/dev/null)
+  # Jobs still in flight. Used ONLY as a sort key within a rank, never to change rank.
+  # A run already underway yields its verdict for free; displacing it to start a fresh
+  # one discards that work and buys nothing. On 2026-10-03 the age tiebreak put a 21h
+  # PR needing a fresh rerun ahead of a 1h PR three jobs from finishing -- and --park
+  # would have CANCELLED the nearly-complete run. Age is the right tiebreak between two
+  # PRs that both need a suite; it is the wrong one when only one of them does.
+  # A null status with a null conclusion is NOT-YET-REPORTED, which is pending, not
+  # neither. CodeRabbit's context sits in that state and the old filter skipped it.
+  inflight=$(printf '%s' "$rollup" | jq "$_latest | map(select(.status==\"IN_PROGRESS\" or .status==\"QUEUED\" or (.status==null and .conclusion==null))) | length" 2>/dev/null)
+  # REACH FLOOR on the rollup itself. Right after a push the run has not registered and
+  # the rollup holds a handful of entries -- #17887 showed 7 against a normal ~60, with
+  # the required `Security Scan` ABSENT. fails=0 and inflight=0 are both true of that,
+  # so rank 0 would offer a PR as merge-now while the check it was queued on all day had
+  # not run. ABSENCE OF A REQUIRED CHECK IS NOT A PASS. 40 against ~60 observed; it
+  # bounds an unregistered run, not the suite's growth.
+  nchecks=$(printf '%s' "$rollup" | jq "$_latest | length" 2>/dev/null)
+  # HAS ANY REVIEW SEEN THE CURRENT HEAD? `reviewDecision` cannot answer this --
+  # APPROVED is unreachable for an own-PR, so it reads REVIEW_REQUIRED forever and
+  # carries no information about whether the content was looked at. Compare the
+  # newest review's submittedAt against the head commit's committedDate instead.
+  # On #17868 the last review landed 75 SECONDS before the commit under review, so
+  # the PR was green, clean, zero-threads and entirely unreviewed, and nothing in
+  # its appearance showed it. A bot "Merge branch main" head is excluded: it carries
+  # no authored content, so an earlier review still covers the PR.
+  # Compare the newest review against the newest AUTHORED commit -- the last one
+  # with a single parent. A bot "Merge branch main" head carries no authored
+  # content, so skipping it is right; SKIPPING THE CHECK ENTIRELY when the head is
+  # a bot merge is NOT, because the merge can sit on top of an unreviewed commit.
+  # That is exactly #17868: bot merge over a commit the last review predated by 75s.
+  # A REVIEW HERE IS AN ISSUE COMMENT, not a GitHub review submission. APPROVED is
+  # unreachable for an own-PR (no self-review as `mrveiss`), so CLAUDE_REVIEW.md:302
+  # makes "post a detailed review comment" the sanctioned mechanism and sessions
+  # name the SHA in it. A check reading `reviews(last:1)` therefore misses the real
+  # verdict and holds every PR forever -- which is the APPROVED-gating hole again,
+  # one artifact over, and it fails toward PERMANENT HOLD so it reads as caution.
+  # Primary signal: a comment or review naming the newest AUTHORED commit's SHA.
+  # Fallback: anything posted after that commit. Bot merge heads are skipped by
+  # taking the last single-parent commit, not by skipping the check.
+  rv=$(gh api graphql -f query="{repository(owner:\"${REPO%%/*}\",name:\"${REPO##*/}\"){pullRequest(number:$n){reviews(last:10){nodes{submittedAt body}} comments(last:20){nodes{createdAt body}} commits(last:30){nodes{commit{oid committedDate parents{totalCount}}}}}}}" 2>/dev/null)
+  _authored=$(printf '%s' "$rv" | jq -r '[.data.repository.pullRequest.commits.nodes[].commit | select(.parents.totalCount < 2)] | sort_by(.committedDate) | last // {}' 2>/dev/null)
+  _head_at=$(printf '%s' "$_authored" | jq -r '.committedDate // ""' 2>/dev/null)
+  _head_sha=$(printf '%s' "$_authored" | jq -r '.oid // ""' 2>/dev/null)
+  _short=$(printf '%s' "$_head_sha" | cut -c1-9)
+  seen=0
+  if [ -n "$_short" ] && printf '%s' "$rv" | jq -r '[.data.repository.pullRequest.comments.nodes[].body, .data.repository.pullRequest.reviews.nodes[].body] | join(" ")' 2>/dev/null | grep -qF "$_short"; then
+    seen=1
+  else
+    _latest=$(printf '%s' "$rv" | jq -r '[(.data.repository.pullRequest.reviews.nodes[].submittedAt), (.data.repository.pullRequest.comments.nodes[].createdAt)] | sort | last // ""' 2>/dev/null)
+    if [ -n "$_latest" ] && [ -n "$_head_at" ] && [ "$_latest" \> "$_head_at" ]; then seen=1; fi
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$left" "$n" "$br" "$age" "$since" "$unres" "${verdict:-?}" "${bh:-0}" "${fails:-0}" "${rev:-NONE}" "${inflight:-0}" "${nchecks:-0}" "${seen:-0}" "${draft:-false}" >> "$tmp"
+done <<< "$rows"
+
+# RANK, then deadline. Rank is the readiness class; the deadline only breaks ties
+# inside a class, so an overdue PR that cannot produce a usable verdict no longer
+# jumps ahead of one that can.
+#
+#   0  green, clean, 0 behind      -> merges now, costs no runner
+#   1  clean, 0 behind             -> its run tests the base it will land on
+#   2  clean, behind>0             -> one update-branch makes it rank 1
+#   3  unresolved review threads   -> answer them first (owner rule 2026-10-02)
+#   4  blocked by an open PR       -> its base is about to move
+#   5  red on current base         -> needs a person, not a runner
+#: PRs that yield the slot to ANY other PR that wants it. A chain ("17865 after
+#: 17874") has to be re-pointed every time its target merges, and the auto-update
+#: bot refreshes the deferred PR to behind=0 within seconds of that merge -- so it
+#: retakes the slot before anyone re-points it. That happened four times tonight,
+#: each time to one of my own PRs, each time displacing somebody else's work.
+#:
+#: A deferral is the right shape: it says "lowest priority" once, rather than
+#: naming a successor that keeps changing.
+DEFER_FILE="$HOME/.claude/pr-gate-defer"
+#: A review verdict of "blocked" recorded in the ledger AGAINST THE CURRENT HEAD.
+#: The gate otherwise ranks on green CI alone, and green is not the same claim as
+#: reviewed. #17877 was green, 0 behind, 0 threads -- and its test passed with the
+#: fix reverted, so the PASS licensed nothing. The gate printed merge-now anyway,
+#: because "can this test fail?" is not a signal CI emits.
+#: Head-scoped on purpose: a new push invalidates the verdict, so a blocked PR that
+#: has since been fixed returns to r0 on its own without anyone clearing a flag.
+#: Self-contained: the ledger record carries BOTH `head=` and `review=blocked@`,
+#: so the staleness check needs no second lookup and cannot disagree with itself.
+review_blocked() {
+  local rec head verdict
+  rec=$("$HOME/.claude/scripts/ledger" pr "$1" 2>/dev/null | head -1) || return 1
+  case "$rec" in *"review=blocked@"*) ;; *) return 1 ;; esac
+  head=${rec#*head=}; head=${head%% *}
+  verdict=${rec#*review=blocked@}; verdict=${verdict%% *}
+  [ -n "$head" ] && [ "$head" = "$verdict" ]
+}
+is_deferred() {
+  [ -f "$DEFER_FILE" ] || return 1
+  grep -qxF "$1" "$DEFER_FILE"
+}
+AFTER_FILE="$HOME/.claude/pr-gate-after"
+blocked_by() {
+  [ -f "$AFTER_FILE" ] || return 1
+  while read -r dep on; do
+    case "$dep" in ''|\#*) continue;; esac
+    [ "$dep" = "$1" ] || continue
+    gh pr view "$on" --repo $REPO --json state --jq .state 2>/dev/null | grep -q OPEN && { echo "$on"; return 0; }
+  done < "$AFTER_FILE"
+  return 1
+}
+: > "$tmp.r"
+while IFS=$'\t' read -r left n br age since unres verdict behind fails rev inflight nchecks seen draft; do
+  [ -z "$n" ] && continue
+  #: A recorded `blocked` review demotes at EVERY rank, not just r0. First version
+  #: only guarded the green-and-clean path, so when main moved and the PR went to
+  #: behind=1 it took the r2 UPDATE branch first and reclaimed the slot -- spending a
+  #: full suite on a PR that still needs its fix. The verdict is about the head, not
+  #: about how far behind it is.
+  if is_deferred "$n" && [ "$(wc -l < "$tmp")" -gt 1 ]; then rank=6; dep="deferred"
+  elif review_blocked "$n"; then rank=5; verdict="REVIEW-BLOCKED"
+  elif dep=$(blocked_by "$n"); then rank=4
+  elif [ "${unres:-0}" -gt 0 ]; then rank=3
+  #: A DRAFT NEVER HOLDS THE SLOT. `isDraft` was fetched and read into $draft from
+  #: the first version of this script and then never used -- a dead variable, so
+  #: a draft fell through to `else rank=1` and was admitted as RUN. On 2026-10-07
+  #: that put draft #17963 in the slot and this sweep CANCELLED the runs of #18092,
+  #: the only non-draft PR at 0 behind, which is the one that could actually land.
+  #:
+  #: Two reasons it must never be r1, and the second is the one that makes this a
+  #: waste rather than merely a wrong order:
+  #:   1. a draft cannot be merged at all -- the merge API answers 405.
+  #:   2. draft is how this repo PARKS CI. `ci.yml` and `code-quality.yml` gate
+  #:      their heavy jobs on `draft == false`, so a draft's "run" skips the suite
+  #:      it was admitted to run. The slot is spent on almost nothing.
+  #:
+  #: Rank 3 so it is never admitted, but the INSTRUCTION is not THREADS'. A thread
+  #: is answered for free; `gh pr ready` is free to type and then launches a full
+  #: suite, so "act on it now" read across seven drafts floods CI with exactly the
+  #: runs this gate exists to ration. The verdict therefore says ready-WHEN-NEXT:
+  #: undraft one PR when the slot is free, not all of them because the row looked
+  #: cheap. Placed AFTER the $unres test so a draft with open threads still reports
+  #: THREADS -- that is the action which has to happen first anyway, and it really
+  #: is free.
+  elif [ "${draft:-false}" = "true" ]; then rank=3; verdict="DRAFT(ready-when-next)"
+  elif [ "${verdict%% *}" = "RED" ] && [ "${behind:-0}" -eq 0 ]; then rank=5
+  elif [ "${behind:-0}" -gt 0 ]; then rank=2
+  #: reviewDecision is reported as a COLUMN and is deliberately NOT a rank input.
+  #: Every session here pushes as `mrveiss`, and GitHub refuses "Can not approve your
+  #: own pull request" -- so APPROVED is UNREACHABLE in this repo and
+  #: docs/developer/CLAUDE_REVIEW.md:302 names the sanctioned substitute: "PR authors
+  #: cannot self-approve -- post a detailed review comment instead." Gating rank 0 on
+  #: APPROVED was written here on 2026-10-03 and reverted the same hour: it would have
+  #: made every PR permanently unmergeable. The sweep that motivated it -- zero of four
+  #: PRs approved -- was correct, complete, and about a different question than the one
+  #: asked. "Why is nothing approved" is answered by the platform, not by reviewer care.
+  elif [ "$verdict" = "GREEN" ] && [ "${fails:-0}" -eq 0 ] && [ "${nchecks:-0}" -ge "${PR_GATE_MIN_CHECKS:-40}" ] && [ "${seen:-0}" = "1" ]; then rank=0
+  #: Green, clean, 0 behind -- and NO review has seen the current head. Costs no
+  #: runner to fix, so it ranks with THREADS rather than as merge-now.
+  elif [ "$verdict" = "GREEN" ] && [ "${fails:-0}" -eq 0 ] && [ "${nchecks:-0}" -ge "${PR_GATE_MIN_CHECKS:-40}" ]; then rank=3; verdict="UNREVIEWED-HEAD"
+  #: Green and clean but the rollup is too small to believe -- the run has not registered.
+  #: Rank 1 so it waits for its real suite rather than being offered as merge-now.
+  elif [ "$verdict" = "GREEN" ] && [ "${fails:-0}" -eq 0 ]; then rank=1; verdict="UNREGISTERED($nchecks)"
+  elif [ "$verdict" = "GREEN" ]; then rank=5; verdict="RED-UNREQ($fails)"
+  else rank=1; fi
+  # How many OPEN PRs are waiting on this one. A blocker must run before its
+  # dependents or their runs are void, and the deadline cannot see this: #17861
+  # unblocks #17707 and #17708, yet at 1h old it sorted BEHIND a 5h PR that
+  # unblocks nothing. Negated so a plain numeric sort puts the biggest blocker
+  # first within its rank.
+  blocks=0
+  if [ -f "$AFTER_FILE" ]; then
+    while read -r d o; do
+      case "$d" in ''|\#*) continue;; esac
+      [ "$o" = "$n" ] || continue
+      gh pr view "$d" --repo $REPO --json state --jq .state 2>/dev/null | grep -q OPEN && blocks=$((blocks+1))
+    done < "$AFTER_FILE"
+  fi
+  # 0 sorts before 1: a PR with a suite already in flight keeps the slot it is using.
+  if [ "${inflight:-0}" -gt 0 ]; then running_first=0; else running_first=1; fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$rank" "-$blocks" "$running_first" "$left" "$n" "$br" "$age" "$since" "$unres" "$verdict" "$behind" "${dep:-}" "$rev" >> "$tmp.r"
+done < "$tmp"
+# rank, then most-blocking, then most-overdue. Readiness decides WHETHER a run is
+# worth starting; unblocking decides WHICH of the worthwhile ones goes first.
+# ALREADY-RUNNING FIRST, then rank, then most-blocking, then most-overdue.
+# Owner rule 2026-11-04: "we do not cancel ci in the same prs, the rule states, 2 prs
+# may run ci at the same time the amount of cis in those are not limited". Two PRs
+# hold CI at once, and a PR whose suite is already running keeps its slot until the
+# suite ends. Ranking within the rest only decides who gets a slot that is FREE.
+# Running-first used to be the third key, so a rank-1 newcomer outranked a running
+# rank-2 PR and its in-flight workflows were cancelled mid-suite (#20818, 11:06 and
+# 11:43 on 2026-11-04). Only ranks 1 and 2 take a slot, so a running PR at rank 3-5
+# is still not admitted; that case is handled below as before.
+sort -t$'\t' -k3,3n -k1,1n -k2,2n -k4,4n "$tmp.r" > "$tmp.s"
+echo "PR queue gate — width=$WIDTH, SLA=${SLA_H}h, $(date '+%H:%M')"
+printf '%-8s %-5s %-6s %-7s %-6s %-9s %-8s %-6s %-5s %-9s %s\n' "SLOT" "rank" "unbl" "PR" "age_h" "since_rev" "sla_h" "thr" "bhnd" "review" "gate"
+i=0; admitted=""; mergeable=""
+while IFS=$'\t' read -r rank nblocks running_first left n br age since unres verdict behind dep rev; do
+  [ -z "$n" ] && continue
+  case "$rank" in
+    0)  # Green, no unresolved threads, 0 behind. Merges now and FREES a runner, so
+        # it is never rationed -- rationing a PR that needs no work is how a ready
+        # change ages into an SLA breach for nothing.
+        slot="MERGE"; mergeable="$mergeable $n" ;;
+    2)  # Behind. One update-branch moves it to rank 1. That update IS its run, so
+        # it competes for the width. Never `gh run rerun`: that replays the old
+        # refs/pull/N/merge commit and re-tests the base it was already stale against.
+        i=$((i+1))
+        if [ "$i" -le "$WIDTH" ]; then slot="UPDATE"; admitted="$admitted $n"
+        else slot="UPDATE-Q"; fi ;;
+    3)  # Unresolved review threads (owner rule 2026-10-02: answer every CodeRabbit
+        # before relaunching CI). A fix is already owed, so a run started now is spent
+        # twice. Costs NO runner and needs no slot -- act on it immediately, alongside
+        # whatever holds the width. This is work to do now, not a wait state.
+        slot="THREADS" ;;
+    4)  # Blocked by an open PR. Its base moves when the blocker merges, so whatever
+        # a run says now is void on arrival. The dependency the deadline cannot see.
+        slot="BLOCKED"; verdict="$verdict (after #$dep)" ;;
+    6)  # Deferred: yields to any other open PR. Not blocked, not broken --
+        # just last, by standing instruction, until the queue is otherwise empty.
+        slot="DEFER" ;;
+    5)  # Red at behind=0: the run tested current base, so the verdict is about THIS
+        # tree and a person is genuinely owed. A runner changes nothing. Holds no
+        # slot -- letting it would be head-of-line blocking, and at width 1 a single
+        # red PR would stall the entire queue.
+        #
+        # RED-UNREQ(n) means every REQUIRED context is green and n non-required checks
+        # are failing. It still lands here: "red CI never merges" is not scoped to the
+        # required set, and a non-required red is usually a base-wide fault that no
+        # amount of re-running this PR will clear.
+        slot="FIX" ;;
+    *)  # rank 1 -- clean, 0 behind, not yet green. Its run tests the base it will
+        # actually land on, so this is the only class whose verdict survives to merge.
+        i=$((i+1))
+        if [ "$i" -le "$WIDTH" ]; then slot="RUN"; admitted="$admitted $n"
+        else slot="WAIT"; fi ;;
+  esac
+  case "$rev" in APPROVED) revs="appr";; REVIEW_REQUIRED) revs="REQ'D";; CHANGES_REQUESTED) revs="CHANGES";; *) revs="none";; esac
+  printf '%-8s %-5s %-6s #%-6s %-6s %-9s %-8s %-6s %-5s %-9s %s\n' \
+    "$slot" "r$rank" "unbl${nblocks#-}" "$n" "$age" "$since" "$left" "$unres" "$behind" "$revs" "$verdict"
+done < "$tmp.s"
+
+# THE MERGER'S PIN OVERRIDES THE RANKING (owner rule 2026-10-09: "we start CI only for
+# the one PR we are preparing to merge"). The ranking above cannot see the merge order
+# the merging session chose -- with eight fresh dependabot PRs tied at r1 it admitted
+# #18149 while the merger was landing #18154. `ledger hold ci-slot:<pr> <reason>` names
+# the one PR that may hold CI; while it is set and that PR is open, nothing else is
+# admitted. Mergeable (r0) PRs stay kept: they need no runner.
+# EVERY ci-slot pin counts (owner decision 2026-10-11: two CI slots). Each pinned PR that
+# is open is admitted; a pin naming no open PR is reported, never silently honoured.
+pin=$("$HOME/.claude/scripts/ledger" holds 2>/dev/null | sed -n 's/^ci-slot:\([0-9][0-9]*\).*/\1/p' | tr '\n' ' ')
+pinned_open=""
+for p in $pin; do
+  if awk -F'\t' -v p="$p" '$5==p{f=1} END{exit !f}' "$tmp.s"; then
+    pinned_open="$pinned_open $p"; echo "pinned: #$p (ledger hold ci-slot:$p)"
+  elif [ "$(gh pr view "$p" --repo "$REPO" --json state -q .state 2>/dev/null)" = OPEN ]; then
+    # Opened after this sweep's snapshot: still open, so it still takes its slot.
+    pinned_open="$pinned_open $p"; echo "pinned: #$p (opened after the snapshot; ledger hold ci-slot:$p)"
+  else
+    echo "pinned: #$p is not an open PR -- pin ignored; release it with: ledger unhold ci-slot:$p"
+  fi
+done
+# Pins take their slots FIRST; the ranked queue fills what is left of WIDTH (owner
+# 2026-11-04: "one is running, second is queued and can be doing a trial run").
+# A pin used to REPLACE the admitted list, so one pinned train collapsed width 2 to 1
+# and every other PR's runs were parked.
+if [ -n "$pinned_open" ]; then
+  fill="$pinned_open"; n=$(echo $pinned_open | wc -w)
+  for p in $admitted; do
+    [ "$n" -ge "$WIDTH" ] && break
+    case " $fill " in *" $p "*) ;; *) fill="$fill $p"; n=$((n+1));; esac
+  done
+  admitted="$fill"
+fi
+
+echo "merge-now:${mergeable:- none}   (green, 0 threads — costs no runner)"
+echo "ci-slots:${admitted:- none}"
+# --park: cancel the runs of PRs this sweep did NOT admit.
+#
+# This was declared on line 34 and never read -- the header advertised the
+# behaviour and the flag was a silent no-op, so a sweep "with parking" and one
+# without were indistinguishable from the output. Found 2026-10-02 while
+# cancelling by hand what this was supposed to do.
+#
+# What makes it safe to cancel is the 0-behind rule, not impatience: a run on a
+# PR that is not the one landing is invalidated the moment the landing one
+# merges, so it was never going to produce a usable verdict. Only PR head
+# branches are touched -- never `main`, whose post-merge runs are the validation
+# of what just landed.
+if [ "$PARK" = "1" ]; then
+  # The pinned PR is ALWAYS kept, even when this sweep's snapshot predates it.
+  # The snapshot is taken at sweep start; a PR opened mid-sweep is absent from it,
+  # so the pin read as "not an open PR" and its fresh runs were parked (#18171,
+  # 2026-10-10). Keeping by number costs nothing if the PR really is closed.
+  keep=" $admitted $mergeable ${pin:-} "
+  parked=0
+  : > "$tmp.prmap"
+  for st in in_progress queued; do
+    gh api "repos/$REPO/actions/runs?status=$st&per_page=100" \
+      --jq ".workflow_runs[]|select(.created_at>\"$(date -u +%Y-%m-%d)\")|\"\(.id)\t\(.head_branch)\t\(.name)\t\(.created_at)\t\(.event)\"" 2>/dev/null
+  done | while IFS=$'\t' read -r id br nm started ev; do
+    [ -z "$id" ] && continue
+    # A push, dispatch or schedule run on main is post-merge validation, not a PR run. The PR lookup below
+    # finds the release PR for head `main`, so without this every run on main was parked as that PR's.
+    [ "$br" = main ] && [ "$ev" != pull_request ] && [ "$ev" != pull_request_target ] && continue
+    # Cached branch->PR. This was one `gh pr list` PER RUN, and a single branch
+    # can carry 24 runs, so a sweep made 24 identical lookups for it. That is
+    # what pushed the gate past a 120s timeout -- O(runs) where the question is
+    # O(branches). Measured 2026-10-02.
+    pr=$(grep -m1 "^$br	" "$tmp.prmap" 2>/dev/null | cut -f2)
+    if [ -z "$pr" ]; then
+      pr=$(gh pr list --repo $REPO --head "$br" --state open --json number --jq '.[0].number // empty' 2>/dev/null)
+      printf '%s\t%s\n' "$br" "${pr:-NONE}" >> "$tmp.prmap"
+    fi
+    [ "$pr" = NONE ] && pr=""
+    [ -z "$pr" ] && continue                       # not an open PR (e.g. main) -- leave it
+    case "$keep" in *" $pr "*) continue;; esac     # admitted or mergeable -- leave it
+    # NEVER PARK A CHEAP REQUIRED-CONTEXT PUBLISHER. A cancelled required check
+    # renders as a red X and blocks the merge, so parking one turns a healthy
+    # parked PR into one that looks failed -- #17948 lost its required
+    # "No open blocks-merge issues reference this PR" this way (2026-10-04).
+    # These run for seconds; cancelling them saves nothing.
+    #
+    # TWO TIERS, deliberately. The exact names below are the REQUIRED-context
+    # publishers, each checked against the workflow `name:` on main and against
+    # what the runs API returns live -- exact match because a wrong guess here
+    # silently reintroduces the #17948 red. The glob tier after it covers cheap
+    # PR-metadata checks that are NOT required: parking them costs seconds and
+    # buys nothing, but getting one wrong only loses early feedback, so a
+    # pattern is proportionate there.
+    #
+    # Checked before the thread query below, so an exempt workflow also skips a
+    # GraphQL round trip.
+    #
+    # #18208: the five *-required-context names below stop existing at the one-workflow
+    # cutover; drop them once it has landed. `AutoBot CI/CD Pipeline` is deliberately NOT
+    # exempt: it then holds every heavy job, and a parked run ends its gates cancelled
+    # (#17764), which ci-gate reads as RERUN, not RED.
+    case "$nm" in
+      "PR Blocking Findings"|"No Commit Trailers"|"Enforce Pre-commit Hooks"|\
+      "backend-required-context"|"code-quality-required-context"|\
+      "docker-smoke-required-context"|"Frontend Required Context"|\
+      "python-required-context")
+        echo "NOT parked: #$pr $nm -- a cheap required-context publisher; cancelling it reads as a failed required check"
+        continue;;
+      *"PR Template"*|*"Issue Link"*|*"Queue Gate"*|*"commit subject"*|*"batching"*)
+        echo "NOT parked: #$pr $nm -- a cheap PR-metadata check; parking it costs seconds and buys nothing"
+        continue;;
+    esac
+    # A RUN ALREADY IN FLIGHT WHEN THE FINDING ARRIVED IS NOT A RELAUNCH.
+    #
+    # The owner rule is "answer every CodeRabbit before RELAUNCHING ci". Parking
+    # on unanswered threads applied it to runs that were already underway, which
+    # systematically killed every new PR's first run: a PR attracts its first
+    # review comment within minutes of opening, demoting it to THREADS while its
+    # opening suite is still going. #17874 -- a security fix -- was created at
+    # 20:23:43 and its thread arrived at 20:29:19, six minutes into the run.
+    #
+    # NOT the timestamp heuristic reverted earlier tonight. That one guessed the
+    # FIX was already in the head, which is unknowable. This asks which rule
+    # applies: a run begun before the finding existed was not started with
+    # findings unread, so the rule does not reach it.
+    oldest_thread=$(gh api graphql -f query="{repository(owner:\"${REPO%%/*}\",name:\"${REPO##*/}\"){pullRequest(number:$pr){reviewThreads(first:100){nodes{isResolved comments(first:1){nodes{createdAt}}}}}}}" \
+      --jq '[.data.repository.pullRequest.reviewThreads.nodes[]|select(.isResolved==false)|.comments.nodes[0].createdAt]|min // empty' 2>/dev/null)
+    if [ -n "$oldest_thread" ] && [ -n "$started" ] && [ "$started" \< "$oldest_thread" ]; then
+      echo "NOT parked: #$pr $nm — the run started $started, before its oldest unanswered thread ($oldest_thread). Answer them, but this suite was not launched with findings unread."
+      continue
+    fi
+    # NOTE: a timestamp heuristic was tried here and REVERTED the same hour.
+    # It compared the head's committedDate against the newest unresolved thread
+    # and skipped the cancel when the head was newer, on the theory that the fix
+    # was already in. #17842 disproved it: the head WAS newer and the threads
+    # were new defects raised against that very commit. "Newer" does not mean
+    # "addressed", and a guess dressed as a measurement is worse than parking.
+    if "$HOME/.claude/scripts/ci-cancel" "$id" pr-queue-gate "parked: $nm" "$br" "$pr" >/dev/null; then
+      echo "parked: #$pr $nm"
+    else
+      echo "could NOT park: #$pr $nm (already finishing, or a stranded record -- see #17866)"
+    fi
+  done
+fi
+
+# Claims on PRs that are no longer open. A claim is how sessions avoid working
+# the same PR, so one left on a merged PR blocks the next person for no reason --
+# and the ledger only lets the OWNER release, so nobody else can clear it. It is
+# debris in the sense that matters: silent, and costly to whoever hits it.
+#
+# Found 2026-10-02 by a session that correctly refused to `--steal` past one.
+# One `gh pr list` for every open PR, not one call per claim.
+if command -v "$HOME/.claude/scripts/ledger" >/dev/null 2>&1; then
+  open_prs=" $(gh pr list --repo $REPO --state open --limit 100 --json number --jq '[.[].number]|join(" ")' 2>/dev/null) "
+  "$HOME/.claude/scripts/ledger" claims 2>/dev/null | awk '$1=="pr"{print $2"\t"$3}' | while IFS=$'\t' read -r n owner; do
+    [ -z "$n" ] && continue
+    case "$open_prs" in *" $n "*) ;; *) echo "stale claim: #$n still held by $owner but the PR is closed/merged — only $owner can release it";; esac
+  done
+fi
+
+echo "note: ORDER IS RANK FIRST, DEADLINE SECOND. A run is only worth starting if"
+echo "      its verdict will still be true when it lands. r3/r4/r5 are never admitted."
+echo "      r0 MERGE    green, clean, 0 behind   -> merge; frees a runner, never rationed"
+echo "      r1 RUN      clean, 0 behind          -> the ONLY class whose verdict survives"
+echo "      r2 UPDATE   behind>0                 -> update-branch (that IS its run); never rerun"
+echo "      r3 THREADS  unresolved review threads-> answer them NOW; costs no runner, no slot"
+echo "      review col  APPROVED is UNREACHABLE here (no self-approve); REQ'D is normal, not a block"
+echo "      r4 BLOCKED  waits on an open PR      -> base about to move"
+echo "      r5 FIX      red at behind=0          -> needs a person; holds no slot"
+echo "  WIDTH DEFAULTS TO 1: since the 0-behind rule every merge puts every other PR"
+echo "      at behind=1, so K concurrent runs cost K suites and discard K-1."
+echo "  NEVER HELD: a push carrying a CORRECTNESS FIX."

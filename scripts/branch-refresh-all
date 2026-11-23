@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# branch-refresh-all [--apply] — owner rule 2026-09-19: every branch <=10 behind main, because updating
+# surfaces problems. For remote branches WITHOUT an open PR: server-side merge main into the branch
+# (no CI on non-PR branches), then classify: LANDED (no diff vs main -> deletion candidate),
+# UNIQUE (still carries changes -> triage), CONFLICT (problem -> report). Dry run unless --apply.
+# Skips release/main/Dev_new_gui and branches claimed in the ledger by an active session.
+set -u
+REPO=mrveiss/AutoBot-AI; APPLY=${1:-}
+open=$(gh pr list --repo $REPO --state open --limit 300 --json headRefName -q '.[].headRefName' | sort -u)
+claimed=$(~/.claude/scripts/ledger claims 2>/dev/null | awk '$1=="branch"{print $2}' | sort -u)
+git ls-remote --heads https://github.com/$REPO 2>/dev/null | awk '{sub("refs/heads/","",$2);print $2}' | while read -r b; do
+  case "$b" in main|release|Dev_new_gui) continue;; esac
+  grep -qx "$b" <<<"$open" && continue
+  grep -qx "$b" <<<"$claimed" && { echo "SKIP-CLAIMED $b"; continue; }
+  behind=$(gh api "repos/$REPO/compare/main...$b" -q .behind_by 2>/dev/null) || continue
+  if [ "${behind:-0}" -gt 10 ] && [ "$APPLY" = --apply ]; then
+    r=$(gh api -X POST "repos/$REPO/merges" -f base="$b" -f head=main -f commit_message="Merge main into $b (branch-refresh: keep <=10 behind)" 2>&1)
+    case "$r" in *onflict*) echo "CONFLICT $b behind=$behind"; continue;; esac
+  elif [ "${behind:-0}" -gt 10 ]; then echo "WOULD-MERGE $b behind=$behind"; continue; fi
+  files=$(gh api "repos/$REPO/compare/main...$b" -q '.files|length' 2>/dev/null)
+  [ "${files:-1}" = 0 ] && echo "LANDED $b (identical to main after refresh)" || echo "UNIQUE $b files=$files"
+done

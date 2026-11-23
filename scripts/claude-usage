@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""claude-usage — the account's Claude usage windows, from Claude Code's own cached utilization
+(~/.claude.json cachedUsageUtilization; refreshed by the client). Prints utilization per window,
+time to reset, and the daily burn allowed to reach the 7-day reset without running out.
+Goal 2026-09-19: "not run out of weekly claude usage tokens" — this is the number to check."""
+import datetime as dt
+import json
+import pathlib
+
+
+def _recent(util, allowed, left_h):
+    """Burn since a snapshot >= 1 h old, so a change in behaviour shows up (the window average
+    cannot). Snapshots: redis db15 list claude:usage:snapshots of "epoch utilization"."""
+    import subprocess
+    import time
+    r = ["redis-cli", "--no-auth-warning", "-n", "15"]
+    now = time.time()
+    subprocess.run(r + ["RPUSH", "claude:usage:snapshots", f"{int(now)} {util}"], capture_output=True, check=False)
+    rows = subprocess.run(r + ["LRANGE", "claude:usage:snapshots", "0", "-1"], capture_output=True, text=True).stdout.split("\n")
+    past = [tuple(map(float, x.split())) for x in rows if x.strip()]
+    base = [p for p in past if now - p[0] >= 3600]
+    if not base:
+        print(f"recent burn: need a snapshot >= 1 h old (have {len(past)}); re-run later")
+        return
+    t0, u0 = base[-1]
+    per_day = (util - u0) / ((now - t0) / 86400)
+    verdict = "OK" if per_day <= allowed else "OVER"
+    print(f"recent burn {per_day:.1f}%/day over the last {(now - t0) / 3600:.1f} h vs allowed {allowed:.1f}%/day -> {verdict}")
+
+
+#: Past this, the cached blob describes a window that may already have reset and every
+#: derived number is fiction. A stale read must say "cannot tell", never "OK" -- reporting
+#: a verdict computed from two reads of the SAME stale value is the failure this guards.
+STALE_MIN = 45
+
+d = json.loads((pathlib.Path.home() / ".claude.json").read_text(encoding="utf-8"))["cachedUsageUtilization"]
+now = dt.datetime.now(dt.timezone.utc)
+fetched = dt.datetime.fromtimestamp(d["fetchedAtMs"] / 1000, dt.timezone.utc)
+age_min = int((now - fetched).total_seconds() // 60)
+print(f"cached {age_min} min ago")
+if age_min > STALE_MIN:
+    print(f"STALE: the client has not refreshed this in {age_min} min (> {STALE_MIN}).")
+    print("VERDICT: CANNOT TELL -- not OK. Every utilization and burn figure below would be")
+    print("derived from a snapshot that old; a 0.0%/day 'recent burn' across two reads of the")
+    print("same stale value is an artifact, not a measurement. Open the Claude Code client or")
+    print("run /usage to force a refresh, then re-run this.")
+    raise SystemExit(3)
+for name in ("five_hour", "seven_day"):
+    w = (d.get("utilization") or {}).get(name) or {}
+    if w.get("utilization") is None:
+        continue
+    reset = dt.datetime.fromisoformat(w["resets_at"])
+    left_h = (reset - now).total_seconds() / 3600
+    line = f"{name:9s} {w['utilization']:>3}% used, resets in {left_h:5.1f} h"
+    if name == "seven_day" and left_h > 0:
+        start = reset - dt.timedelta(days=7)
+        elapsed_d = max((now - start).total_seconds() / 86400, 0.01)
+        rate = w["utilization"] / elapsed_d
+        allowed = (100 - w["utilization"]) / (left_h / 24)
+        eta = (100 - w["utilization"]) / rate if rate else float("inf")
+        line += (f" | window-avg burn {rate:.1f}%/day, allowed {allowed:.1f}%/day, "
+                 f"at that burn runs out in {eta:.1f} days {'OK' if eta * 24 >= left_h else 'WILL RUN OUT'}")
+        print(line)
+        _recent(w["utilization"], allowed, left_h)
+        continue
+    print(line)
+

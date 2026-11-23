@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# ci-watch [interval_s] — blocks until any land-next PR's strict-gate verdict becomes
+# GREEN/RED/MERGED/CLOSED (or changes head+verdict), prints those lines, exits.
+# One wake per real event; verdicts cached in Redis db15 (claude:watch:<pr>).
+set -u
+REPO=mrveiss/AutoBot-AI; RC="redis-cli --no-auth-warning -n 15"; iv=${1:-300}
+NS=${CI_WATCH_NS:-coord}  # per-session namespace: peers MUST set CI_WATCH_NS=<their name>
+# One watcher per namespace, enforced: a second instance wakes the session twice per event
+# and re-arms blindly (2026-09-19: two ran for ~30 min before anyone noticed).
+exec 9>"${XDG_RUNTIME_DIR:-/tmp}/ci-watch.$NS.lock"
+flock -n 9 || { echo "ci-watch: an instance for namespace '$NS' is already running — not starting a second" >&2; exit 3; }
+while true; do
+  prs=$(gh pr list --repo $REPO --state open --label land-next --limit 50 --json number -q '.[].number' 2>/dev/null)
+  prs="$prs $($RC SMEMBERS claude:watch:$NS:set 2>/dev/null)"
+  out=""
+  for p in $(tr ' ' '\n' <<<"$prs" | grep -E '^[0-9]+$' | sort -un); do
+    $RC SADD claude:watch:$NS:set "$p" >/dev/null
+    line=$(nice -n 19 ~/.claude/scripts/ci-gate "$p" 2>/dev/null | head -1)
+    case "$line" in *" WAIT "*|*" RERUN "*|*" HOLD "*|"") continue;; esac
+    case "$line" in *" RED "*)
+      sigs=$($RC SMEMBERS claude:known-red-sig 2>/dev/null)
+      if [ -n "$sigs" ]; then
+        sha=$(gh pr view "$p" --repo $REPO --json headRefOid -q .headRefOid 2>/dev/null)
+        logs=$(for id in $(gh api "repos/$REPO/commits/$sha/check-runs?per_page=100" -q '.check_runs[]|select(.conclusion=="failure")|.id' 2>/dev/null); do gh run view --repo $REPO --job "$id" --log 2>/dev/null | tail -300; done)
+        known=""; while IFS= read -r sg; do [ -n "$sg" ] && grep -qF "$sg" <<<"$logs" && known="$sg"; done <<<"$sigs"
+        if [ -n "$known" ]; then $RC SET "claude:watch:$NS:$p" "$line" >/dev/null; $RC SADD claude:known-red-hits "$p" >/dev/null; continue; fi
+      fi;;
+    esac
+    prev=$($RC GET "claude:watch:$NS:$p")
+    [ "$prev" = "$line" ] && continue
+    $RC SET "claude:watch:$NS:$p" "$line" >/dev/null
+    case "$line" in *MERGED|*CLOSED) $RC SREM claude:watch:$NS:set "$p" >/dev/null;; esac
+    out="$out$line"$'\n'
+  done
+  [ -n "$out" ] && { printf '%s' "$out"; exit 0; }
+  sleep "$iv"
+done

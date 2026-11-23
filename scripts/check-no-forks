@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# check-no-forks — fail if a second copy of a shared tool, or any backup, exists.
+#   check-no-forks [--repo-only]
+# Checks, with the tools being every file under this repo's scripts/ (the one copy):
+#   1. no two files in scripts/ share a basename;
+#   2. no *.bak* file or directory under $CLAUDE_CONFIG_DIR/scripts or $CLAUDE_CONFIG_DIR/state;
+#   3. no file under those two trees shares a basename with a scripts/ tool, unless it IS that tool
+#      (the installed scripts dir is a symlink to scripts/, so its files resolve to the same inode).
+# Not scanned: __pycache__, state/4e-artifacts-*, state/drift-removed-*, and any */tree/* snapshot.
+# --repo-only runs check 1 alone (for a checkout with no installed config). Exit 1 on any finding.
+set -u
+here="$(cd "$(dirname "$0")" && pwd -P)"
+cfg="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+rc=0
+fail() { echo "FORK: $*"; rc=1; }
+
+dups=$(find "$here" -type f ! -name README.md -printf '%f\n' | sort | uniq -d)
+for n in $dups; do fail "scripts/ holds two files named $n: $(find "$here" -type f -name "$n" | tr '\n' ' ')"; done
+[ "${1:-}" = "--repo-only" ] && exit $rc
+
+prune=( -name __pycache__ -o -path "$cfg/state/4e-artifacts-*" -o -path "$cfg/state/drift-removed-*" -o -path '*/tree/*' )
+scan() {  # scan <root>: print files and dirs, skipping the excluded trees
+  [ -e "$1" ] || return 0
+  find -L "$1" \( "${prune[@]}" \) -prune -o -print 2>/dev/null
+}
+tools=$(find "$here" -type f ! -name README.md -printf '%f\n' | sort -u)
+for root in "$cfg/scripts" "$cfg/state"; do
+  while IFS= read -r p; do
+    b=${p##*/}
+    case "$b" in *.bak|*.bak[-.]*|*.bak[0-9]*) fail "backup copy: $p"; continue;; esac
+    [ -f "$p" ] || continue
+    grep -qxF -- "$b" <<<"$tools" || continue
+    # the installed copy of the tool itself is not a fork
+    for t in $(find "$here" -type f -name "$b"); do [ "$p" -ef "$t" ] && continue 2; done
+    fail "second copy of tool $b: $p"
+  done < <(scan "$root")
+done
+[ $rc -eq 0 ] && echo "check-no-forks: clean"
+exit $rc

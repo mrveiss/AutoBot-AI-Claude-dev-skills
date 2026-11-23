@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# sync-local-branches [repo] — owner rule 2026-11-18: no local branch may be behind its origin branch.
+# Fetches with prune, fast-forwards every local branch that is strictly behind origin/<same name>
+# and not checked out in any worktree. Reports (never touches) diverged or checked-out ones.
+R=${1:-$(git rev-parse --show-toplevel 2>/dev/null)}; [ -n "$R" ] || exit 0
+cd "$R" || exit 0
+git fetch -q --prune origin 2>/dev/null || exit 0
+wt=$(git worktree list --porcelain | awk '/^branch/{print $2}')
+ff=0; rep=()
+while read -r b; do
+  o=refs/remotes/origin/$b; git show-ref -q --verify "$o" || continue
+  read -r ahead behind < <(git rev-list --left-right --count "$b...$o")
+  [ "$behind" -eq 0 ] && continue
+  if grep -qx "refs/heads/$b" <<<"$wt"; then rep+=("$b behind=$behind (checked out in a worktree)")
+  elif [ "$ahead" -eq 0 ]; then git update-ref "refs/heads/$b" "$o" "$(git rev-parse "refs/heads/$b")" && ff=$((ff+1))
+  else rep+=("$b ahead=$ahead behind=$behind (diverged: merge origin/$b in a worktree, push)"); fi
+done < <(git for-each-ref --format='%(refname:short)' refs/heads)
+[ $ff -gt 0 ] && echo "sync-local-branches: fast-forwarded $ff branch(es) to origin"
+for l in "${rep[@]}"; do echo "sync-local-branches: BEHIND $l"; done
+exit 0

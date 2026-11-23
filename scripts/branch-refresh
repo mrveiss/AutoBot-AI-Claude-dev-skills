@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# branch-refresh [max_behind=10] — owner rule 2026-09-19: every branch stays <= max_behind commits
+# behind main. Updates each open PR (base=main) that is further behind via GitHub's server-side
+# update-branch. To protect shared CI (gotcha_mass_update_branch_floods_ci), queued runs spawned
+# on PRs that are NOT land-next are cancelled — they get a fresh run when they enter the landing set.
+# Conflicts are reported (never resolved here). Stacked PRs, release/main/Dev_new_gui, rescued/* skipped.
+set -u
+REPO=mrveiss/AutoBot-AI; MAX=${1:-10}; upd=""; conf=""; cancelled=0
+# Coordinator hold (2026-09-19: an unattributed bulk update-branch at 17:51-18:00Z imported a red
+# main into 5+ PRs and ~200 runs had to be cancelled). While the flag is set, updates are sequenced
+# by the coordinator in landing order; clear with: redis-cli -n 15 DEL claude:hold-updates
+hold=$(redis-cli --no-auth-warning -n 15 GET claude:hold-updates 2>/dev/null)
+[ -n "$hold" ] && { echo "branch-refresh: HOLD set by coordinator — $hold. Not updating anything." >&2; exit 4; }
+while read -r n b base land; do
+  [ "$base" != main ] && continue
+  case "$b" in release|main|Dev_new_gui|rescued/*) continue;; esac
+  behind=$(gh api "repos/$REPO/compare/main...$b" -q .behind_by 2>/dev/null) || continue
+  [ "${behind:-0}" -le "$MAX" ] && continue
+  if gh pr update-branch "$n" --repo $REPO >/dev/null 2>&1; then
+    upd="$upd #$n($behind)"
+    if [ "$land" != true ]; then
+      sleep 20
+      h=$(gh pr view "$n" --repo $REPO --json headRefOid -q .headRefOid)
+      for id in $(gh run list --repo $REPO --branch "$b" --status queued --limit 60 --json databaseId,headSha -q ".[]|select(.headSha==\"$h\")|.databaseId"); do
+        "$HOME/.claude/scripts/ci-cancel" "$id" branch-refresh "queued run on a refreshed head" "$b" "$n" >/dev/null && cancelled=$((cancelled+1))
+      done
+    fi
+  else conf="$conf #$n($behind)"; fi
+done < <(gh pr list --repo $REPO --state open --limit 200 --json number,headRefName,baseRefName,labels \
+          -q '.[]|"\(.number) \(.headRefName) \(.baseRefName) \([.labels[].name]|index("land-next")!=null)"')
+echo "updated:${upd:- none}"; echo "conflicts (owner must resolve):${conf:- none}"; echo "cancelled non-land-next runs: $cancelled"

@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# safe-merge PR... — merge ONLY if, at the exact current head SHA:
+#   ci-gate says GREEN, and behind-ok says OK (behind=0 or disjoint from main's new commits).
+# Uses --match-head-commit so a head that moves between check and merge is refused by GitHub.
+set -u
+REPO=mrveiss/AutoBot-AI; S=~/.claude/scripts
+for p in "$@"; do
+  sha=$(gh pr view "$p" --repo $REPO --json headRefOid -q .headRefOid) || { echo "#$p ? no PR"; continue; }
+  g=$($S/ci-gate "$p"); case "$g" in *" ${sha:0:9} GREEN") ;; *) echo "#$p SKIP gate: $g"; continue;; esac
+  b=$($S/behind-ok "$p"); case "$b" in "#$p OK"*) ;; *) echo "#$p SKIP behind: $b"; continue;; esac
+  if gh pr merge "$p" --repo $REPO --admin --merge --match-head-commit "$sha" >/dev/null 2>&1; then
+    gh pr edit "$p" --repo $REPO --remove-label land-next >/dev/null 2>&1
+    echo "#$p MERGED at ${sha:0:9} ($b)"; merged=1
+  else echo "#$p merge refused (head moved or blocked)"; fi
+done
+# Owner rule 2026-09-19: main moving must surface new conflicts in every open PR at once.
+[ -n "${merged:-}" ] && nice -n 19 $S/conflict-scan
+# Owner rule 2026-09-19: the PR that lands next gets CI priority. The auto-update bot starts a
+# run on some later PR after every main push; hand the pool back to the head of the landing order
+# (redis db15 list claude:landing-order, maintained by the coordinator; merged/closed PRs skipped).
+if [ -n "${merged:-}" ]; then
+  for nxt in $(redis-cli --no-auth-warning -n 15 LRANGE claude:landing-order 0 -1 2>/dev/null); do
+    st=$(gh pr view "$nxt" --repo $REPO --json state -q .state 2>/dev/null)
+    [ "$st" = OPEN ] || { redis-cli --no-auth-warning -n 15 LREM claude:landing-order 0 "$nxt" >/dev/null; continue; }
+    $S/ci-priority "$nxt"
+    # Handing it the pool is not enough: its own runs were CANCELLED by an earlier
+    # priority sweep, and a cancelled run never restarts by itself. Worse, `gh pr checks`
+    # renders cancelled as red, so the PR reads as broken and gets triaged as a defect --
+    # 31 cancelled vs 2 real failures on #16853 cost a session a full investigation before
+    # anyone noticed the difference. Restart them as the pool is handed over.
+    sha=$(gh pr view "$nxt" --repo $REPO --json headRefOid -q .headRefOid 2>/dev/null)
+    ids=$(gh api "repos/$REPO/actions/runs?head_sha=$sha&per_page=100" \
+            -q '.workflow_runs[]|select(.conclusion=="cancelled")|.id' 2>/dev/null)
+    if [ -n "$ids" ]; then
+      echo "#$nxt: restarting $(grep -c . <<<"$ids") cancelled run(s)"
+      xargs -r -P4 -I{} gh run rerun {} --repo $REPO >/dev/null 2>&1 <<<"$ids"
+    fi
+    break
+  done
+fi

@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# push-and-park — push, then IMMEDIATELY enforce one-PR-CI.
+#
+# Owner rule 2026-11-06: 2 PRs hold CI, park (cancel) the rest; supersedes the
+# 2026-11-05 "no cancel". pr-queue-gate parks only with --park (its default is
+# report-only), so this passes it. Issue: https://github.com/mrveiss/Claude-Dev-Skills/issues/11
+#
+# A push to a non-admitted PR starts a full suite the instant it lands, so the
+# rule is violated in the window between pushing and the next sweep. I did
+# exactly that twice in one hour -- 22 runs the first time, 6 the second --
+# both times intending to park "on the next tick". The next tick is too late:
+# the runners are already allocated.
+#
+# So the park is not a separate step to remember, it is part of pushing.
+# Usage: push-and-park [<git push args...>]
+set -u
+echo "== pushing =="
+PATH="$(git rev-parse --show-toplevel 2>/dev/null)/venv/bin:${AUTOBOT_VENV:-$HOME/AutoBot-Ai/AutoBot-AI/venv}/bin:$PATH" \
+  git push "$@" || { echo "push failed — not parking"; exit 1; }
+echo "== enforcing one-PR-CI (parking non-admitted runs) =="
+exec "$(dirname "$0")/pr-queue-gate" --park

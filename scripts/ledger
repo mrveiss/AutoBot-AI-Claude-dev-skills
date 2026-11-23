@@ -1,0 +1,590 @@
+#!/usr/bin/env python3
+"""ledger: shared coordination state for the dev sessions on this machine — claims, PR state, holds, events.
+
+Usage:  ledger iam <name> [--takeover OLD]              register this session's name; --takeover moves a DEAD name's claims (#19452)
+        ledger sessions | ledger whoami                    name -> session id / messaging socket / liveness; my identity + claims
+        ledger claim <kind> <id> [--note T] [--ttl 4h] [--steal REASON]   kind: pr|branch|worktree|issue|task
+        ledger release <kind> <id> | ledger who <kind> <id> | ledger claims [--owner NAME]
+        ledger beat [--quiet]                               refresh my claims' heartbeat + mark me alive (activity hook, #19452)
+        ledger heartbeat <kind> <id> | ledger orphan <kind> <id> --snapshot DIR [--owner N]   reaper liveness + orphan event (#19452)
+        ledger review <pr> <sha> approve|blocked [--note T]  a verdict for THAT head; a head move makes it stale
+        ledger set <pr> [--batch B] [--merger NAME] [--owner NAME]
+        ledger pr <n> | ledger prs [--batch B] [--owner NAME] [--all] | ledger ready
+        ledger hold <scope> <reason> [--ttl 2h] | ledger unhold <scope> | ledger holds
+        ledger events [-n 20] [--for NAME] | ledger watch [--for NAME]   (watch blocks: run it under a Monitor)
+        ledger poll [--loop]                               the single GitHub poller (cron runs it under flock)
+Global: --as NAME acts as NAME (the poller, tests).  State: the private redis-stack instance ix starts
+(Unix socket, no TCP). GitHub stays the system of record; this is a rebuildable projection.
+"""
+import argparse, importlib.machinery, importlib.util, json, os, re, subprocess, sys, time
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+REPO = os.environ.get("LEDGER_REPO", "mrveiss/AutoBot-AI")
+STREAM, MAXLEN, TZ = "lg:events", 10000, ZoneInfo("Europe/Riga")
+KINDS = ("pr", "branch", "worktree", "issue", "task")
+SHA = re.compile(r"^[0-9a-f]{7,40}$")
+CI = {"SUCCESS": "green", "FAILURE": "red", "ERROR": "red", "PENDING": "running", "EXPECTED": "running"}
+REQUIRED = ("smoke-test", "code-quality", "startup-import-smoke", "Unit & Integration Tests",
+            "No open blocks-merge issues reference this PR", "No commit trailers", "verify-generated-types",
+            "migration-matrix", "verify-precommit-config", "api-wiring")
+AS = None
+QUERY = ("query($endCursor:String){repository(owner:\"%s\",name:\"%s\"){pullRequests(states:OPEN,first:100,after:$endCursor)"
+         "{pageInfo{hasNextPage endCursor} nodes{number title headRefOid commits(last:1){nodes{commit{statusCheckRollup{state}}}}}}}}")
+
+
+def conn():
+    path = str(Path.home() / ".claude/scripts/ix")
+    loader = importlib.machinery.SourceFileLoader("ix", path)
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("ix", loader))
+    loader.exec_module(mod)
+    return mod.ledger_client()
+
+
+def me(r) -> str:
+    if AS:
+        return AS
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    return (r.hget("lg:names", sid) or f"session-{sid[:8]}") if sid else "poller"
+
+
+def now() -> str:
+    return f"{time.time():.0f}"
+
+
+def when(ts) -> str:
+    return datetime.fromtimestamp(float(ts), TZ).strftime("%m-%d %H:%M") if ts else "-"
+
+
+def seconds(spec: str) -> int:
+    m = re.fullmatch(r"(\d+)([smhd])", spec)
+    if not m:
+        sys.exit(f"ledger: bad duration {spec!r} (use e.g. 90m, 4h, 2d)")
+    return int(m.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def ev(r, typ: str, **fields) -> None:
+    body = {"type": typ, "by": me(r), "ts": now(), **{k: str(v) for k, v in fields.items() if v not in (None, "")}}
+    r.xadd(STREAM, body, maxlen=MAXLEN, approximate=True)
+
+
+def pr_owner(r, n) -> str:
+    return r.hget(f"lg:claim:pr:{n}", "owner") or r.hget(f"lg:pr:{n}", "owner") or ""
+
+
+# ---- claims -------------------------------------------------------------------------------------
+#: A takeover is allowed only from a name that has made no activity beat for this long (#19452).
+TAKEOVER_IDLE_S = int(os.environ.get("LEDGER_TAKEOVER_IDLE_S", str(6 * 3600)))
+
+
+def _takeover(r, old: str, new: str) -> int:
+    """Move a dead name's claims to `new` and record the alias; refused while `old` is alive."""
+    ts = r.get(f"lg:alive:{old}")
+    if ts and time.time() - float(ts) < TAKEOVER_IDLE_S:
+        sys.exit(f"ledger iam: {old} beat {int((time.time() - float(ts)) // 60)}m ago — still alive, takeover refused")
+    moved = 0
+    for key in r.scan_iter("lg:claim:*"):
+        if r.hget(key, "owner") == old:
+            r.hset(key, mapping={"owner": new, "heartbeat": now()})
+            moved += 1
+    r.hset("lg:aliases", old, new)
+    r.delete(f"lg:alive:{old}")  # the old name is retired: it must not read as alive afterwards
+    ev(r, "takeover", prev=old, owner=new, claims=moved)
+    return moved
+
+
+def cmd_iam(r, a):
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not sid:
+        sys.exit("ledger iam: no CLAUDE_CODE_SESSION_ID in this environment")
+    moved = _takeover(r, a.takeover, a.name) if a.takeover else 0
+    r.hset("lg:names", sid, a.name)
+    _record_session(r, a.name, sid)
+    print(f"this session is now {a.name}" + (f" (took over {moved} claim(s) from {a.takeover})" if a.takeover else ""))
+
+
+def _record_session(r, name: str, sid: str) -> None:
+    """Where a ledger name lives now: session id, messaging socket (the `from=` of peer messages), pid."""
+    r.hset(f"lg:session:{name}", mapping={"sid": sid, "socket": os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET", ""),
+                                         "pid": os.environ.get("CLAUDE_PID", ""), "seen": now()})
+
+
+def cmd_sessions(r, a):
+    """ledger name -> session id, messaging socket, liveness: answers 'who is <display name>' (#19452)."""
+    aliases = r.hgetall("lg:aliases")
+    rows = []
+    for key in r.scan_iter("lg:session:*"):
+        name, d = key.split(":", 2)[2], r.hgetall(key)
+        sock = d.get("socket", "").rsplit("/", 1)[-1]
+        prev = ",".join(o for o, n in aliases.items() if n == name)
+        rows.append(f"{name:<18} {alive(r, name):<10} sid {d.get('sid', '')[:8]:<9} socket {sock:<12} seen {when(d.get('seen'))}"
+                    + (f"  (was {prev})" if prev else ""))
+    print("\n".join(sorted(rows)) or "no sessions recorded")
+    return 0
+
+
+def cmd_whoami(r, a):
+    """For the SessionStart hook: this session's ledger name and its claims, or how to set one."""
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    name = r.hget("lg:names", sid) if sid else None
+    if not name:
+        print("No ledger name for this session. If you resume another session's work, run "
+              "`ledger iam <its name>` (same session id) or `ledger iam <new name> --takeover <old name>` "
+              "(fresh session; refused while the old one is alive). Check `ledger sessions` first.")
+        return 0
+    _record_session(r, name, sid)
+    claims = sorted(k.split(":", 3)[2] + " " + k.split(":", 3)[3] for k in r.scan_iter("lg:claim:*") if r.hget(k, "owner") == name)
+    print(f"Ledger identity: you are {name}. Claims ({len(claims)}): " + ("; ".join(claims[:20]) or "none")
+          + ". Your display name may differ after a restart; `ledger sessions` maps names to sessions.")
+    return 0
+
+
+def cmd_claim(r, a):
+    key, mine, t = f"lg:claim:{a.kind}:{a.id}", me(r), now()
+    cur = r.hgetall(key)
+    if cur and cur.get("owner") != mine and not a.steal:
+        print(f"{a.kind} {a.id}: claimed by {cur['owner']} since {when(cur.get('since'))} — {cur.get('note', '')}; --steal REASON only with their agreement")
+        return 1
+    since = cur.get("since", t) if cur.get("owner") == mine else t
+    r.hset(key, mapping={"owner": mine, "note": a.note or cur.get("note", ""), "since": since, "heartbeat": t})
+    r.expire(key, seconds(a.ttl))
+    stolen = bool(cur) and cur.get("owner") != mine
+    ev(r, "steal" if stolen else "claim", kind=a.kind, id=a.id, owner=mine, prev=cur.get("owner") if stolen else None, reason=a.steal)
+    print(f"{a.kind} {a.id}: {'stolen from ' + cur['owner'] + ' by' if stolen else 'claimed by'} {mine} (ttl {a.ttl})")
+    return 0
+
+
+def cmd_release(r, a):
+    key, mine = f"lg:claim:{a.kind}:{a.id}", me(r)
+    cur = r.hgetall(key)
+    if not cur:
+        print(f"{a.kind} {a.id}: not claimed")
+        return 0
+    if cur["owner"] != mine:
+        print(f"{a.kind} {a.id}: owned by {cur['owner']}, not {mine} — only the owner releases")
+        return 1
+    r.delete(key)
+    ev(r, "release", kind=a.kind, id=a.id, owner=mine)
+    print(f"{a.kind} {a.id}: released")
+    return 0
+
+
+def cmd_who(r, a):
+    key = f"lg:claim:{a.kind}:{a.id}"
+    cur = r.hgetall(key)
+    print(f"{a.kind} {a.id}: " + (f"{cur['owner']} since {when(cur.get('since'))}, heartbeat {when(cur.get('heartbeat'))}, "
+                                  f"expires in {r.ttl(key) // 60}m, owner {alive(r, cur['owner'])} — {cur.get('note', '')}" if cur else "unclaimed"))
+    return 0
+
+
+def cmd_claims(r, a):
+    rows = []
+    for key in r.scan_iter("lg:claim:*"):
+        d = r.hgetall(key)
+        if d and (not a.owner or d.get("owner") == a.owner):
+            _, _, kind, ident = key.split(":", 3)
+            rows.append(f"{kind:<8} {ident:<40} {d.get('owner', '?'):<18} {alive(r, d.get('owner', '?')):<9} since {when(d.get('since'))}  {d.get('note', '')[:50]}")
+    print("\n".join(sorted(rows)) or "no claims")
+    return 0
+
+
+#: A session counts as alive while its last activity beat is younger than this (#19452).
+ALIVE_TTL = int(os.environ.get("LEDGER_ALIVE_TTL", "900"))
+
+
+def alive(r, name: str) -> str:
+    """'alive' / 'idle Nm' / 'no beat' for a ledger name — activity, not claim age, is liveness."""
+    ts = r.get(f"lg:alive:{name}")
+    if not ts:
+        return "no beat"
+    age = time.time() - float(ts)
+    return "alive" if age < ALIVE_TTL else f"idle {int(age // 60)}m"
+
+
+def cmd_beat(r, a):
+    """Refresh the heartbeat of every claim this session owns, and stamp it alive (#19452)."""
+    mine, t, n = me(r), now(), 0
+    if mine == "poller":
+        return 0
+    r.set(f"lg:alive:{mine}", t, ex=7 * 86400)
+    if os.environ.get("CLAUDE_CODE_SESSION_ID"):
+        _record_session(r, mine, os.environ["CLAUDE_CODE_SESSION_ID"])
+    for key in r.scan_iter("lg:claim:*"):
+        if r.hget(key, "owner") == mine:
+            r.hset(key, "heartbeat", t)
+            n += 1
+    if not a.quiet:
+        print(f"{mine}: alive, {n} claim(s) refreshed")
+    return 0
+
+
+def cmd_heartbeat(r, a):
+    """Machine-readable claim liveness for the reaper: '<owner> <heartbeat-epoch>' or 'unclaimed' (#19452)."""
+    cur = r.hgetall(f"lg:claim:{a.kind}:{a.id}")
+    print(f"{cur['owner']} {cur.get('heartbeat') or cur.get('since') or 0}" if cur else "unclaimed")
+    return 0
+
+
+def cmd_orphan(r, a):
+    """Record an orphaned claim and where its work was snapshotted; nothing is changed (#19452)."""
+    ev(r, "orphan", kind=a.kind, id=a.id, owner=a.owner, snapshot=a.snapshot)
+    print(f"{a.kind} {a.id}: orphan event raised (owner {a.owner or '-'}, snapshot {a.snapshot})")
+    return 0
+
+
+# ---- PR state -----------------------------------------------------------------------------------
+def current(d) -> bool:
+    return bool(d.get("head") and d.get("review_sha") and d["head"].startswith(d["review_sha"]))
+
+
+def row(r, n, d) -> str:
+    rv = d.get("review_verdict")
+    review = f"{rv}@{d.get('review_sha', '')[:9]}{'' if current(d) else ' STALE'}" if rv else "-"
+    line = (f"#{n:<6} {d.get('state', '?'):<6} {d.get('ci', '?'):<8} head={d.get('head', '')[:9]:<9} review={review:<26} "
+            f"batch={d.get('batch', '-'):<4} merger={d.get('merger', '-'):<14} owner={pr_owner(r, n) or '-'}")
+    return line + (f"\n        fails: {d['fails']}" if d.get("ci") in ("red", "incomplete") and d.get("fails") else "")
+
+
+def _pr_number(text: str) -> str:
+    """A bare PR number only: `pr:21823` or `#21823` once filed a verdict under a key nothing reads."""
+    if not text.isdigit():
+        raise argparse.ArgumentTypeError(f"expected a bare PR number, got {text!r} (e.g. 21823, not pr:21823)")
+    return text
+
+
+def cmd_review(r, a):
+    if not SHA.match(a.sha):
+        sys.exit("ledger review: sha must be 7-40 hex chars from the PR's head")
+    key = f"lg:pr:{a.pr}"
+    r.hset(key, mapping={"review_sha": a.sha, "review_verdict": a.verdict, "reviewer": me(r), "review_note": a.note or "", "review_ts": now()})
+    ev(r, "review", pr=a.pr, sha=a.sha[:9], verdict=a.verdict, owner=pr_owner(r, a.pr), merger=r.hget(key, "merger"))
+    # Compare against the live head: the poller's copy can lag a fresh push by one cycle. Read-only on
+    # purpose: writing it here would swallow the poller's pr.head_moved event for that push.
+    live = gh("pr", "view", str(a.pr), "-R", REPO, "--json", "headRefOid", "-q", ".headRefOid", timeout=30)
+    head = live.stdout.strip() if live.returncode == 0 and live.stdout.strip() else (r.hget(key, "head") or "")
+    print(f"#{a.pr}: {a.verdict} at {a.sha[:9]}" + (f" — WARNING: head is {head[:9]}, so this review is already stale" if head and not head.startswith(a.sha) else ""))
+    return 0
+
+
+def cmd_set(r, a):
+    fields = {k: v for k, v in (("batch", a.batch), ("merger", a.merger), ("owner", a.owner)) if v is not None}
+    if not fields:
+        sys.exit("ledger set: give --batch, --merger or --owner")
+    r.hset(f"lg:pr:{a.pr}", mapping=fields)
+    ev(r, "set", pr=a.pr, **fields)
+    print(f"#{a.pr}: " + ", ".join(f"{k}={v}" for k, v in fields.items()))
+    return 0
+
+
+def cmd_pr(r, a):
+    d = r.hgetall(f"lg:pr:{a.n}")
+    if not d:
+        print(f"#{a.n}: not in the ledger (the poller records open PRs)")
+        return 1
+    print(row(r, a.n, d))
+    print(f"        {d.get('title', '')[:90]} | pending {d.get('pending', '?')} | updated {when(d.get('updated'))}"
+          + (f" | reviewer {d.get('reviewer')}: {d.get('review_note', '')[:60]}" if d.get("reviewer") else ""))
+    return 0
+
+
+def all_prs(r):
+    for key in r.scan_iter("lg:pr:*"):
+        yield key.split(":")[-1], r.hgetall(key)
+
+
+def cmd_prs(r, a):
+    out = [(int(n), row(r, n, d)) for n, d in all_prs(r)
+           if (a.all or d.get("state") == "OPEN") and (not a.batch or d.get("batch") == a.batch)
+           and (not a.owner or a.owner in (pr_owner(r, n), d.get("merger"), d.get("reviewer")))]
+    print("\n".join(line for _, line in sorted(out)) or "no matching PRs")
+    return 0
+
+
+def cmd_ready(r, a):
+    hold = r.hgetall("lg:hold:merges")
+    if hold:
+        print(f"HOLD merges: {hold.get('reason')} (by {hold.get('by')}, expires in {r.ttl('lg:hold:merges') // 60}m)")
+    ok = [(int(n), row(r, n, d)) for n, d in all_prs(r)
+          if d.get("state") == "OPEN" and d.get("ci") == "green" and d.get("review_verdict") == "approve" and current(d)]
+    print("\n".join(line for _, line in sorted(ok)) or "nothing ready (needs: green CI + approve naming the current head)")
+    return 0
+
+
+# ---- holds --------------------------------------------------------------------------------------
+def _hold_txn(r, key, mine, steal, write):
+    """Check-and-act on a hold atomically (WATCH/MULTI): two sessions in the same second
+    can no longer both 'win'. Returns (ok, current_holder_dict)."""
+    from redis.exceptions import WatchError  # the ledger client is redis-py (via ix)
+
+    with r.pipeline() as p:
+        while True:
+            try:
+                p.watch(key)
+                cur = p.hgetall(key)
+                if cur and cur.get("by") != mine and not steal:
+                    p.unwatch()
+                    return False, cur
+                p.multi()
+                write(p, cur)
+                p.execute()
+                return True, cur
+            except WatchError:
+                continue
+
+
+#: A waiter that has not retried `hold` for this long is dropped, so a dead session cannot block the queue.
+QUEUE_STALE_S = 90
+
+
+def _queue_keys(scope):
+    return f"lg:holdq:{scope}", f"lg:holdq_seen:{scope}"
+
+
+def _live_head(p, qkey, skey):
+    """The oldest waiter still retrying (stale ones are pruned inside the caller's MULTI)."""
+    cutoff, stale, head = time.time() - QUEUE_STALE_S, [], None
+    for who in p.zrange(qkey, 0, -1):
+        if float(p.hget(skey, who) or 0) < cutoff:
+            stale.append(who)
+        elif head is None:
+            head = who
+    return head, stale
+
+
+def _hold_fifo(r, a, key, mine):
+    """Take the hold if free AND this session is first in line; else join the FIFO queue.
+    Returns ("taken"|"held"|"queued", current_holder, position)."""
+    from redis.exceptions import WatchError
+
+    qkey, skey = _queue_keys(a.scope)
+    with r.pipeline() as p:
+        while True:
+            try:
+                p.watch(key, qkey, skey)
+                cur, ts = p.hgetall(key), time.time()
+                head, stale = _live_head(p, qkey, skey)
+                mine_holds = cur.get("by") == mine
+                blocked = (cur and not mine_holds) or (not cur and head not in (None, mine))
+                p.multi()
+                for who in stale:
+                    p.zrem(qkey, who)
+                    p.hdel(skey, who)
+                if blocked and not a.steal:
+                    p.zadd(qkey, {mine: ts}, nx=True)
+                    p.hset(skey, mine, ts)
+                    p.execute()
+                    rank = r.zrank(qkey, mine)
+                    return ("held" if cur else "queued"), cur, (rank or 0) + 1
+                since = cur.get("since", now()) if mine_holds else now()
+                p.hset(key, mapping={"reason": a.reason, "by": mine, "since": since})
+                p.expire(key, seconds(a.ttl))
+                p.zrem(qkey, mine)
+                p.hdel(skey, mine)
+                p.execute()
+                return "taken", cur, 0
+            except WatchError:
+                continue
+
+
+def cmd_hold(r, a):
+    key, mine = f"lg:hold:{a.scope}", me(r)
+    state, cur, pos = _hold_fifo(r, a, key, mine)
+    if state == "held":
+        print(f"{a.scope}: HELD by {cur.get('by')} since {when(cur.get('since'))} — {cur.get('reason', '')}; "
+              f"you are #{pos} in the queue — retry to keep your place, or --steal REASON only with their agreement")
+        return 2
+    if state == "queued":
+        print(f"{a.scope}: free, but #{pos} in the FIFO queue — an earlier waiter goes first; retry to keep your place")
+        return 3
+    stolen = bool(cur) and cur.get("by") != mine
+    ev(r, "steal-hold" if stolen else "hold", scope=a.scope, reason=a.reason, prev=cur.get("by") if stolen else None)
+    print(f"HOLD {a.scope}: {a.reason} (ttl {a.ttl})" + (f" — STOLEN from {cur.get('by')}" if stolen else ""))
+    return 0
+
+
+def cmd_unhold(r, a):
+    key, mine = f"lg:hold:{a.scope}", me(r)
+    ok, cur = _hold_txn(r, key, mine, a.force, lambda p, cur: p.delete(key))
+    if not ok:
+        print(f"{a.scope}: held by {cur.get('by')}, not {mine} — only the holder releases (--force REASON to override)")
+        return 2
+    if cur:
+        ev(r, "unhold", scope=a.scope, prev=cur.get("by") if cur.get("by") != mine else None)
+    print(f"{a.scope}: {'released' if cur else 'was not held'}")
+    return 0
+
+
+def cmd_holds(r, a):
+    rows = [f"{k.split(':', 2)[2]:<12} {d.get('reason', '')} — by {d.get('by')} since {when(d.get('since'))}, {r.ttl(k) // 60}m left"
+            for k in r.scan_iter("lg:hold:*") for d in [r.hgetall(k)] if d]
+    cutoff = time.time() - QUEUE_STALE_S
+    for qk in sorted(r.scan_iter("lg:holdq:*")):
+        scope = qk.split(":", 2)[2]
+        seen = r.hgetall(_queue_keys(scope)[1])
+        live = [w for w in r.zrange(qk, 0, -1) if float(seen.get(w, 0)) >= cutoff]
+        if live:
+            rows.append(f"{scope:<12} QUEUE: " + " → ".join(f"{i}. {w}" for i, w in enumerate(live, 1)))
+    print("\n".join(sorted(rows)) or "no holds")
+    return 0
+
+
+# ---- events -------------------------------------------------------------------------------------
+def mine_prs(r, name) -> set:
+    owned = {k.split(":")[-1] for k in r.scan_iter("lg:claim:pr:*") if r.hget(k, "owner") == name}
+    return owned | {n for n, d in all_prs(r) if name in (d.get("owner"), d.get("merger"), d.get("reviewer"))}
+
+
+def relevant(e, name, prs) -> bool:
+    return (not name or e.get("type") in ("hold", "unhold") or name in (e.get("owner"), e.get("prev"), e.get("merger"))
+            or (e.get("pr") in prs and e.get("by") != name))
+
+
+def fmt(e) -> str:
+    extra = " ".join(f"{k}={v}" for k, v in e.items() if k not in ("type", "by", "ts", "pr"))
+    return f"{when(e.get('ts'))} {e.get('type')}{' #' + e['pr'] if e.get('pr') else ''} {extra} (by {e.get('by')})"
+
+
+def cmd_events(r, a):
+    prs = mine_prs(r, a.for_) if a.for_ else set()
+    got = [fmt(e) for _, e in r.xrevrange(STREAM, count=a.n * 20) if relevant(e, a.for_, prs)][:a.n]
+    print("\n".join(reversed(got)) or "no events")
+    return 0
+
+
+def cmd_watch(r, a):
+    last, prs, refreshed = "$", set(), 0.0
+    while True:
+        if a.for_ and time.time() - refreshed > 60:
+            prs, refreshed = mine_prs(r, a.for_), time.time()
+        for _, entries in r.xread({STREAM: last}, block=30000, count=50) or []:
+            for eid, e in entries:
+                last = eid
+                if relevant(e, a.for_, prs) and e.get("by") != a.for_:
+                    print(fmt(e), flush=True)
+
+
+# ---- the single poller --------------------------------------------------------------------------
+def gh(*args, timeout=180):
+    return subprocess.run(["gh", *args], capture_output=True, text=True, timeout=timeout)
+
+
+def failing(n) -> str:
+    q = '[.statusCheckRollup[]|select(.conclusion=="FAILURE" or .conclusion=="TIMED_OUT" or .state=="FAILURE" or .state=="ERROR")|(.name // .context)]|join(",")'
+    out = gh("pr", "view", str(n), "-R", REPO, "--json", "statusCheckRollup", "-q", q, timeout=60)
+    return out.stdout.strip()[:300]
+
+
+def required_gap(n) -> str:
+    """Required contexts not yet passed: a green rollup over side checks alone is not green."""
+    q = '[.statusCheckRollup[]|select((.conclusion // .state) as $c|["SUCCESS","SKIPPED","NEUTRAL"]|index($c))|(.name // .context)]|join("\\n")'
+    out = gh("pr", "view", str(n), "-R", REPO, "--json", "statusCheckRollup", "-q", q, timeout=60)
+    if out.returncode != 0:
+        return "lookup failed"
+    ok = set(out.stdout.splitlines())
+    return ",".join(x for x in REQUIRED if x not in ok)
+
+
+def update_pr(r, p) -> None:
+    n, key = str(p["number"]), f"lg:pr:{p['number']}"
+    old = r.hgetall(key)
+    state = (p["commits"]["nodes"][0]["commit"].get("statusCheckRollup") or {}).get("state") if p["commits"]["nodes"] else None
+    ci, head = CI.get(state or "", "none"), p["headRefOid"]
+    new = {"title": p["title"][:120], "head": head, "state": "OPEN", "ci": ci, "updated": now()}
+    if ci == "green" and old.get("req_ok") != head:
+        gap = required_gap(n)
+        if gap:
+            new.update(ci="incomplete", fails="missing: " + gap[:280])
+            ci = "incomplete"
+        else:
+            new.update(req_ok=head, fails="")
+    if ci == "red":
+        new["fails"] = failing(n)  # every poll while red: failures can arrive after the first red
+    r.hset(key, mapping=new)
+    r.persist(key)
+    if not old.get("head"):
+        return
+    who = {"owner": pr_owner(r, n), "merger": old.get("merger")}
+    if old["head"] != head:
+        stale = "stale" if old.get("review_sha") and not head.startswith(old["review_sha"]) else None
+        ev(r, "pr.head_moved", pr=n, head=head[:9], prev=old["head"][:9], review=stale, **who)
+    if old.get("ci") != ci and ci in ("green", "red"):
+        ev(r, f"pr.{ci}", pr=n, head=head[:9], fails=new.get("fails"), **who)
+    elif ci == "red" and old.get("head") == head and set(filter(None, (old.get("fails") or "").split(","))) != set(filter(None, new["fails"].split(","))):
+        ev(r, "pr.red", pr=n, head=head[:9], fails=new["fails"], note="failing set changed", **who)
+
+
+def close_pr(r, n) -> None:
+    out = gh("pr", "view", n, "-R", REPO, "--json", "state,mergeCommit", "-q", '"\\(.state) \\(.mergeCommit.oid // "")"', timeout=60)
+    state, _, sha = out.stdout.strip().partition(" ")
+    if state in ("MERGED", "CLOSED"):
+        key = f"lg:pr:{n}"
+        r.hset(key, mapping={"state": state, "merge_sha": sha, "updated": now()})
+        r.expire(key, 7 * 86400)
+        ev(r, f"pr.{state.lower()}", pr=n, sha=sha[:9], owner=pr_owner(r, n), merger=r.hget(key, "merger"))
+
+
+def poll_once(r) -> int:
+    out = gh("api", "graphql", "--paginate", "-f", "query=" + QUERY % tuple(REPO.split("/")), "--jq", ".data.repository.pullRequests.nodes[]|@json")
+    if out.returncode:
+        print(f"ledger poll: gh failed: {out.stderr.strip()[-200:]}", file=sys.stderr)
+        return 1
+    seen = set()
+    for line in out.stdout.splitlines():
+        p = json.loads(line)
+        seen.add(str(p["number"]))
+        update_pr(r, p)
+    for n, d in list(all_prs(r)):
+        if d.get("state") == "OPEN" and n not in seen:
+            close_pr(r, n)
+    r.set("lg:poll:last", now())
+    print(f"{when(now())} polled {len(seen)} open PRs")
+    return 0
+
+
+def cmd_poll(r, a):
+    while True:
+        rc = poll_once(r)
+        if not a.loop:
+            return rc
+        time.sleep(180)
+
+
+def main() -> int:
+    global AS
+    ap = argparse.ArgumentParser(prog="ledger", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--as", dest="as_")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    def add(name, fn, *spec):
+        p = sub.add_parser(name)
+        for args, kw in spec:
+            p.add_argument(*args, **kw)
+        p.set_defaults(fn=fn)
+    add("iam", cmd_iam, (("name",), {}), (("--takeover",), {}))
+    add("sessions", cmd_sessions)
+    add("whoami", cmd_whoami)
+    add("claim", cmd_claim, (("kind",), {"choices": KINDS}), (("id",), {}), (("--note",), {}), (("--ttl",), {"default": "4h"}), (("--steal",), {}))
+    add("release", cmd_release, (("kind",), {"choices": KINDS}), (("id",), {}))
+    add("who", cmd_who, (("kind",), {"choices": KINDS}), (("id",), {}))
+    add("claims", cmd_claims, (("--owner",), {}))
+    add("beat", cmd_beat, (("--quiet",), {"action": "store_true"}))
+    add("heartbeat", cmd_heartbeat, (("kind",), {"choices": KINDS}), (("id",), {}))
+    add("orphan", cmd_orphan, (("kind",), {"choices": KINDS}), (("id",), {}), (("--owner",), {}), (("--snapshot",), {"required": True}))
+    add("review", cmd_review, (("pr",), {"type": _pr_number}), (("sha",), {}), (("verdict",), {"choices": ("approve", "blocked")}), (("--note",), {}))
+    add("set", cmd_set, (("pr",), {}), (("--batch",), {}), (("--merger",), {}), (("--owner",), {}))
+    add("pr", cmd_pr, (("n",), {}))
+    add("prs", cmd_prs, (("--batch",), {}), (("--owner",), {}), (("--all",), {"action": "store_true"}))
+    add("ready", cmd_ready)
+    add("hold", cmd_hold, (("scope",), {}), (("reason",), {}), (("--ttl",), {"default": "2h"}), (("--steal",), {}))
+    add("unhold", cmd_unhold, (("scope",), {}), (("--force",), {}))
+    add("holds", cmd_holds)
+    add("events", cmd_events, (("-n",), {"type": int, "default": 20}), (("--for",), {"dest": "for_"}))
+    add("watch", cmd_watch, (("--for",), {"dest": "for_"}))
+    add("poll", cmd_poll, (("--loop",), {"action": "store_true"}))
+    a = ap.parse_args()
+    AS = a.as_
+    return a.fn(conn(), a) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

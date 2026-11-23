@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# branch-for-issue <issue-number> [branch-name] — create a branch that GitHub natively LINKS to
+# the issue, shown in its Development panel.
+#
+# Why this exists: GitHub's createLinkedBranch mutation links a branch only at the moment it
+# creates it. A branch made with `git branch` / `git worktree add -b` and pushed can NEVER be
+# linked afterwards -- tested against issue-17039-orphan-detector, the mutation returns
+# linkedBranch:null and there is no other API for it. So the link has to be made up front or
+# not at all.
+#
+# Default name is issue-<N>-<slugified title>, matching the repo convention.
+set -euo pipefail
+REPO=${REPO:-mrveiss/AutoBot-AI}
+N=${1:?usage: branch-for-issue <issue-number> [branch-name]}
+
+title=$(gh api "repos/$REPO/issues/$N" -q .title)
+slug=$(printf '%s' "$title" \
+  | tr '[:upper:]' '[:lower:]' \
+  | sed -E 's/\([^)]*\)//g; s/[^a-z0-9]+/-/g; s/^-+|-+$//g' \
+  | cut -c1-40 | sed -E 's/-+$//')
+name=${2:-issue-$N-$slug}
+
+if git ls-remote --heads origin "$name" | grep -q .; then
+  echo "branch-for-issue: '$name' already exists on origin." >&2
+  echo "It can no longer be linked -- GitHub links a branch only when it creates it." >&2
+  echo "Pick a different name, or accept the naming convention as the only association." >&2
+  exit 3
+fi
+
+base=$(git rev-parse origin/main)
+rid=$(gh api "repos/$REPO" -q .node_id)
+iid=$(gh api "repos/$REPO/issues/$N" -q .node_id)
+
+out=$(gh api graphql -f query='
+  mutation($i:ID!,$o:GitObjectID!,$n:String!,$r:ID!){
+    createLinkedBranch(input:{issueId:$i,oid:$o,name:$n,repositoryId:$r}){
+      linkedBranch{ ref { name } }
+    }
+  }' -f i="$iid" -f o="$base" -f n="$name" -f r="$rid")
+
+case "$out" in
+  *"\"name\":\"$name\""*)
+    echo "created and linked to #$N: $name (off ${base:0:9})"
+    echo "worktree:  git worktree add .worktrees/$name $name" ;;
+  *)
+    echo "branch-for-issue: mutation returned no link -- branch NOT created as linked." >&2
+    echo "$out" >&2
+    exit 4 ;;
+esac

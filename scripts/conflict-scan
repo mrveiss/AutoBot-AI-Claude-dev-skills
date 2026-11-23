@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# conflict-scan — dry-merge every open PR (base main) against origin/main and list the ones that
+# would conflict, with the conflicting files and the ledger owner. Local git only: no push, no CI.
+# Owner rule 2026-09-19 (#16965 sat 392 behind and conflicted on update): conflicts must surface the
+# moment main moves, not on the train's turn. safe-merge runs this after every merge.
+# Git 2.34 here: uses the 3-arg `git merge-tree` and counts +<<<<<<< markers (no --write-tree).
+set -u
+REPO=mrveiss/AutoBot-AI
+cd "$(git rev-parse --show-toplevel 2>/dev/null || echo "$HOME/AutoBot-Ai/AutoBot-AI")" || exit 2
+git fetch -q origin main 2>/dev/null
+list=$(gh pr list --repo $REPO --state open --base main --limit 200 --json number,headRefName -q '.[]|"\(.number) \(.headRefName)"')
+# shellcheck disable=SC2046
+git fetch -q origin $(awk '{print $2}' <<<"$list" | tr '\n' ' ') 2>/dev/null
+found=0
+while read -r n b; do
+  [ -n "$n" ] || continue
+  # From the retired vsmain.sh: CONFLICT_SCAN_SKIP_PREFIX=train- leaves merge-train branches out of the scan.
+  [ -n "${CONFLICT_SCAN_SKIP_PREFIX:-}" ] && case "$b" in "$CONFLICT_SCAN_SKIP_PREFIX"*) continue;; esac
+  h=$(git rev-parse -q --verify "origin/$b") || continue
+  mb=$(git merge-base "$h" origin/main) || continue
+  mt=$(git merge-tree "$mb" "$h" origin/main)
+  c=$(grep -c '^+<<<<<<<' <<<"$mt")
+  [ "$c" -gt 0 ] || continue
+  found=$((found+1))
+  files=$(awk '/^changed in both/{getline; getline; print $4}' <<<"$mt" | sort -u | head -5 | tr '\n' ' ')
+  owner=$(~/.claude/scripts/ledger who pr "$n" 2>/dev/null | awk '{print $3}' | head -1)
+  echo "CONFLICT #$n behind=$(git rev-list --count "$h..origin/main") hunks=$c owner=${owner:-unclaimed} $b :: $files"
+done <<<"$list"
+[ "$found" -eq 0 ] && echo "conflict-scan: no open PR conflicts with main"

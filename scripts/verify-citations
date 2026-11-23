@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""Resolve every file:line citation in a draft before it is published.
+
+A citation is evidence only once the cited line has been read. This prints each
+cited line so it can be checked, and exits non-zero if any citation cannot be
+resolved — so an unresolvable coordinate never reaches an issue, PR or comment.
+
+Usage:
+    verify-citations draft.md
+    gh issue view 123 --json body --jq .body | verify-citations -
+    verify-citations - --root /path/to/repo   (default: cwd)
+"""
+import argparse
+import os
+import re
+import sys
+
+CITATION = re.compile(
+    r"([A-Za-z0-9_][A-Za-z0-9_./-]*\.(?:py|md|yml|yaml|vue|ts|tsx|js|json|sh|toml|cfg)):(\d+)"
+)
+# Prefixes tried when a citation omits its directory.
+AMBIGUOUS = object()
+SEARCH_PREFIXES = ("", "autobot-backend/", "autobot_shared/", "autobot-slm-backend/",
+                   "autobot-frontend/src/", "src/", "scripts/")
+
+
+SKIP_DIRS = {".git", "node_modules", "venv", ".venv", "__pycache__", "dist", "build"}
+_index = None
+
+
+def _build_index(root):
+    """Map basename -> [full paths], built once, for citations missing a directory."""
+    index = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for name in filenames:
+            index.setdefault(name, []).append(os.path.join(dirpath, name))
+    return index
+
+
+def resolve(path, root):
+    """Exact path, then known prefixes, then a unique basename match."""
+    for prefix in SEARCH_PREFIXES:
+        candidate = os.path.join(root, prefix + path)
+        if os.path.isfile(candidate):
+            return candidate
+
+    global _index
+    if _index is None:
+        _index = _build_index(root)
+    matches = _index.get(os.path.basename(path), [])
+    # A citation like "search_components/reranking.py" must match that tail.
+    tail = [m for m in matches if m.replace(os.sep, "/").endswith("/" + path)]
+    if len(tail) == 1:
+        return tail[0]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        return AMBIGUOUS
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("draft", help="file containing the draft, or - for stdin")
+    ap.add_argument("--root", default=os.getcwd())
+    args = ap.parse_args()
+
+    text = sys.stdin.read() if args.draft == "-" else open(
+        args.draft, encoding="utf-8").read()
+
+    seen, unresolved, resolved = set(), [], 0
+    for path, lineno in CITATION.findall(text):
+        lineno = int(lineno)
+        if (path, lineno) in seen:
+            continue
+        seen.add((path, lineno))
+
+        real = resolve(path, args.root)
+        if real is AMBIGUOUS:
+            unresolved.append(f"{path}:{lineno}  -- ambiguous: several files share that name")
+            continue
+        if real is None:
+            unresolved.append(f"{path}:{lineno}  -- no such file under {args.root}")
+            continue
+        lines = open(real, encoding="utf-8", errors="replace").read().splitlines()
+        if lineno > len(lines):
+            unresolved.append(f"{path}:{lineno}  -- file has only {len(lines)} lines")
+            continue
+        resolved += 1
+        print(f"{path}:{lineno} | {lines[lineno - 1].strip()[:100]}")
+
+    print(f"\nresolved={resolved}  unresolved={len(unresolved)}")
+    for problem in unresolved:
+        print(f"  UNRESOLVED  {problem}")
+    print("\nRead each line above and confirm it says what the draft claims.")
+    print("A resolvable citation is not yet a correct one.")
+    return 1 if unresolved else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

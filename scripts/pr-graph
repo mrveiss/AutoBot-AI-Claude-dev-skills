@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# pr-graph — PR <-> file graph of open PRs, cached in Redis db15 (separate from AutoBot's pg:* graph).
+#   pr-graph sync              refresh only PRs whose head moved; drop closed PRs
+#   pr-graph who <path>...     open PRs touching each path
+#   pr-graph pr <n>            files of PR n
+#   pr-graph groups            PR groups sharing non-hub files (the same-file rule)
+set -u
+REPO=mrveiss/AutoBot-AI; RC="redis-cli --no-auth-warning -n 15"
+HUB='(ratchet_baseline|known_large|_baseline|CHANGELOG|changelog/|\.session|locales/|/generated/|package-lock|core_routers\.py|ENV_VARS\.md|\.secrets\.baseline|^CLAUDE\.md|^\.github/|env_registry|README\.md)'
+case "${1:-}" in
+sync)
+  open=$(gh pr list --repo $REPO --state open --limit 200 --json number,headRefOid -q '.[]|"\(.number) \(.headRefOid)"')
+  for n in $($RC SMEMBERS claude:prs); do grep -q "^$n " <<<"$open" || {
+    for f in $($RC SMEMBERS claude:pr:$n:files); do $RC SREM "claude:file:$f" "$n" >/dev/null; done
+    $RC DEL claude:pr:$n:files claude:pr:$n:head >/dev/null; $RC SREM claude:prs "$n" >/dev/null; echo "- #$n"; }; done
+  while read -r n h; do
+    [ "$($RC GET claude:pr:$n:head)" = "$h" ] && continue
+    for f in $($RC SMEMBERS claude:pr:$n:files); do $RC SREM "claude:file:$f" "$n" >/dev/null; done
+    $RC DEL claude:pr:$n:files >/dev/null
+    gh pr view "$n" --repo $REPO --json files -q '.files[].path' 2>/dev/null | while read -r f; do
+      $RC SADD claude:pr:$n:files "$f" >/dev/null; $RC SADD "claude:file:$f" "$n" >/dev/null; done
+    $RC SET claude:pr:$n:head "$h" >/dev/null; $RC SADD claude:prs "$n" >/dev/null; echo "+ #$n ${h:0:9}"
+  done <<<"$open" ;;
+who) shift; for f in "$@"; do echo "$f: $($RC SMEMBERS "claude:file:$f" | sort -n | tr '\n' ' ')"; done ;;
+pr) $RC SMEMBERS "claude:pr:$2:files" | sort ;;
+groups)
+  for n in $($RC SMEMBERS claude:prs); do for f in $($RC SMEMBERS claude:pr:$n:files); do
+    grep -qE "$HUB" <<<"$f" && continue
+    others=$($RC SMEMBERS "claude:file:$f" | grep -vx "$n" | sort -n | tr '\n' ' ')
+    [ -n "$others" ] && echo "#$n <-> $others| $f"; done; done | sort -u ;;
+*) sed -n '2,7p' "$0" ;;
+esac

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# pr-sha <N> — fetch PR #N's head and print its full SHA. Creates no ref (only FETCH_HEAD).
+[[ "$1" =~ ^[0-9]+$ ]] || { echo "usage: pr-sha <pr-number>" >&2; exit 2; }
+git fetch -q origin "pull/$1/head" && git rev-parse FETCH_HEAD

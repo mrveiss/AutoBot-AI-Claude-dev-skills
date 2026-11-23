@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+"""ix: a private hybrid index for large command output, so a session keeps a digest + pointer in context, not the dump.
+
+Usage:  ix run [-t k=v]... [--inline N] -- <command...>   small output prints as-is; large output is stored and digested
+        ix show <id> [-l A:B] [-g REGEX [-C N]]           read a slice of a stored output (no flag: its digest again)
+        ix find "<query>" [-t k=v]... [-k 5]              hybrid search: keyword (BM25) + local embedding, rank-fused
+        ix ls [-n 10] [-t k=v]...                         newest entries
+        ix gc                                             drop orphan blobs and entries whose blob is gone
+        ix up | ix down                                   start / stop the private instance (every command auto-starts it)
+Store:  a private redis-stack instance on a Unix socket (mode 0700, no TCP port) under $XDG_STATE_HOME/claude-ix.
+        Full outputs are files beside it; Redis holds only the index (digest, tags, pointer, embedding), TTL $IX_TTL_DAYS.
+Embeds: local Ollama ($IX_EMBED_URL, $IX_EMBED_MODEL). Nothing leaves the machine.
+"""
+import argparse, json, os, re, secrets, shlex, shutil, struct, subprocess, sys, time, urllib.error, urllib.request
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import redis
+
+STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "claude-ix"
+SOCK, BLOBS = STATE / "redis.sock", STATE / "blobs"
+IDX, PREFIX = "ix:idx:v4", "ix:doc:"
+INLINE = int(os.environ.get("IX_INLINE_CHARS", "6000"))
+DIGEST_MAX = int(os.environ.get("IX_DIGEST_MAX_CHARS", "3500"))
+SHOW_MAX = int(os.environ.get("IX_SHOW_MAX_CHARS", "8000"))
+TTL_DAYS = int(os.environ.get("IX_TTL_DAYS", "14"))
+EMBED_URL = os.environ.get("IX_EMBED_URL", "http://127.0.0.1:11434/api/embed")
+EMBED_MODEL = os.environ.get("IX_EMBED_MODEL", "nomic-embed-text")
+DIM = int(os.environ.get("IX_EMBED_DIM", "768"))
+TZ = ZoneInfo(os.environ.get("IX_TZ", "Europe/Riga"))
+SIGNAL = re.compile(r"(?i)\b(errors?|fail(ed|ure|ing|s)?|traceback|exception|assert(ion)?(error)?|fatal|panic|denied|timed? ?out|warning|conflict)\b|^(E |FAILED|ERROR)")
+REDACT = [(re.compile(r"(?i)(bearer\s+)\S+"), r"\1[redacted]"),
+          (re.compile(r"\b(?:ghp|gho|ghs|github_pat|sk|dahl)_[A-Za-z0-9_]{16,}"), "[redacted-token]"),
+          (re.compile(r"(?i)\b(password|secret|api[_-]?key|token)(\s*[:=]\s*)\S{6,}"), r"\1\2[redacted]")]
+IDENT = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+|[A-Za-z][a-z0-9]+(?:[A-Z][a-z0-9]*)+")
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
+AUTO_TAGS = ((r"\bgh\s+pr\s+[\w-]+\s+#?(\d+)", "pr"), (r"\bgh\s+issue\s+[\w-]+\s+#?(\d+)", "issue"),
+             (r"\bgh\s+run\s+[\w-]+\s+(\d+)", "run"), (r"--job[ =](\d+)", "job"))
+
+
+def redact(s: str) -> str:
+    for rx, rep in REDACT:
+        s = rx.sub(rep, s)
+    return s
+
+
+def terms(text: str) -> str:
+    """snake_case / CamelCase parts as extra keyword terms: the BM25 tokenizer keeps identifiers whole."""
+    parts = (p.lower() for tok in IDENT.findall(text) for p in re.split(r"_|(?<=[a-z0-9])(?=[A-Z])", tok))
+    return " ".join(dict.fromkeys(p for p in parts if len(p) >= 3 and not p.isdigit()))[:4000]
+
+
+def signal_lines(lines, cap=40, width=200) -> list:
+    return list(dict.fromkeys(redact(x[:width]) for x in lines if SIGNAL.search(x)))[:cap]
+
+
+def _stack_base() -> Path:
+    if os.environ.get("IX_REDIS_STACK"):
+        return Path(os.environ["IX_REDIS_STACK"])
+    exe = shutil.which("redis-stack-server")
+    if not exe:
+        sys.exit("ix: redis-stack-server not found on PATH; set IX_REDIS_STACK to its install dir")
+    return Path(os.path.realpath(exe)).parent.parent
+
+
+def up() -> None:
+    base = _stack_base()
+    BLOBS.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(STATE, 0o700)
+    conf = STATE / "redis.conf"
+    conf.write_text("\n".join([
+        "port 0", f"unixsocket {SOCK}", "unixsocketperm 700", f"dir {STATE}", "daemonize yes",
+        f"pidfile {STATE / 'redis.pid'}", f"logfile {STATE / 'redis.log'}", "appendonly yes", 'save ""',
+        f"maxmemory {os.environ.get('IX_MAXMEMORY', '512mb')}", "maxmemory-policy noeviction",
+        f"loadmodule {base / 'lib/rejson.so'}", f"loadmodule {base / 'lib/redisearch.so'}"]) + "\n", encoding="utf-8")
+    subprocess.run([str(base / "bin/redis-server"), str(conf)], check=True)
+
+
+def _raw() -> redis.Redis:
+    return redis.Redis(unix_socket_path=str(SOCK), decode_responses=True)
+
+
+def client() -> redis.Redis:
+    r = _raw()
+    try:
+        r.ping()
+    except redis.ConnectionError:
+        up()
+        for _ in range(50):
+            try:
+                r.ping()
+                break
+            except redis.ConnectionError:
+                time.sleep(0.1)
+        else:
+            sys.exit(f"ix: private instance did not start; see {STATE / 'redis.log'}")
+    _ensure_index(r)
+    return r
+
+
+# The ledger gets its own instance (2026-09-18). The shared one above also holds
+# hist's hs:* corpus -- durable, no TTL, unbounded -- and under noeviction a full
+# corpus refuses EVERY write, so the ledger (~450 KB of claims, reviews and a
+# MAXLEN-bounded event stream) went down fleet-wide whenever hs:* outgrew the cap.
+# It happened at every ix restart: up() writes 512mb while hist only raises the
+# cap at runtime. Coordination state must not share a memory ceiling with an
+# unbounded corpus. Core commands only -- hashes, scans, TTLs, one stream -- so no
+# modules and no search index. Its own dir keeps AOF, pid and log from colliding.
+LEDGER_DIR = STATE / "ledger"
+LEDGER_SOCK = LEDGER_DIR / "redis.sock"
+
+
+def ledger_up() -> None:
+    base = _stack_base()
+    LEDGER_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(LEDGER_DIR, 0o700)
+    conf = LEDGER_DIR / "redis.conf"
+    conf.write_text("\n".join([
+        "port 0", f"unixsocket {LEDGER_SOCK}", "unixsocketperm 700", f"dir {LEDGER_DIR}", "daemonize yes",
+        f"pidfile {LEDGER_DIR / 'redis.pid'}", f"logfile {LEDGER_DIR / 'redis.log'}", "appendonly yes", 'save ""',
+        f"maxmemory {os.environ.get('IX_LEDGER_MAXMEMORY', '256mb')}", "maxmemory-policy noeviction"]) + "\n",
+        encoding="utf-8")
+    subprocess.run([str(base / "bin/redis-server"), str(conf)], check=True)
+
+
+def ledger_client() -> redis.Redis:
+    r = redis.Redis(unix_socket_path=str(LEDGER_SOCK), decode_responses=True)
+    try:
+        r.ping()
+    except redis.ConnectionError:
+        ledger_up()
+        for _ in range(50):
+            try:
+                r.ping()
+                break
+            except redis.ConnectionError:
+                time.sleep(0.1)
+        else:
+            sys.exit(f"ix: ledger instance did not start; see {LEDGER_DIR / 'redis.log'}")
+    return r
+
+
+def _ensure_index(r: redis.Redis) -> None:
+    existing = r.execute_command("FT._LIST")
+    if IDX in existing:
+        return
+    for old in (x for x in existing if x.startswith("ix:idx")):
+        r.execute_command("FT.DROPINDEX", old)  # keeps the documents; the new schema re-indexes them
+    r.execute_command("FT.CREATE", IDX, "ON", "JSON", "PREFIX", "1", PREFIX, "SCHEMA",
+                      "$.cmd", "AS", "cmd", "TEXT", "WEIGHT", "2", "$.digest", "AS", "digest", "TEXT",
+                      "$.signals", "AS", "signals", "TEXT", "WEIGHT", "3", "$.terms", "AS", "terms", "TEXT",
+                      "$.tags[*]", "AS", "tags", "TAG", "$.session", "AS", "session", "TAG",
+                      "$.exit", "AS", "exit", "NUMERIC", "$.ts", "AS", "ts", "NUMERIC", "SORTABLE",
+                      "$.vecs[*]", "AS", "vec", "VECTOR", "FLAT", "6", "TYPE", "FLOAT32", "DIM", str(DIM),
+                      "DISTANCE_METRIC", "COSINE")
+
+
+def embed(text: str, kind: str):
+    """A local embedding, or None when the embedder is unreachable; callers report the skipped half."""
+    size = 6000
+    for attempt in (1, 2, 3, 4):
+        body = json.dumps({"model": EMBED_MODEL, "input": [f"{kind}: {text[:size]}"]}).encode()
+        req = urllib.request.Request(EMBED_URL, data=body, headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                vec = json.load(resp)["embeddings"][0]
+            return vec if len(vec) == DIM else None
+        except urllib.error.HTTPError as e:
+            why = f"HTTP {e.code}: {e.read(200).decode('utf-8', 'replace')}"
+        except (OSError, ValueError, KeyError, IndexError) as e:
+            why = f"{type(e).__name__}: {e}"
+        if "context length" in why:
+            size //= 2  # dense log text is token-heavy; the model's context is in tokens, not chars
+            continue
+        print(f"ix: embedding attempt {attempt} failed ({why})", file=sys.stderr)
+        time.sleep(1)
+    return None
+
+
+def vectors(cmd: str, dg: str, sig: list) -> list:
+    """One vector for the output as a whole, one for its error lines: a fetched CI log exits 0 yet is about its failures."""
+    texts = [f"{cmd}\n{dg}"] + (["\n".join([cmd, *sig])] if sig else [])
+    return [v for v in (embed(t, "search_document") for t in texts) if v]
+
+
+def _digest_once(lines, head, tail, signals, width=200):
+    cut = lambda s: redact(s[:width]) + ("…" if len(s) > width else "")
+    n = len(lines)
+    if n <= head + tail:
+        return "\n".join(cut(line) for line in lines)
+    mid = list(dict.fromkeys(cut(line) for line in lines[head:n - tail] if SIGNAL.search(line)))
+    note = f"… {n - head - tail} lines omitted, {len(mid)} signal lines among them" + (f" (first {signals})" if len(mid) > signals else "") + " …"
+    body = [cut(x) for x in lines[:head]] + [note] + mid[:signals] + (["… tail …"] if mid else []) + [cut(x) for x in lines[n - tail:]]
+    return "\n".join(body)
+
+
+def digest(lines) -> str:
+    for head, tail, signals in ((12, 20, 30), (8, 12, 15), (5, 8, 8), (3, 5, 4)):
+        d = _digest_once(lines, head, tail, signals)
+        if len(d) <= DIGEST_MAX:
+            return d
+    return d[:DIGEST_MAX] + "\n… digest truncated …"
+
+
+def _when(ts: float) -> str:
+    return datetime.fromtimestamp(ts, TZ).strftime("%m-%d %H:%M")
+
+
+def header(doc: dict) -> str:
+    return f"ix:{doc['id']} · {doc['lines']} lines · {doc['chars']} chars · exit {doc['exit']} · {_when(doc['ts'])} Riga"
+
+
+def auto_tags(shown: str) -> list:
+    tags = ["tool:" + os.path.basename(shown.split()[0]) if shown.split() else "tool:?"]
+    tags += [f"{k}:{m.group(1)}" for rx, k in AUTO_TAGS for m in re.finditer(rx, shown)]
+    top = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    if top.returncode == 0:
+        tags.append("repo:" + os.path.basename(top.stdout.strip()))
+    return tags
+
+
+def store(r, shown: str, out: str, rc: int, tags: list) -> dict:
+    rid = f"{int(time.time()):x}{secrets.token_hex(2)}"
+    path = BLOBS / f"{rid}.log"
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as fh:
+        fh.write(out)
+    lines = out.splitlines()
+    sig = signal_lines(lines)
+    doc = {"id": rid, "cmd": redact(shown[:2000]), "cwd": os.getcwd(), "session": os.environ.get("CLAUDE_CODE_SESSION_ID", "none"),
+           "exit": rc, "ts": time.time(), "lines": len(lines), "chars": len(out), "path": str(path),
+           "digest": digest(lines), "tags": list(dict.fromkeys(tags))}
+    doc["signals"] = "\n".join(sig)
+    doc["terms"] = terms("\n".join([doc["cmd"], *sig, doc["digest"]]))
+    vecs = vectors(doc["cmd"], doc["digest"], sig)
+    if vecs:
+        doc["vecs"] = vecs
+    r.json().set(PREFIX + rid, "$", doc)
+    r.expire(PREFIX + rid, TTL_DAYS * 86400)
+    return doc
+
+
+def cmd_run(a) -> int:
+    argv = a.command[1:] if a.command[:1] == ["--"] else a.command
+    if not argv:
+        sys.exit("ix run: nothing to run")
+    shown = argv[0] if len(argv) == 1 else shlex.join(argv)
+    proc = subprocess.run(["bash", "-c", argv[0]] if len(argv) == 1 else argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    rc = proc.returncode if proc.returncode >= 0 else 128 - proc.returncode
+    out = ANSI.sub("", proc.stdout.decode("utf-8", "replace"))
+    if len(out) <= a.inline:
+        sys.stdout.write(out)
+        return rc
+    doc = store(client(), shown, out, rc, auto_tags(shown) + [t.replace("=", ":", 1) for t in a.tag])
+    print(header(doc) + "\n" + doc["digest"] + f"\n[full output: ix show {doc['id']} -l A:B | -g REGEX]")
+    return rc
+
+
+def cmd_show(a) -> int:
+    doc = client().json().get(PREFIX + a.id)
+    if not doc:
+        sys.exit(f"ix: no entry {a.id} (expired, collected, or never stored)")
+    if not (a.lines or a.grep):
+        print(header(doc) + "\n" + doc["digest"])
+        return 0
+    lines = Path(doc["path"]).read_text(encoding="utf-8", errors="replace").splitlines()
+    if a.lines:
+        s, _, e = a.lines.partition(":")
+        keep = range(max(1, int(s or 1)), min(len(lines), int(e or len(lines))) + 1)
+    else:
+        rx, hit = re.compile(a.grep), set()
+        for i, line in enumerate(lines, 1):
+            if rx.search(line):
+                hit.update(range(max(1, i - a.context), min(len(lines), i + a.context) + 1))
+        keep = sorted(hit)
+    parts, prev = [], None
+    for i in keep:
+        if prev is not None and i != prev + 1:
+            parts.append("--")
+        parts.append(f"{i}: {redact(lines[i - 1])}")
+        prev = i
+    text = "\n".join(parts)
+    print((text[:SHOW_MAX] + f"\n… truncated at {SHOW_MAX} chars; narrow with -l or -g") if len(text) > SHOW_MAX else (text or "(no matching lines)"))
+    return 0
+
+
+def _esc(v: str) -> str:
+    return re.sub(r"([^A-Za-z0-9_])", r"\\\1", v)
+
+
+def _filter(tags) -> str:
+    return " ".join("@tags:{%s}" % _esc(t.replace("=", ":", 1)) for t in tags)
+
+
+def _keys(res) -> list:
+    return [x for x in res[1:] if isinstance(x, str) and x.startswith(PREFIX)]
+
+
+def _line(doc: dict) -> str:
+    sig = next((x for x in doc["digest"].splitlines() if SIGNAL.search(x)), doc["digest"].splitlines()[0] if doc["digest"] else "")
+    return f"ix:{doc['id']}  {_when(doc['ts'])}  exit {doc['exit']}  {doc['lines']}L  {doc['cmd'][:90]}\n    {sig[:160]}"
+
+
+def cmd_find(a) -> int:
+    r, filt, n = client(), _filter(a.tag), a.k * 3
+    words = list(dict.fromkeys(re.findall(r"\w+", a.query) + terms(a.query).split()))
+    kw = _keys(r.execute_command("FT.SEARCH", IDX, f"({'|'.join(words)}) {filt}".strip(), "NOCONTENT", "SCORER", "BM25", "LIMIT", "0", str(n), "DIALECT", "2")) if words else []
+    vec, vk = embed(a.query, "search_query"), []
+    if vec:
+        res = r.execute_command("FT.SEARCH", IDX, f"({filt})=>[KNN {n} @vec $B AS dist]" if filt else f"*=>[KNN {n} @vec $B AS dist]",
+                                "PARAMS", "2", "B", struct.pack(f"{DIM}f", *vec), "RETURN", "1", "dist", "LIMIT", "0", str(n), "DIALECT", "2")
+        pairs = [(res[i], float(dict(zip(res[i + 1][::2], res[i + 1][1::2]))["dist"])) for i in range(1, len(res), 2)]
+        vk = [k for k, _ in sorted(pairs, key=lambda p: p[1])]
+    score = defaultdict(float)
+    for ranked in (kw, vk):
+        for rank, key in enumerate(ranked):
+            score[key] += 1.0 / (60 + rank)
+    top = sorted(score, key=score.get, reverse=True)[:a.k]
+    for doc in (r.json().mget(top, "$") if top else []):
+        if doc:
+            print(_line(doc[0]))
+    print(f"{'no entries matched' if not top else f'{len(top)} shown'} · keyword half: {len(kw)} hits · vector half: {'skipped, embedder unreachable' if vec is None else f'{len(vk)} hits'}")
+    return 0
+
+
+def cmd_ls(a) -> int:
+    r = client()
+    keys = _keys(r.execute_command("FT.SEARCH", IDX, _filter(a.tag) or "*", "NOCONTENT", "SORTBY", "ts", "DESC", "LIMIT", "0", str(a.n), "DIALECT", "2"))
+    for doc in (r.json().mget(keys, "$") if keys else []):
+        if doc:
+            print(_line(doc[0]))
+    print(f"{len(keys)} shown")
+    return 0
+
+
+def cmd_gc(_a) -> int:
+    r, blobs, docs = client(), 0, 0
+    for p in BLOBS.glob("*.log"):
+        if not r.exists(PREFIX + p.stem):
+            p.unlink()
+            blobs += 1
+    for key in r.scan_iter(PREFIX + "*"):
+        if not Path(r.json().get(key, "$.path")[0]).exists():
+            r.delete(key)
+            docs += 1
+    filled = 0
+    for key in r.scan_iter(PREFIX + "*"):
+        doc = r.json().get(key)
+        if doc and "vecs" not in doc:
+            vecs = vectors(doc["cmd"], doc["digest"], doc.get("signals", "").splitlines())
+            if vecs:
+                r.json().set(key, "$.vecs", vecs)
+                r.json().delete(key, "$.vec")
+                filled += 1
+    print(f"ix gc: {blobs} orphan blobs removed, {docs} entries without a blob removed, {filled} missing embeddings filled")
+    return 0
+
+
+def cmd_down(_a) -> int:
+    try:
+        _raw().shutdown()
+    except redis.ConnectionError:
+        pass
+    print("ix: private instance stopped")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="ix", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("run"); p.add_argument("-t", "--tag", action="append", default=[]); p.add_argument("--inline", type=int, default=INLINE)
+    p.add_argument("command", nargs=argparse.REMAINDER); p.set_defaults(fn=cmd_run)
+    p = sub.add_parser("show"); p.add_argument("id"); p.add_argument("-l", "--lines"); p.add_argument("-g", "--grep")
+    p.add_argument("-C", "--context", type=int, default=2); p.set_defaults(fn=cmd_show)
+    p = sub.add_parser("find"); p.add_argument("query"); p.add_argument("-t", "--tag", action="append", default=[])
+    p.add_argument("-k", type=int, default=5); p.set_defaults(fn=cmd_find)
+    p = sub.add_parser("ls"); p.add_argument("-n", type=int, default=10); p.add_argument("-t", "--tag", action="append", default=[]); p.set_defaults(fn=cmd_ls)
+    sub.add_parser("gc").set_defaults(fn=cmd_gc)
+    sub.add_parser("up").set_defaults(fn=lambda _a: (client(), print("ix: private instance up"))[0] and 0)
+    sub.add_parser("down").set_defaults(fn=cmd_down)
+    a = ap.parse_args()
+    return a.fn(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
