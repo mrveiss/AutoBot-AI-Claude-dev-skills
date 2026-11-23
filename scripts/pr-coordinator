@@ -15,7 +15,7 @@ No active trainmaster is assumed; when one is active (ledger hold `trainmaster`)
 Prints the queue + an ATTENTION block (JSON lines) the coordinator session relays to owners.
 State: ~/.claude/state/pr-coordinator/ (notified keys, queue.md).
 """
-import datetime, importlib.machinery, importlib.util, json, os, re, subprocess, sys, time
+import datetime, importlib.machinery, importlib.util, json, os, re, subprocess, sys, tempfile, time
 from pathlib import Path
 
 REPO, WIDTH, LAST = "mrveiss/AutoBot-AI", 2, {19456}
@@ -52,6 +52,13 @@ RECHECK = json.loads(_rc.read_text(encoding="utf-8")) if _rc.exists() else {}
 # (e.g. "does this move a ratchet baseline"). It may hold a slot but still never lands until approved.
 _sr = Path.home() / ".claude/state/pr-coordinator/signal-run.json"
 SIGNAL_RUN = json.loads(_sr.read_text(encoding="utf-8")) if _sr.exists() else {}
+PREBOARD_WORKFLOW = "dispatch-preboard-guards.yml"   # AutoBot-AI's dispatch-only guard lane (its header documents the artifact)
+PREBOARD_ARTIFACT = "preboard-guards-result"
+PREBOARD_OK = {"green", "green_with_skips"}           # `overall` values that let the full suite start
+PREBOARD_PASS = {"success", "green", "green_with_skips"}   # check statuses not listed as failing in a guards-red page
+PREBOARD_SLOT_WAIT_S = int(os.environ.get("PR_COORDINATOR_PREBOARD_SLOT_WAIT_S", "1200"))   # slow lane: release the slot
+PREBOARD_NO_RUN_S = int(os.environ.get("PR_COORDINATOR_PREBOARD_NO_RUN_S", "600"))   # dispatched, no run ever appeared
+PREBOARD_LIST_CAP = 10                                # failing items named in one page (count capped, text not)
 ACTIVE = {"QUEUED", "IN_PROGRESS", "WAITING", "PENDING", "REQUESTED"}
 
 Q = """query($c:String){repository(owner:"mrveiss",name:"AutoBot-AI"){pullRequests(states:OPEN,first:100,after:$c){
@@ -276,6 +283,108 @@ def cancel(run_id, branch, n, reason, log):
         sh(str(S / "ci-cancel"), run_id, ME, reason, branch, str(n))
 
 
+def preboard_failures(res):
+    """Names of what failed in a preboard result.json: checks whose status is not a pass, the guard `problems`,
+    and the failed tests. The guards check's own status vocabulary is not documented, so only known passes are dropped."""
+    checks = res.get("checks") if isinstance(res.get("checks"), dict) else {}
+    out = [f"{k}={v.get('status')}" for k, v in checks.items() if isinstance(v, dict) and v.get("status") not in PREBOARD_PASS]
+    guards = checks.get("guards") if isinstance(checks.get("guards"), dict) else {}
+    out += [str(x) for x in guards.get("problems") or []]
+    out += [str(t.get("nodeid")) for t in res.get("failed_tests") or [] if isinstance(t, dict)]
+    return (out or [f"overall={res.get('overall')}"])[:PREBOARD_LIST_CAP]
+
+
+def read_preboard(run_id, head):
+    """(state, detail) from a completed lane run's artifact; any failure to read it is "unreadable" (fail closed).
+    The base_sha may be stale: the full suite re-checks on the merge ref, so it is deliberately not compared."""
+    with tempfile.TemporaryDirectory() as d:
+        sh("gh", "run", "download", run_id, "--repo", REPO, "-n", PREBOARD_ARTIFACT, "-D", d)
+        try:
+            res = json.loads((Path(d) / "result.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            return "unreadable", f"run {run_id}: {PREBOARD_ARTIFACT} not readable ({type(exc).__name__})"
+    if not isinstance(res, dict) or not isinstance(res.get("overall"), str):
+        return "unreadable", f"run {run_id}: result.json has no `overall`"
+    if res.get("sha") != head:
+        return "unreadable", f"run {run_id}: result is for another head ({str(res.get('sha'))[:9]})"
+    return ("green", "") if res["overall"] in PREBOARD_OK else ("red", preboard_failures(res))
+
+
+def preboard_state(head):
+    """Newest lane run for exactly this head: none | pending | green | red | unreadable, plus a detail."""
+    out = sh("gh", "api", f"repos/{REPO}/actions/workflows/{PREBOARD_WORKFLOW}/runs?head_sha={head}&event=workflow_dispatch&per_page=5",
+             "--jq", '.workflow_runs[]|[.id, .status, (.conclusion // "")]|@tsv')
+    if not out:
+        return "none", ""
+    run_id, status, conclusion = (out.splitlines()[0].split("\t") + ["", ""])[:3]
+    if status != "completed":
+        return "pending", ""
+    if conclusion == "cancelled":
+        return "unreadable", f"run {run_id} was cancelled"
+    return read_preboard(run_id, head)
+
+
+def preboard_page(n, p, seen, attention, key, checks):
+    """One guards-red page per (PR, head, key); the seen key doubles as the "red at this head" marker."""
+    k = f"{n}:{key}:{p['headRefOid']}"
+    if k not in seen:
+        seen[k] = int(time.time())
+        attention.append({"pr": n, "kind": "guards-red", "owner": p["owner"], "owner_state": p["alive"],
+                          "branch": p["headRefName"], "head": p["headRefOid"][:9], "title": p["title"][:70], "checks": checks})
+
+
+def preboard_wait(n, p, state, seen, log):
+    """No green result yet: dispatch the lane once per (PR, head), then wait. A lane still not done after
+    PREBOARD_SLOT_WAIT_S parks the PR off-slot (why-chain in main), undone by preboard_unpark. Returns the
+    (state, detail) to act on: a lane that never produced a run within PREBOARD_NO_RUN_S is unreadable."""
+    head, k = p["headRefOid"], f"{n}:preboard-dispatch:{p['headRefOid']}"
+    if k not in seen:
+        seen[k] = int(time.time())
+        if state == "pending":                    # a run for this head already exists (dispatched by hand): adopt it
+            return "pending", ""
+        log.append(f"#{n} preboard guards: no result at this head, dispatching the lane")
+        if not DRY:
+            sh("gh", "workflow", "run", PREBOARD_WORKFLOW, "--repo", REPO, "--ref", p["headRefName"], "-f", "base=main")
+        return "pending", ""
+    age = time.time() - seen[k]
+    if state == "none" and age > PREBOARD_NO_RUN_S:
+        return "unreadable", f"lane dispatched {int(age)}s ago but no run for {head[:9]} appeared"
+    if age > PREBOARD_SLOT_WAIT_S:
+        seen.setdefault(f"{n}:preboard-parked:{head}", int(time.time()))
+        log.append(f"#{n} preboard lane slow ({int(age)}s): slot released until it completes")
+    return "pending", ""
+
+
+def preboard_clear(n, p, seen, log, attention):
+    """True when the full suite may start at this head: a completed lane result is green/green_with_skips.
+    Anything else (pending, red, unreadable, no result) is False: fail closed, with the reason logged."""
+    head = p["headRefOid"]
+    if f"{n}:guards-red:{head}" in seen:
+        return False
+    state, detail = preboard_state(head)
+    if state == "green":
+        return True
+    if state in ("none", "pending"):
+        state, detail = preboard_wait(n, p, state, seen, log)
+    if state == "red":
+        log.append(f"#{n} preboard guards RED at {head[:9]}: {'; '.join(detail)}")
+        preboard_page(n, p, seen, attention, "guards-red", detail)
+    elif state == "unreadable":
+        log.append(f"#{n} preboard guards unreadable, not starting the suite: {detail}")
+        preboard_page(n, p, seen, attention, "guards-unreadable", [detail])
+    return False
+
+
+def preboard_unpark(prs, seen, log):
+    """A parked PR (lane slow) is unparked once its lane run is no longer pending, so it can take a slot and
+    preboard_clear acts on the result (start, page red, or page unreadable)."""
+    for p in prs:
+        k = f"{p['number']}:preboard-parked:{p['headRefOid']}"
+        if k in seen and preboard_state(p["headRefOid"])[0] != "pending":
+            del seen[k]
+            log.append(f"#{p['number']} preboard lane finished: eligible for a slot again")
+
+
 def start_ci_or_report(n, p, gate, seen, log, attention):
     """A `[skip ci]` sync head never gets its required checks: ask the sync to start CI once per head (#21577)."""
     parts = gate.split()
@@ -284,6 +393,8 @@ def start_ci_or_report(n, p, gate, seen, log, attention):
     queued = sh("gh", "api", f"repos/{REPO}/actions/runs?head_sha={p['headRefOid']}&per_page=100",
                 "--jq", '[.workflow_runs[]|select(.status!="completed")]|length')
     if queued not in ("", "0"):                   # an Actions run is live (queued or running): CI is underway
+        return
+    if not preboard_clear(n, p, seen, log, attention):   # guards before the suite (#49)
         return
     k = f"{n}:start-ci:{p['headRefOid']}"
     msg = sh("gh", "api", f"repos/{REPO}/commits/{p['headRefOid']}", "--jq", ".commit.message")
@@ -580,13 +691,13 @@ def _update_step(n, p, blocked, log):
     return True
 
 
-def _recheck_step(n, p, runs_here, blocked, seen, log):
+def _recheck_step(n, p, runs_here, blocked, seen, log, attention):
     if not (RECHECK.get(str(n)) == p["headRefOid"][:9] and any(r.endswith("\tfailure") for r in runs_here)):
         return False
     # A rerun replays the ORIGINAL event payload (labels/draft as they were), so a metadata-only fix never
     # clears by rerun. A fresh head does: ask the sync for its empty start-CI commit, once per head.
     k = f"{n}:recheck-start-ci:{p['headRefOid']}"
-    if k not in seen and not blocked:
+    if k not in seen and not blocked and preboard_clear(n, p, seen, log, attention):
         seen[k] = int(time.time())
         log.append(f"start-ci #{n} (stale red at a recheck head: fresh event needed)")
         if not DRY:
@@ -601,11 +712,13 @@ def slot_ci_phase(n, p, blocked, seen, log, attention):
         return True
     runs_here = sh("gh", "api", f"repos/{REPO}/actions/runs?head_sha={p['headRefOid']}&per_page=100",
                    "--jq", '.workflow_runs[]|[.id, .status, (.conclusion // "")]|@tsv').splitlines()
-    if _recheck_step(n, p, runs_here, blocked, seen, log):
+    if _recheck_step(n, p, runs_here, blocked, seen, log, attention):
         return True
     cancelled = [r.split("\t")[0] for r in runs_here if r.endswith("\tcancelled")]
     live = any(r.split("\t")[1] != "completed" for r in runs_here if r)
     if cancelled and not live and not blocked:    # judge by Actions runs only: outside apps (semgrep) are not CI
+        if not preboard_clear(n, p, seen, log, attention):
+            return True
         log.append(f"rerun {len(cancelled)} cancelled run(s) #{n}")
         if not DRY:
             for rid in cancelled:
@@ -676,6 +789,7 @@ def main():
     pr_claims = {int(k.rsplit(":", 1)[1]): r.hget(k, "owner") or "?" for k in r.scan_iter("lg:claim:pr:*")}
     log.extend(stale_pr_claims(pr_claims, open_now))
 
+    preboard_unpark(prs, seen, log)
     for p in prs:
         n, red, active, total = p["number"], *ci_state(p)
         p["red"], p["active"], p["total"] = red, active, total
@@ -706,6 +820,10 @@ def main():
             p["why"] = "red"
         elif f"{n}:red:{p['headRefOid']}" in seen:   # paged red at THIS head; a later cancel must not hide it
             p["why"] = "red at this head (owner paged); waits for a new head"
+        elif f"{n}:guards-red:{p['headRefOid']}" in seen:
+            p["why"] = "preboard guards red at this head (owner paged); waits for a new head"
+        elif f"{n}:preboard-parked:{p['headRefOid']}" in seen:
+            p["why"] = "preboard lane still running: off-slot until it completes"
         else:
             p["why"] = ""
             eligible.append(n)
