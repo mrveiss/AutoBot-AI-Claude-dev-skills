@@ -30,6 +30,18 @@ class Table(unittest.TestCase):
         t = "|ac|  PRECONDITION |postcondition|Establishing   Lines|argument|REVIEWER|\n|:--|:-:|--:|---|---|---|\n" + ROW
         self.assertEqual(PC.proof_table_reason(body(t, "##  requirement proofs")), "")
 
+    def test_annotated_header_passes(self):
+        t = HEAD.replace("Establishing lines", "Establishing lines (file:line)").replace("Argument", "Argument (why EVERY input satisfies it)")
+        self.assertEqual(PC.proof_table_reason(body(t + ROW)), "")
+
+    def test_annotated_wrong_base_name_fails(self):
+        t = HEAD.replace("Establishing lines", "Lines (file:line)")
+        self.assertIn("header", PC.proof_table_reason(body(t + ROW)))
+
+    def test_annotation_on_every_column_passes(self):
+        t = "| AC (id) | Precondition (before) | Postcondition (after) | Establishing lines (file:line) | Argument (why) | Reviewer (who) |\n|---|---|---|---|---|---|\n"
+        self.assertEqual(PC.proof_table_reason(body(t + ROW)), "")
+
     def test_na_row_accepted(self):
         self.assertEqual(PC.proof_table_reason(body(HEAD + "| — | n/a | n/a | f.py:3 | pure rename | alice |")), "")
         self.assertEqual(PC.proof_table_reason(body(HEAD + "| - | n/a | n/a | f.py:3 | pure rename | alice |")), "")
