@@ -109,7 +109,6 @@ plugins/autobot-dev-skills/
   skills/<meta>/references/<workflow>.md   full workflow, read on demand
   agents/<role>.md                         model-pinned role agent (auto-discovered)
 scripts/                                   the shared dev tools (ledger, pr-coordinator, ci-gate, ...) -- ONE copy
-scripts/train/                             merge-train tools (ship, next_train, land_when_green, ...)
 scripts/measure/                           re-runnable measurement tools
 scripts/check-no-forks                     fails on a .bak* file or a second copy of a tool
 ```
@@ -131,7 +130,7 @@ run from it). Edit a tool in a worktree of this repo and open a PR; never in `~/
 (that edits the clone's checkout in place) and never leave a `.bak-*` copy -- git is the history.
 
 Tools read their paths from the environment: `$HOME`, the git top level, or an override
-(`AUTOBOT_REPO`, `TRAIN_W`, `TRAIN_WORK`, `TRAIN_STATE`, `SYNC_W`, `CLAUDE_CONFIG_DIR`).
+(`AUTOBOT_REPO`, `CLAUDE_CONFIG_DIR`).
 
 `scripts/check-no-forks` fails if a `*.bak*` file, or a second file sharing a `scripts/` tool's
 name, exists under `~/.claude/scripts` or `~/.claude/state` (not `state/4e-artifacts-*`,

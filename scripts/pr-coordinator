@@ -202,13 +202,19 @@ def _ghost_cutoff():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - GHOST_AGE_H * 3600))
 
 
+# Post-merge bookkeeping that runs when a PR closes and carries no test load: the PR is already gone from the
+# queue, so rule 2 would cancel it and the landing note would be lost (ci-enforce.sh, 2026-11-06). "train-content-gate"
+# was exempted there too but only matters for merge trains, which are retired, so it is not ported.
+EXEMPT_WORKFLOWS = {"Issue landing notes"}
+
+
 def actions_runs():
     runs = []
     for status in ("in_progress", "queued", "waiting", "pending"):
         raw = sh("gh", "api", f"repos/{REPO}/actions/runs?status={status}&per_page=100",
-                 "--jq", f'.workflow_runs[]|select(.created_at > "{_ghost_cutoff()}")|[.id,.head_branch,.head_sha,.event]|@tsv')
+                 "--jq", f'.workflow_runs[]|select(.created_at > "{_ghost_cutoff()}")|[.id,.head_branch,.head_sha,.event,.name]|@tsv')
         runs += [line.split("\t") for line in raw.splitlines() if line]
-    return list({r[0]: r for r in runs}.values())   # a run can appear under two status filters
+    return [r[:4] for r in {r[0]: r for r in runs}.values() if (r[4:5] or [""])[0] not in EXEMPT_WORKFLOWS]   # a run can appear under two status filters
 
 
 def owner_of(r, lg, pr):
