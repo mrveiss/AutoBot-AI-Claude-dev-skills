@@ -15,7 +15,7 @@ No active trainmaster is assumed; when one is active (ledger hold `trainmaster`)
 Prints the queue + an ATTENTION block (JSON lines) the coordinator session relays to owners.
 State: ~/.claude/state/pr-coordinator/ (notified keys, queue.md).
 """
-import datetime, importlib.machinery, importlib.util, json, os, re, subprocess, sys, tempfile, time
+import datetime, fcntl, importlib.machinery, importlib.util, json, os, re, subprocess, sys, tempfile, time
 from pathlib import Path
 
 REPO, WIDTH, LAST = "mrveiss/AutoBot-AI", 2, {19456}
@@ -25,6 +25,14 @@ PROTECTED = {"main", "release", "master"}   # a promotion PR's head is main: its
 S = Path.home() / ".claude/scripts"
 STATE = Path.home() / ".claude/state/pr-coordinator"
 DRY = "--dry" in sys.argv
+# Every live pass takes this lock itself (#57). It must NOT be the loop's `flock -n /tmp/pr-coordinator.lock` file:
+# flock(1) holds that one on its own open file description, so a second flock() on the same path would always block.
+LOCK_PATH = os.environ.get("PR_COORDINATOR_PASS_LOCK", "/tmp/pr-coordinator.pass.lock")
+USAGE = """usage: pr-coordinator [--dry | --proof-check PR | -h | --help]
+  (no args)           one live coordinator pass (takes the pass lock)
+  --dry               read-only pass, no lock
+  --proof-check PR    validate PR's requirement-proof table, no lock
+  -h, --help          this text"""
 # Owner 2026-11-23: a head pushed after this instant needs a valid requirement-proof table in the PR body before CI starts.
 PROOF_CUTOFF = os.environ.get("PR_COORDINATOR_PROOF_CUTOFF", "2026-11-23T11:36:00Z")
 try:
@@ -988,12 +996,44 @@ def degraded_tick(err):
         print("ACTION", line)
 
 
-if __name__ == "__main__":
-    if len(sys.argv) == 3 and sys.argv[1] == "--proof-check":
-        raise SystemExit(proof_check_cli(sys.argv[2]))
+def take_pass_lock():
+    """Exclusive non-blocking flock on LOCK_PATH (distinct from the loop's lock file). Returns the open handle, or None if held."""
+    fh = open(LOCK_PATH, "a", encoding="utf-8")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    return fh
+
+
+def run_cli(argv):
+    """Strict argv handling: only the known flags run anything. Returns an exit code, or None after a live pass."""
+    if argv in (["-h"], ["--help"]):
+        print(USAGE)
+        return 0
+    if len(argv) == 2 and argv[0] == "--proof-check":
+        return proof_check_cli(argv[1])
+    if argv not in ([], ["--dry"]):
+        print(f"pr-coordinator: unknown arguments {argv}\n{USAGE}", file=sys.stdout)
+        return 2
+    lock = None if argv == ["--dry"] else take_pass_lock()
+    if argv != ["--dry"] and lock is None:
+        print("another coordinator pass is running")
+        return 0
     try:
         main()
     except SystemExit as exc:
         if "rate limit" not in str(exc):
             raise
         degraded_tick(str(exc))
+    finally:
+        if lock:
+            lock.close()
+    return None
+
+
+if __name__ == "__main__":
+    code = run_cli(sys.argv[1:])
+    if code is not None:
+        raise SystemExit(code)
