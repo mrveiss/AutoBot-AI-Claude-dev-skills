@@ -1,5 +1,5 @@
 """CLI argument handling and the pass self-lock of scripts/pr-coordinator (#57)."""
-import contextlib, fcntl, importlib.machinery, importlib.util, io, os, tempfile, unittest
+import contextlib, fcntl, importlib.machinery, importlib.util, io, os, shutil, subprocess, sys, tempfile, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -70,6 +70,28 @@ class Cli(unittest.TestCase):
             with mock.patch.object(PC, "proof_check_cli", return_value=0) as pc:
                 self.assertEqual(run(["--proof-check", "7"])[0], 0)
                 pc.assert_called_once_with("7")
+
+
+DRIVER = """
+import importlib.machinery, importlib.util, sys
+from unittest import mock
+l = importlib.machinery.SourceFileLoader("pc", sys.argv[1])
+m = importlib.util.module_from_spec(importlib.util.spec_from_loader("pc", l))
+l.exec_module(m)
+with mock.patch.object(m, "main", lambda: print("PASS-RAN")):
+    print("rc", m.run_cli([]))
+"""
+
+
+@unittest.skipUnless(shutil.which("flock"), "flock(1) not installed")
+class UnderLoopFlock(unittest.TestCase):
+    def test_pass_runs_under_the_loops_outer_flock(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(os.environ, PR_COORDINATOR_PASS_LOCK=os.path.join(d, "pass.lock"))
+            r = subprocess.run(["flock", "-n", os.path.join(d, "loop.lock"), sys.executable, "-c", DRIVER, PATH],
+                               env=env, capture_output=True, text=True, timeout=60)
+        self.assertIn("PASS-RAN", r.stdout, r.stdout + r.stderr)
+        self.assertNotIn("another coordinator pass", r.stdout)
 
 
 if __name__ == "__main__":

@@ -25,8 +25,9 @@ PROTECTED = {"main", "release", "master"}   # a promotion PR's head is main: its
 S = Path.home() / ".claude/scripts"
 STATE = Path.home() / ".claude/state/pr-coordinator"
 DRY = "--dry" in sys.argv
-# The coordinator loop wraps a pass in `flock -n <this path>`; a live pass takes the same lock itself (#57).
-LOCK_PATH = os.environ.get("PR_COORDINATOR_LOCK", "/tmp/pr-coordinator.lock")
+# Every live pass takes this lock itself (#57). It must NOT be the loop's `flock -n /tmp/pr-coordinator.lock` file:
+# flock(1) holds that one on its own open file description, so a second flock() on the same path would always block.
+LOCK_PATH = os.environ.get("PR_COORDINATOR_PASS_LOCK", "/tmp/pr-coordinator.pass.lock")
 USAGE = """usage: pr-coordinator [--dry | --proof-check PR | -h | --help]
   (no args)           one live coordinator pass (takes the pass lock)
   --dry               read-only pass, no lock
@@ -996,7 +997,7 @@ def degraded_tick(err):
 
 
 def take_pass_lock():
-    """Exclusive non-blocking flock on LOCK_PATH (same file as the loop's `flock -n`). Returns the open handle, or None if held."""
+    """Exclusive non-blocking flock on LOCK_PATH (distinct from the loop's lock file). Returns the open handle, or None if held."""
     fh = open(LOCK_PATH, "a", encoding="utf-8")
     try:
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
