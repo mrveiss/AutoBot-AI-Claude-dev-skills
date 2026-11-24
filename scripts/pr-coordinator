@@ -83,7 +83,7 @@ pageInfo{hasNextPage endCursor} nodes{number title createdAt updatedAt isDraft b
 THREADS = """reviewThreads(first:60){nodes{id isResolved comments(first:1){nodes{author{login}}}
   last:comments(last:1){nodes{author{login} createdAt url}}}}"""
 CHECKS = """commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{
-  ... on CheckRun{name status conclusion startedAt databaseId} ... on StatusContext{context state createdAt}}}}}}}"""
+  ... on CheckRun{name status conclusion startedAt databaseId checkSuite{workflowRun{workflow{name}}}} ... on StatusContext{context state createdAt}}}}}}}"""
 DETAIL_CHUNK = 8   # GraphQL cost scales with requested nodes; small aliased batches stay under the per-minute limit
 
 
@@ -186,12 +186,21 @@ def fetch_prs():
     return prs
 
 
+def _advisory_run(c):
+    """True for a CheckRun owned by an advisory workflow (the preboard lane, landing notes). Required-context
+    publishers stay out of this set: their failures are real gates."""
+    wf = (((c.get("checkSuite") or {}).get("workflowRun") or {}).get("workflow") or {}).get("name")
+    return wf in EXEMPT_WORKFLOWS - REQUIRED_CONTEXT_PUBLISHERS
+
+
 def ci_state(pr):
     """Latest attempt per context: (red names, active count, total contexts)."""
     nodes = pr["commits"]["nodes"]
     ctx = (nodes[0]["commit"]["statusCheckRollup"] or {}).get("contexts", {}).get("nodes", []) if nodes else []
     latest, ids = {}, {}
     for c in ctx:
+        if _advisory_run(c):
+            continue                              # the preboard lane etc. is advisory: never red, active or counted (#55)
         name = c.get("name") or c.get("context")
         stamp = c.get("startedAt") or c.get("createdAt") or ""
         if name and (name not in latest or stamp >= latest[name][0]):

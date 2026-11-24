@@ -250,5 +250,34 @@ class Main(Base):
         self.assertEqual(self.pages(), [])
 
 
+def _run(name, wf, concl="FAILURE", status="COMPLETED"):
+    return {"name": name, "status": status, "conclusion": concl, "startedAt": "2026-11-24T10:00:00Z", "databaseId": 1,
+            "checkSuite": {"workflowRun": {"workflow": {"name": wf}}}}
+
+
+def _pr(*nodes):
+    return {"number": 22028, "headRefOid": HEAD, "isDraft": False,
+            "commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": list(nodes)}}}}]}}
+
+
+class LaneNeverRedTest(unittest.TestCase):
+    """#55: the lane's check runs ride the PR head SHA; ci_state must not count them by job name."""
+
+    def test_lane_only_failures_are_not_red_active_or_counted(self):
+        lane = PC.PREBOARD_LANE_NAME
+        pr = _pr(*[_run(n, lane) for n in ("result", "guards shard 3/6", "own tests")],
+                 _run("types", lane, None, "IN_PROGRESS"))
+        self.assertEqual(PC.ci_state(pr), ([], 0, 0))
+
+    def test_real_ci_failure_beside_lane_reds_is_still_red(self):
+        pr = _pr(_run("result", PC.PREBOARD_LANE_NAME), _run("python-suite", "CI"), _run("lint", "CI", "SUCCESS"))
+        red, active, total = PC.ci_state(pr)
+        self.assertEqual((red, active, total), (["python-suite"], 0, 2))
+
+    def test_status_context_without_workflow_is_kept(self):
+        pr = _pr({"context": "legacy", "state": "FAILURE", "createdAt": "2026-11-24T10:00:00Z"})
+        self.assertEqual(PC.ci_state(pr)[0], ["legacy"])
+
+
 if __name__ == "__main__":
     unittest.main()
