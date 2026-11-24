@@ -89,5 +89,28 @@ class Rerun(unittest.TestCase):
 
 red_ids = {"a": 1, "b": 2, "c": 3}
 
+
+
+GIT_NET = (
+    "error: RPC failed; curl 56 Recv failure: Connection reset by peer\n"
+    "fatal: protocol error: bad pack header\n"
+    "fatal: unable to access 'https://github.com/o/r/': Failed to connect to github.com port 443 after 133426 ms: "
+    "Could not connect to server"
+)
+
+
+class GitNetwork(unittest.TestCase):
+    def test_git_network_tail_is_infra(self):
+        self.assertTrue(PC.is_infra_failure(PC.clean_log(stamped(GIT_NET))))
+
+    def test_each_pattern_alone(self):
+        for line in GIT_NET.splitlines():
+            self.assertTrue(PC.is_infra_failure(PC.clean_log(stamped(line))), line)
+
+    def test_test_output_connection_reset_is_code(self):
+        tail = "E   AssertionError: connection reset by peer not handled\nFAILED tests/t.py::test_x\n1 failed in 1s"
+        self.assertFalse(PC.is_infra_failure(PC.clean_log(stamped(tail))))
+
+
 if __name__ == "__main__":
     unittest.main()
