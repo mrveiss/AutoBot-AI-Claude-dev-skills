@@ -104,8 +104,26 @@ class GitNetwork(unittest.TestCase):
         self.assertTrue(PC.is_infra_failure(PC.clean_log(stamped(GIT_NET))))
 
     def test_each_pattern_alone(self):
-        for line in GIT_NET.splitlines():
+        lines = [
+            "error: RPC failed; curl 56 Recv failure: Connection reset by peer",
+            "fatal: protocol error: bad pack header",
+            "fatal: early EOF: Connection reset by peer",
+            "fatal: unable to access 'https://github.com/o/r/': Could not connect to server",
+            "fatal: x: Failed to connect to github.com port 443 after 5 ms: Could not connect to server",
+        ]
+        for line in lines:
             self.assertTrue(PC.is_infra_failure(PC.clean_log(stamped(line))), line)
+
+    def test_each_infra_pattern_has_a_positive(self):
+        lines = GIT_NET.splitlines() + ["fatal: early EOF: Connection reset by peer",
+                                        "fatal: unable to access 'https://h/r': Could not connect to server"]
+        for rx in PC.INFRA_PATTERNS[-5:]:
+            self.assertTrue(any(rx.search(x) for x in lines), rx.pattern)
+
+    def test_app_log_could_not_connect_is_not_infra(self):
+        tail = ("Test Files  2 passed (2)\npsql: error: Could not connect to server\n"
+                "error: redis client Connection reset by peer\nProcess completed with exit code 1.")
+        self.assertFalse(PC.is_infra_failure(PC.clean_log(stamped(tail))))
 
     def test_test_output_connection_reset_is_code(self):
         tail = "E   AssertionError: connection reset by peer not handled\nFAILED tests/t.py::test_x\n1 failed in 1s"

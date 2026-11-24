@@ -658,8 +658,8 @@ INFRA_PATTERNS = [re.compile(x) for x in (
     r"The runner has received a shutdown signal", r"runner .{0,60}lost communication with the server",
     r"No space left on device", r"Failed to download action", r"Unable to resolve action",
     r"Failed to connect to \S+ port \d+.*(timed out|Connection refused|Could not connect to server)",
-    r"Could not connect to server", r"RPC failed; curl \d+", r"protocol error: bad pack header",
-    r"(error|fatal): .*Connection reset by peer")]
+    r"unable to access '[^']*':.*Could not connect to server", r"RPC failed; curl \d+",
+    r"protocol error: bad pack header", r"fatal: .*Connection reset by peer")]
 # Test-failure evidence anywhere in the tail vetoes an infra verdict.
 CODE_FAILURE = re.compile(r"^FAILED \S+::|\b\d+ failed\b|AssertionError|No export is defined on the .* mock|error TS\d+|"
                           r"Test Files +\d+ failed|Tests +\d+ failed|^E {3}", re.M)
