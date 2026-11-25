@@ -161,6 +161,12 @@ def milestone_rank(p):
     return int(m.group(1)) if m else NO_MILESTONE_RANK
 
 
+def ms_label(p):
+    """Queue-table milestone cell: "M<n>" when the rank came from a numbered milestone, else "-"."""
+    k = milestone_rank(p)
+    return "-" if k == NO_MILESTONE_RANK else f"M{k}"
+
+
 def fetch_prs():
     """Light list of every open PR, then threads (non-draft) and checks (slot candidates) in small batches."""
     prs, cur = [], None
@@ -961,7 +967,7 @@ def main():
     for pos, p in enumerate(prs, 1):
         slot = "SLOT" if p["number"] in slots else ""
         ci = "red" if p["red"] else ("running" if p["active"] else ("none" if not p["total"] else "done"))
-        rows.append(f"| {pos} | #{p['number']} | {(p.get('milestone') or {}).get('title', '-')[:3].strip()} | {p['createdAt'][:16]} | {slot} | {ci} | {p['why'] or 'ready'} "
+        rows.append(f"| {pos} | #{p['number']} | {ms_label(p)} | {p['createdAt'][:16]} | {slot} | {ci} | {p['why'] or 'ready'} "
                     f"| {p['owner']} ({p['alive']}) | {p['title'][:55]} |")
     table = "| # | PR | ms | submitted (UTC) | slot | CI | state | owner | title |\n|---|---|---|---|---|---|---|---|---|\n" + "\n".join(rows)
     # a --dry view (push-and-park) must not clobber the live queue.md: it writes queue.dry.md instead
