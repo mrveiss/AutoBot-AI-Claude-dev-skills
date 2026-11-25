@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """pr-coordinator [--dry] — one tick of the cross-session PR traffic light (owner rules 2026-11-18).
 
-  1 FIFO: PRs land in submission order (createdAt). A PR that is draft, conflicting or red keeps
+  1 FIFO: PRs land milestone first (M1 → M2 → …, no milestone last), then submission order (createdAt). A PR that is draft, conflicting or red keeps
     its place but gets no CI slot; once fixed it is ahead of everything submitted after it.
     The release promotion (#19456) is always last. Outside-contributor PRs are reported, not slotted.
   2 At most WIDTH (2) PRs hold CI. Slots are ledger holds `ci-slot:N` (other sessions' holds count).
@@ -84,10 +84,12 @@ PREBOARD_LIST_CAP = 10                                # failing items named in o
 # gh's wording when the branch has no such workflow file, no workflow_dispatch trigger or no `base` input (from gh's
 # messages as remembered, not captured): the lane is then unavailable for THAT branch, not broken.
 LANE_MISSING = re.compile(r"could not find any workflow|workflow_dispatch|unexpected inputs|HTTP 404|HTTP 422|not found", re.I)
+NO_MILESTONE_RANK = 10**6   # a PR with no milestone, or a non-"M<n>" one, lands after every numbered milestone
+MILESTONE_NUM = re.compile(r"^\s*M(\d+)\b")
 ACTIVE = {"QUEUED", "IN_PROGRESS", "WAITING", "PENDING", "REQUESTED"}
 
 Q = """query($c:String){repository(owner:"mrveiss",name:"AutoBot-AI"){pullRequests(states:OPEN,first:100,after:$c){
-pageInfo{hasNextPage endCursor} nodes{number title createdAt updatedAt isDraft body changedFiles headRefName headRefOid isCrossRepository mergeable author{login}}}}}"""
+pageInfo{hasNextPage endCursor} nodes{number title createdAt updatedAt isDraft body changedFiles headRefName headRefOid isCrossRepository mergeable milestone{title} author{login}}}}}"""
 THREADS = """reviewThreads(first:60){nodes{id isResolved comments(first:1){nodes{author{login}}}
   last:comments(last:1){nodes{author{login} createdAt url}}}}"""
 CHECKS = """commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{
@@ -150,6 +152,19 @@ def gql(query, **var):
             if attempt == 2:
                 raise
             time.sleep(5)
+
+
+def milestone_rank(p):
+    """Landing rank from the leading M<digits> of the milestone title ("M4 - Deforking" -> 4); no milestone
+    or a non-M title -> NO_MILESTONE_RANK, so those PRs land after every numbered milestone."""
+    m = MILESTONE_NUM.match((p.get("milestone") or {}).get("title") or "")
+    return int(m.group(1)) if m else NO_MILESTONE_RANK
+
+
+def ms_label(p):
+    """Queue-table milestone cell: "M<n>" when the rank came from a numbered milestone, else "-"."""
+    k = milestone_rank(p)
+    return "-" if k == NO_MILESTONE_RANK else f"M{k}"
 
 
 def fetch_prs():
@@ -816,7 +831,7 @@ def main():
         print("trainmaster active — train rules apply; pr-coordinator reports only")
         globals()["DRY"] = True
 
-    prs = sorted(fetch_prs(), key=lambda p: (p["number"] in LAST, p["createdAt"], p["number"]))
+    prs = sorted(fetch_prs(), key=lambda p: (p["number"] in LAST, milestone_rank(p), p["createdAt"], p["number"]))
     by_branch = {p["headRefName"]: p for p in prs if p["headRefName"] not in PROTECTED}
     runs = actions_runs()
     held = {int(k.rsplit(":", 1)[1]): r.hgetall(k) for k in r.scan_iter("lg:hold:ci-slot:*")}
@@ -952,9 +967,9 @@ def main():
     for pos, p in enumerate(prs, 1):
         slot = "SLOT" if p["number"] in slots else ""
         ci = "red" if p["red"] else ("running" if p["active"] else ("none" if not p["total"] else "done"))
-        rows.append(f"| {pos} | #{p['number']} | {p['createdAt'][:16]} | {slot} | {ci} | {p['why'] or 'ready'} "
+        rows.append(f"| {pos} | #{p['number']} | {ms_label(p)} | {p['createdAt'][:16]} | {slot} | {ci} | {p['why'] or 'ready'} "
                     f"| {p['owner']} ({p['alive']}) | {p['title'][:55]} |")
-    table = "| # | PR | submitted (UTC) | slot | CI | state | owner | title |\n|---|---|---|---|---|---|---|---|\n" + "\n".join(rows)
+    table = "| # | PR | ms | submitted (UTC) | slot | CI | state | owner | title |\n|---|---|---|---|---|---|---|---|---|\n" + "\n".join(rows)
     # a --dry view (push-and-park) must not clobber the live queue.md: it writes queue.dry.md instead
     write_atomic(STATE / ("queue.dry.md" if DRY else "queue.md"),
                  f"# PR queue — {time.strftime('%F %T')} (dry={DRY})\n\n{table}\n")
