@@ -1,4 +1,4 @@
-When to use: Validate code before merging — syntax, imports, call-site impact, tests, types, and linting
+When to use: Validate code before merging — syntax, imports, call-site impact, and CI's results for tests, types and linting
 
 # /autobot-dev-skills:review pre-merge-validate — Pre-Merge Validation Gates
 
@@ -24,12 +24,9 @@ When to use: Validate code before merging — syntax, imports, call-site impact,
    - Block if `NEW -eq 0` (all already merged — close the PR)
    - Warn if `DUPES -gt 0 && NEW -gt 0` (partial duplicate — don't block)
 
-**Gate 1 — Python Syntax + Imports**
-4. Get changed files: `git diff origin/main...$BRANCH --name-only -- '*.py' | grep -E '^autobot-backend|^autobot-shared'`
-5. Per file — syntax: `python -c "import ast; ast.parse(open('$file').read())"`
-6. Per file — imports: `python -m py_compile "$file"`
-7. For `api/schemas_*.py` — runtime import: `(cd autobot-backend && python3 -c "from api import $SCHEMA_MOD")`
-   - Block on any SyntaxError, ImportError, or NameError
+**Gate 1 — Syntax + Imports (read from CI)**
+4. Read CI for the head: `gh pr checks <pr>` (coordinator lanes plus suite)
+   - Block on any failed syntax, import or collection check; no local compile (see `lifecycle/references/session-lifecycle.md`)
 
 **Gate 2 — Call-Site Impact Analysis**
 8. Find removed symbols:
@@ -48,15 +45,9 @@ When to use: Validate code before merging — syntax, imports, call-site impact,
 12. Check that a matching test file exists and that its CI check passed: `gh pr checks <pr>`
     - Block on a failed CI test check; Skip if no matching test files found
 
-**Gate 4 — Frontend Type Check (conditional)**
-13. Check: `git diff origin/main...$BRANCH --name-only | grep -c "^autobot-frontend"`
-14. If changed: `cd autobot-frontend && npm run type-check`
-    - Block on TypeScript errors; Skip if no frontend changes
-
-**Gate 5 — Linting**
-15. Backend: `cd autobot-backend && flake8 --config=.flake8 $BACKEND_CHANGED`
-    - Block on E/F codes; W/C codes reported only
-16. Frontend (non-blocking): `cd autobot-frontend && npm run lint -- --quiet`
+**Gate 4 — Types and Lint (read from CI)**
+5. Read the type-check and lint checks from the same `gh pr checks <pr>` output
+   - Block on a failed backend lint or type check; frontend lint failures are reported only
 
 ## Verdict
 ```bash

@@ -85,23 +85,18 @@ Repeat batches until all issues are `SUCCESS`, `SKIPPED`, or `ESCALATED`.
 
 ---
 
-## Step 4: Pre-Push Verification (every PR before push)
+## Step 4: Pre-Push Check (every PR before push)
 
 ```bash
 # Re-fetch and abort if issue already closed during session
 git fetch origin main -q
 gh issue view <n> --json state -q '.state'   # CLOSED → abort
 
-# Type-check (frontend)
-cd autobot-frontend && npx vue-tsc --noEmit -p tsconfig.app.json
-
-# No local test runs - CI is the gate; run only targeted lint/type/guards
-
 # Extraction PRs only — behavioral grep audit (before/after; after-count must be 0)
 grep -rnE "<behavior-pattern>" autobot-frontend/src --include="*.vue"
 ```
 
-Push only after all checks pass: `git push -u origin issue-<n>`
+Local runs: see `session-lifecycle.md` (No local test runs). Then `git push -u origin issue-<n>`.
 
 ---
 
@@ -111,18 +106,16 @@ Push only after all checks pass: `git push -u origin issue-<n>`
 gh pr create --base main --head issue-<n> --title "..." --body-file <file>
 ```
 
-- Syntax/imports: `python -m py_compile <file>` for Python; `vue-tsc` for TS/Vue.
 - Call-site impact: grep that nothing removed is still called elsewhere.
 - Wiring check: any new public module must have ≥1 production caller — HARD BLOCK if 0.
-- Linting: `python -m black --check <files>`
 
-Fix inline and re-push if validation fails, unless the head is queued in a train. Never merge a failing PR.
+Fix inline and re-push if validation fails, unless the coordinator or a trainmaster already holds the head. Never merge a failing PR.
 
 ---
 
 ## Step 6: Land
 
-Hand off to the trainmaster's merge train — see `references/pr.md` Step 5.
+Give each PR number and head to the PR coordinator (`references/pr.md` Step 5).
 
 ```bash
 git fetch origin && git log origin/main --oneline --grep="#<n>" | head -1  # confirm landed

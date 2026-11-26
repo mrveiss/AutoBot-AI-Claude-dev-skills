@@ -207,7 +207,7 @@ Task(
     1. cd .worktrees/issue-123 && pwd
     2. git branch --show-current   # must be issue-123 (created with the worktree)
     3. Implement the full issue
-    4. Run targeted lint/type/guard checks only (no local test runs - CI is the gate)
+    4. Local runs: see `session-lifecycle.md` (No local test runs)
     5. Commit: git commit -m "feat: description (#123)"
     6. Push: git push -u origin issue-123
     7. Report: files changed, tests status, branch name
@@ -271,7 +271,7 @@ for ISSUE in "${ISSUES[@]}"; do
         # Check if commits were made
         COMMITS=$(git log main..HEAD --oneline | wc -l)
 
-        # Tests are not run locally - CI is the gate (check `gh pr checks` after the PR is open)
+        # No local runs; CI is the gate (`gh pr checks` after the PR is open)
 
         echo "Issue #${ISSUE}:"
         echo "  Branch: $BRANCH"
@@ -309,7 +309,7 @@ Implements #${ISSUE}, developed in a parallel worktree by an automated agent.
 $(git log origin/main..HEAD --pretty='- %s')
 
 ## Verification
-Targeted lint/type/guard checks run before push; CI is the test gate.
+No local runs; CI is the gate (see `session-lifecycle.md` (No local test runs)).
 
 ## Model Used
 <model id>

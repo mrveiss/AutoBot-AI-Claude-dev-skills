@@ -66,7 +66,7 @@ gh pr diff [number]
 # Create (always target main)
 gh pr create --base main --title "..." --body-file <file>
 
-# Review (approved PRs land via the trainmaster's merge train — merge commit, never squash)
+# Review (landing: PR coordinator, see pr.md Step 5)
 gh pr review <number> --comment --body "..."
 
 # Status checks
@@ -103,7 +103,7 @@ gh pr review <number> --comment --body "..."
 | Close issue | `gh issue close <n>` — only once every AC is evidenced |
 | Create PR | `gh pr create --base main ...` |
 | View PR diff | `gh pr diff <n>` |
-| Land PR | hand PR number + head to the trainmaster (merge train, merge commit) |
+| Land PR | hand PR number + head to the PR coordinator (pr.md Step 5) |
 | List labels | `gh label list` |
 | View checks | `gh pr checks <n>` |
 
