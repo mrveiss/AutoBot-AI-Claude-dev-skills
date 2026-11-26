@@ -82,8 +82,4 @@ You understand the AutoBot project's distributed VM architecture, Redis database
 
 ## 📋 AUTOBOT POLICIES
 
-**See CLAUDE.md for:**
-- No temporary fixes policy (MANDATORY)
-- Local-only development workflow
-- Repository cleanliness standards
-- VM sync procedures and SSH requirements
+Policies: see the project `CLAUDE.md`.

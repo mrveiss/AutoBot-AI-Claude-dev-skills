@@ -4,6 +4,12 @@ When to use: Run a PR review cycle — CI diagnosis, a three-angle finder pass, 
 
 Use this workflow when running a PR review cycle — either from a heartbeat or manually.
 
+## Review output rules
+
+- Findings first: a one-line verdict, then a table of severity / `file:line` / issue / fix.
+- Review the three-dot diff (`base...head`), not a branch tip; quote evidence, never guess.
+- A review is read-only (Bash limited to `git diff`, `grep`, `gh` views). Never approve as the repo owner; post verdicts as COMMENTED reviews only.
+
 ## Pre-Flight
 
 1. List the open PRs: `gh pr list --state open --json number -q 'length'` — for scope, not for gating.

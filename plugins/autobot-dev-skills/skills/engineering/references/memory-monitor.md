@@ -33,16 +33,13 @@ stated in the project instructions. Memory is for what the code cannot tell the 
 
 ## How to store
 
-Memory is a **file-based store** — one fact per file, with frontmatter carrying its name, a
-one-line description used for recall, and a type. Related entries cross-link by name. After
-writing a file, add a single pointer line to the index. The index stays an index: if a fact
-needs more than one line, it belongs in its own file.
+Structure, file format, frontmatter and indexing rules are not kept here. Read `/claude-dev-skills:memory-library write` before creating a file and `/claude-dev-skills:memory-library structure` for where it lives.
 
 Convert relative dates to absolute ones as you write. "Last Tuesday" is worthless in a month.
 
 ## Surfacing
 
-When a topic recurs, search the store and report what is already recorded — the entry and its
+When a topic recurs, look it up as `/claude-dev-skills:memory-library lookup` describes and report what is already recorded — the entry and its
 location, so the caller can read it. Flag a conflict between a new request and a stored
 decision; state both sides and stop there. You report; you do not adjudicate.
 

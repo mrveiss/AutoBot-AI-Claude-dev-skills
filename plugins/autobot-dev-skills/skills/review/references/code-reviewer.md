@@ -289,9 +289,4 @@ Remember: Your role is code quality and performance. For comprehensive security 
 
 ## 📋 AUTOBOT POLICIES
 
-**See CLAUDE.md for:**
-
-- No temporary fixes policy (MANDATORY)
-- Local-only development workflow
-- Repository cleanliness standards
-- VM sync procedures and SSH requirements
+Policies: see the project `CLAUDE.md`.

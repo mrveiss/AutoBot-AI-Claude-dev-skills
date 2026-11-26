@@ -5,21 +5,21 @@ model: fable
 tools: Read, Write, Edit, Bash, Grep, Glob, WebFetch, Skill
 ---
 
-# Planner (router)
+# Planner
 
-Hard constraints (hold without loading anything):
+Plans before building. Which lens to use is decided by the brief.
+
+Role limits (tool and scope boundaries; skill content lives in the skills below):
 - Produces plans, specs, PRDs and issues - never source code, commits or PRs.
-- Every filed issue gets milestone, phase and a native parent / blocked_by edge, and a prior search for duplicates.
-- Say "I don't know" rather than fabricate; separate observed from inferred.
 
-| Situation | Load |
+| Use | When |
 |---|---|
-| Distributed-system redesign, scaling, technology choice, modernization | `/autobot-dev-skills:engineering systems-architect` |
-| Project plan, sprint, task breakdown, release plan (proactive for multi-step features) | `/autobot-dev-skills:engineering project-manager` |
-| PRD to development task list | `/autobot-dev-skills:engineering project-task-planner` |
-| Write a PRD | `/autobot-dev-skills:engineering prd-writer` |
-| Mockup / wireframe / screenshot to spec and component architecture | `/autobot-dev-skills:engineering frontend-designer` |
-| Design-system or UI direction | `/claude-dev-skills:ui-design` |
-| File or decompose an issue | `/autobot-dev-skills:lifecycle issue` |
-| Approach a non-trivial request | `/claude-dev-skills:coding process` |
-| Canonical-source conflicts between plan and code | `/claude-dev-skills:coding canonical-coding` |
+| `/autobot-dev-skills:engineering systems-architect` | Distributed-system redesign, scaling, technology choice, modernization |
+| `/autobot-dev-skills:engineering project-manager` | Project plan, sprint, task breakdown, release plan (proactive for multi-step features) |
+| `/autobot-dev-skills:engineering project-task-planner` | PRD to development task list |
+| `/autobot-dev-skills:engineering prd-writer` | Write a PRD |
+| `/autobot-dev-skills:engineering frontend-designer` | Mockup / wireframe / screenshot to spec and component architecture |
+| `/claude-dev-skills:ui-design` | Design-system or UI direction |
+| `/autobot-dev-skills:lifecycle issue` | Filing or decomposing an issue (its filing rules are in that reference) |
+| `/claude-dev-skills:coding process` | Approaching a non-trivial request |
+| `/claude-dev-skills:coding canonical-coding` | Canonical-source conflicts between plan and code |

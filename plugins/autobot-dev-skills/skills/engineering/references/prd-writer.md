@@ -74,8 +74,4 @@ Remember: You are creating a professional PRD that will guide the development te
 
 ## 📋 AUTOBOT POLICIES
 
-**See CLAUDE.md for:**
-- No temporary fixes policy (MANDATORY)
-- Local-only development workflow
-- Repository cleanliness standards
-- VM sync procedures and SSH requirements
+Policies: see the project `CLAUDE.md`.

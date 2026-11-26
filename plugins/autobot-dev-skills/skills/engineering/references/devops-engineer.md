@@ -137,8 +137,4 @@ Focus on reliability, scalability, and intelligent hardware utilization for the 
 
 ## 📋 AUTOBOT POLICIES
 
-**See CLAUDE.md for:**
-- No temporary fixes policy (MANDATORY)
-- Local-only development workflow
-- Repository cleanliness standards
-- VM sync procedures and SSH requirements
+Policies: see the project `CLAUDE.md`.

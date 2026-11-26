@@ -1,94 +1,16 @@
-When to use: Standardized commit workflow with pre-flight checks, auto-format, and retry logic for pre-commit hooks
+When to use: Committing in AutoBot-AI. The generic commit workflow (pre-flight, format, retry, verify) lives in `/claude-dev-skills:coding commit`; this reference holds only what is AutoBot-specific.
 
-# Commit Workflow
+# AutoBot commit specifics
 
-Self-healing commit sequence that formats, stages, commits, and verifies — retrying up to 3x on hook failures.
+Run `/claude-dev-skills:coding commit` for the workflow, then apply these project rules.
 
-## Step 1 — Pre-flight state check
+- Never commit on `release` or `main`; branch names are `issue-*` or `hotfix-*` and the pre-commit hook blocks the rest.
+- Message format: `<type>(scope): <description> (#issue-number)`; types `feat` · `fix` · `refactor` · `test` · `docs` · `chore` · `perf`.
+- No `Co-Authored-By` or tool trailers; `mrveiss` is the sole author.
+- Never `--no-verify`; a PostToolUse hook auto-formats `.py`, so re-stage with `git add -u` and commit again when a hook reformats.
+- Stage explicit files for the current issue; never `git add .`.
 
-```bash
-git branch --show-current        # Must NOT be release/main directly
-git status                       # Identify all modified/untracked files
-git diff --staged --name-only    # What's already staged?
-git stash list                   # Warn if stashes exist
-```
-
-If on `release` or `main` directly: **STOP** and ask user.
-
-## Step 2 — Auto-format Python files
-
-For every `.py` file that will be committed:
-
-```bash
-BLACK=$HOME/.cache/pre-commit/repoefsi1klb/py_env-python3/bin/black
-
-for FILE in $(git diff --staged --name-only | grep '\.py$'); do
-    $BLACK --line-length=88 "$FILE"
-    isort --profile=black --line-length=88 "$FILE"
-    git add "$FILE"    # Re-stage after formatting
-done
-```
-
-Skip if no `.py` files are being committed.
-
-## Step 3 — Stage files
-
-Stage only files relevant to the current issue. **Never** `git add .` blindly.
-
-```bash
-git add <file1> <file2> ...   # Preferred: explicit files
-# OR
-git add -u                     # All tracked modifications (safe if worktree is clean)
-
-# Verify:
-git diff --staged --name-only
-git diff --staged --stat
-```
-
-If unrecognized files appear staged: `git restore --staged <file>`
-
-## Step 4 — Commit with retry loop
-
-Attempt up to **3 times**, fixing hook failures between attempts:
-
-```bash
-for ATTEMPT in 1 2 3; do
-    echo "Commit attempt $ATTEMPT/3..."
-
-    git commit -m "$(cat <<'MSG'
-<type>(scope): <description> (#issue-number)
-MSG
-)" && echo "✅ Committed on attempt $ATTEMPT" && break
-
-    # Hook failed — re-stage any files hooks modified
-    echo "⚠️  Hook failed. Re-staging modified files..."
-    git add -u
-done
-```
-
-**NEVER use `--no-verify`.** Fix the underlying issue.
-
-## Step 5 — Post-commit verification
-
-```bash
-git log -1 --stat        # Verify commit landed
-git diff                 # Nothing left uncommitted
-git diff --staged        # Nothing accidentally staged
-```
-
-## Step 6 — Report
-
-State commit hash, files changed, branch, and whether more commits are needed.
-
-## Commit Message Format
-
-```
-<type>(scope): <description> (#issue-number)
-```
-
-Types: `feat` · `fix` · `refactor` · `test` · `docs` · `chore` · `perf`
-
-## Common Hook Failures & Fixes
+## Common hook failures and fixes
 
 | Hook | Symptom | Fix |
 |------|---------|-----|
