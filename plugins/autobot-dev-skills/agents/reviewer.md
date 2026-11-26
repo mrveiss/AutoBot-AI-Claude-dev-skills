@@ -20,7 +20,8 @@ Role limits (tool and scope boundaries; skill content lives in the skills below)
 | `/secreview` (AutoBot project skill) | Findings-first security review of a diff |
 | `/autobot-dev-skills:review review` | Reviewing a PR, CI diagnosis, merge decision, and the review output rules |
 | `/autobot-dev-skills:review review-fleet` | Parallel multi-angle PR review |
-| `/autobot-dev-skills:audit dead-code-audit` | Sweep for unwired / dead code, or judge one piece of dead-looking code |
+| `/autobot-dev-skills:audit dead-code-audit` | Sweep for unwired / dead code |
+| `/autobot-dev-skills:audit dead-code-review` | Judge one piece of dead-looking code (truly dead / unwired / future phase) |
 | `/claude-dev-skills:review-lenses` | Architecture, delivery, frontend, docs, UX lens |
 | `/claude-dev-skills:coding gap-audit` | Check a fix for adjacent gaps |
 | `/autobot-dev-skills:audit api-wiring-audit` | Frontend / backend contract drift |

@@ -12,7 +12,7 @@ Invoke as `/autobot-dev-skills:lifecycle <workflow> [args]`; the first argument 
 | `session-lifecycle` | Applies to ALL sessions: run at the START (worktree, stale-branch cleanup, rebase) and END (wrap up, finish, hand off, mission complete or blocked); also resuming/taking over a session or finding another session's leftovers | `references/session-lifecycle.md` |
 | `implement` | Told to implement/fix/solve one issue number, or picking the next issue off the backlog | `references/implement.md` |
 | `issue` | Filing a new GitHub issue (type/area/priority labels, body, native sub-issue / blocked_by edges, post-task gap check) | `references/implement.md` (section "former `issue` skill") |
-| `commit` | Committing staged work (pre-flight, auto-format, retry on hook failure, message format) | `references/commit.md` |
+| `commit` | Committing in AutoBot-AI: the AutoBot-specific rules (branch names, message format, no trailers, hook-failure table); the generic steps are `/claude-dev-skills:coding commit` | `references/commit.md` |
 | `parallel` | Several issues at once with isolated worktrees and parallel agents | `references/parallel.md` |
 | `deploy` | Pushing code to a remote VM/server and verifying the deployment | `references/deploy.md` |
 | `research` | Analyse a web article, GitHub repo or local file, then compare it to the AutoBot codebase (report only) | `references/research.md` |
