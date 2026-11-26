@@ -33,7 +33,7 @@ Read your assigned step from the umbrella issue before proceeding.
 
 ## Step 2 — Investigate, then design (do NOT code yet)
 - Grep/Glob for the affected files; confirm each exists.
-- Post the plan in ≤10 lines: files, changes, edge cases, risks.
+- Post the plan: files, changes, edge cases, risks.
 - Ask the moment a user-level decision surfaces (architecture, deletion, scope); in an autonomous loop post options + a recommendation on the issue with `needs-decision` and continue. A file count alone is not the trigger.
 - Write a TodoWrite checklist of discrete, testable tasks.
 
