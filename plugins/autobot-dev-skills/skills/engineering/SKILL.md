@@ -32,6 +32,6 @@ Invoke as `/autobot-dev-skills:engineering <workflow> [args]`; the first argumen
 
 ## Notes
 
-- Reviewer lenses (`code-reviewer`, `code-skeptic`, `security-auditor`) live in `/autobot-dev-skills:review`; the research-only issue-tree workflow is `/autobot-dev-skills:lifecycle research-to-issues`.
+- Reviewer lenses (`code-reviewer`, `code-skeptic`, `security-auditor`) live in `/autobot-dev-skills:review`; the research-only issue-tree workflow is `/research-hub to-issues` (KarnakOS-private-skills).
 - Issue, commit and deploy mechanics are in `/autobot-dev-skills:lifecycle`; this skill holds domain knowledge only.
 - Project rules in the repo `CLAUDE.md` override anything in a reference.

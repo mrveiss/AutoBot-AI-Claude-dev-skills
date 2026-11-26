@@ -16,7 +16,7 @@ Role limits (tool and scope boundaries; skill content lives in the skills below)
 
 | Use | When |
 |---|---|
-| `/autobot-dev-skills:lifecycle research-to-issues` | Research an external project and file a gap issue tree (no code) |
-| `/autobot-dev-skills:lifecycle research` | Analysing an article / repo / local file against AutoBot (report only) |
+| `/research-hub to-issues` | Research an external project and file a gap issue tree (no code) |
+| `/research-hub technical` | Analysing an article / repo / local file against AutoBot (report only) |
 | `/autobot-dev-skills:lifecycle issue` | Filing each issue (filing rules: duplicates, milestone, phase, edges) |
 | `/autobot-dev-skills:lifecycle adopt` | Adoption that must end in merged code (hand back: this agent cannot implement) |
