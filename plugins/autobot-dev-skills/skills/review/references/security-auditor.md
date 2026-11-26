@@ -188,8 +188,58 @@ Your task is to thoroughly review the codebase, identify security risks, and cre
 
 Your security-report.md should follow this structure:
 
-```
-[Code example removed for token optimization (markdown)]
+```markdown
+# AutoBot Security Audit Report
+
+## Executive Summary
+[Brief overview of findings with risk assessment for AutoBot's multi-modal AI platform]
+
+## Critical Vulnerabilities
+### [Vulnerability Title]
+- **Location**: [File path(s) and line numbers]
+- **AutoBot Context**: [Relevance to multi-modal AI, NPU workers, or desktop streaming]
+- **Description**: [Detailed explanation of the vulnerability]
+- **Impact**: [Potential consequences if exploited]
+- **Remediation Checklist**:
+  - [ ] [Specific action to take]
+  - [ ] [Configuration change to make]
+  - [ ] [Code modification with example]
+- **References**: [Links to relevant standards or resources]
+
+## High Vulnerabilities
+[Same format as Critical]
+
+## Medium Vulnerabilities
+[Same format as Critical]
+
+## Low Vulnerabilities
+[Same format as Critical]
+
+## AutoBot Specific Security Recommendations
+- [ ] Implement multi-modal input validation and sanitization
+- [ ] Secure NPU worker container isolation and privilege management
+- [ ] Enable desktop streaming authentication and encryption
+- [ ] Configure voice data anonymization and image metadata removal
+- [ ] Implement vector database access controls
+- [ ] Enable Redis Stack authentication and encryption
+- [ ] Configure comprehensive audit logging for multi-modal processing
+- [ ] Validate AI model integrity and prevent model poisoning
+
+## General Security Recommendations
+- [ ] [Recommendation 1]
+- [ ] [Recommendation 2]
+- [ ] [Recommendation 3]
+
+## Data Privacy and Compliance Assessment
+- [ ] GDPR compliance for multi-modal data processing
+- [ ] Voice data retention and anonymization policies
+- [ ] Image metadata scrubbing implementation
+- [ ] Audit logging for all AI processing activities
+- [ ] User consent mechanisms for multi-modal data
+- [ ] Data deletion capabilities and procedures
+
+## Security Posture Improvement Plan
+[Prioritized list of steps to improve overall security, with emphasis on AutoBot multi-modal AI security requirements]
 ```
 
 ## Tone and Style
@@ -221,9 +271,9 @@ Your security-report.md should follow this structure:
 
 Use these security validation approaches:
 
-```
-[Code example removed for token optimization (python)]
-```
+- Multi-modal input: prompt-injection detection and sensitive-data filtering for text, malware scanning and metadata removal for images, threat detection and anonymisation for audio.
+- NPU worker: container isolation, privilege checks, resource limits, model integrity.
+- Desktop streaming: session encryption, access control, authentication, session-hijacking prevention.
 
 ## Critical Security Checks for AutoBot
 
@@ -277,14 +327,10 @@ Remember that your goal is to help developers understand and address security is
 - Share security patterns and best practices via memory system for consistency across development
 
 **Memory Sharing Examples:**
-```
-[Code example removed for token optimization (markdown)]
-```
+Record each vulnerability pattern and its working remediation as one durable memory entry. How: [memory-curator.md](../../engineering/references/memory-curator.md).
 
 **Task Coordination Examples:**
-```
-[Code example removed for token optimization (markdown)]
-```
+Example split for a remediation: security (finding and re-test), backend or DevOps (the fix), testing (regression test). The re-test runs only after the fix merges.
 
 **Escalation Patterns:**
 - **Critical vulnerabilities**: Immediate escalation to relevant agents with urgent priority

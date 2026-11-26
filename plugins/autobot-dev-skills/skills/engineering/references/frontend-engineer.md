@@ -1,6 +1,6 @@
 When to use: Vue 3 + TypeScript specialist for AutoBot platform. Use for UI components, WebSocket integration, workflow dashboards, multi-modal interfaces, and frontend architecture. Proactively engage for user interface development.
 
-You are a Senior Frontend Engineer specializing in the AutoBot Vue 3 application. Your expertise includes:
+Covers AutoBot's Vue 3 frontend: components, state, WebSocket and tests.
 
 **🧹 REPOSITORY CLEANLINESS MANDATE:**
 - **NEVER place build artifacts in root directory** - ALL builds go in `dist/` directory
@@ -49,14 +49,11 @@ You are a Senior Frontend Engineer specializing in the AutoBot Vue 3 application
 **Core Responsibilities:**
 
 **Core Component Development:**
-```
-[Code example removed for token optimization (vue)]
-```
+- Components in play: the chat interface (WebSocket connected), terminal (xterm.js), knowledge manager, and the remote-desktop viewer. Find them in `autobot-frontend/src/components` and reuse them; do not fork.
 
 **State Management & API Integration:**
-```
-[Code example removed for token optimization (typescript)]
-```
+- Pinia stores with selective persistence; actions own WebSocket and API handling.
+- Backend URLs come from `getBackendUrl` in `@/config/ssot-config`, never literals.
 
 **Advanced Workflow Dashboards:**
 - Real-time multi-agent progress tracking
@@ -65,8 +62,17 @@ You are a Senior Frontend Engineer specializing in the AutoBot Vue 3 application
 - Interactive approval workflows with rich context
 
 **Development Workflow:**
-```
-[Code example removed for token optimization (bash)]
+```bash
+cd autobot-frontend
+npm run dev            # development server
+npm run build          # production build
+npm run lint           # ESLint + oxlint
+npm run format         # Prettier
+npm run type-check     # vue-tsc
+npm run test:unit      # Vitest
+npm run test:playwright
+npm run test:e2e
+npm run test:coverage
 ```
 
 **AutoBot Component Standards:**
@@ -118,14 +124,10 @@ When developing components, always consider the multi-modal AI context, ensure s
 - Escalate security concerns to Security Auditor with detailed context
 
 **Memory Sharing Examples:**
-```
-[Code example removed for token optimization (markdown)]
-```
+Keep a memory entry per reusable UI pattern or integration fix, with the component it applies to; entry format: [memory-curator.md](memory-curator.md).
 
 **Task Coordination Examples:**
-```
-[Code example removed for token optimization (markdown)]
-```
+Example split for a dashboard feature: frontend (components, store), backend (endpoint, WebSocket event), testing (unit and E2E). The backend contract lands before the component that consumes it.
 
 
 

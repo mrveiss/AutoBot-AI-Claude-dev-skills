@@ -1,6 +1,6 @@
 When to use: Documentation specialist for AutoBot's comprehensive documentation requirements. Use for maintaining docs/, API documentation, code documentation, and ensuring compliance with strict documentation standards. Proactively engage for any code changes requiring documentation updates.
 
-You are a Senior Documentation Engineer specializing in AutoBot's comprehensive documentation system. Your expertise covers:
+Covers writing and validating AutoBot documentation: docstrings, API pages and `docs/`.
 
 **🧹 REPOSITORY CLEANLINESS MANDATE:**
 - **NEVER place documentation files in root directory** - ALL docs go in `docs/`
@@ -16,16 +16,13 @@ You are a Senior Documentation Engineer specializing in AutoBot's comprehensive 
 - Explain complex topics simply; no filler, no invented facts.
 
 **Documentation Architecture:**
-```
-[Code example removed for token optimization]
-```
+- All documentation lives under `docs/`, grouped by purpose (for example `deployment/`, `features/`, `security/`, `workflow/`). Read the current `docs/` tree and add to an existing group before creating one.
 
 **Core Responsibilities:**
 
 **Mandatory Documentation Compliance:**
-```
-[Code example removed for token optimization (python)]
-```
+- Every function and method carries a Google-style docstring: a summary line, `Args`, `Returns`, `Raises`, an `Example` where behaviour is not obvious, and a `Note` for hardware or fallback behaviour (for example NPU absent, CPU used).
+- Types in the signature, meaning in the docstring; never restate the type.
 
 **Documentation Requirements Matrix:**
 
@@ -38,243 +35,19 @@ You are a Senior Documentation Engineer specializing in AutoBot's comprehensive 
 | **AutoBot Components** | Multi-modal usage guides + NPU setup + integration examples |
 
 **API Documentation Patterns:**
-```
-[Code example removed for token optimization (markdown)]
-```json
-{
-  "text": "Analyze this interface for automation opportunities",
-  "image_base64": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA...",
-  "audio_base64": "data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAA...",
-  "options": {
-    "confidence_threshold": 0.8,
-    "enable_npu_acceleration": true,
-    "processing_mode": "comprehensive"
-  }
-}
-```
-[Code example removed for token optimization]
-```json
-{
-  "success": true,
-  "data": {
-    "text_analysis": {
-      "intent": "automation_request",
-      "confidence": 0.95,
-      "entities": ["interface", "automation"]
-    },
-    "image_analysis": {
-      "ui_elements": [
-        {"type": "button", "text": "Submit", "coordinates": [100, 200]}
-      ],
-      "automation_opportunities": 3,
-      "confidence": 0.92
-    },
-    "audio_analysis": {
-      "transcript": "Please automate clicking the submit button",
-      "intent": "automation_command",
-      "confidence": 0.88
-    },
-    "combined_analysis": {
-      "overall_confidence": 0.92,
-      "recommended_actions": ["click_submit_button"],
-      "context_coherence": 0.94
-    }
-  },
-  "metadata": {
-    "processing_time_ms": 245,
-    "npu_acceleration_used": true,
-    "model_versions": {
-      "text": "<text-model>",
-      "vision": "<vision-model>",
-      "audio": "<audio-model>"
-    }
-  }
-}
-```
-[Code example removed for token optimization]
-```
+
+Document each endpoint with these sections, in order: description; authentication (required permission, rate limit); request format with a minimal JSON body; response format covering success and error shapes, including metadata such as processing time and whether NPU acceleration was used; error codes; and one worked example. Build request and response samples from the router's real Pydantic models, never from memory, and truncate binary payloads to a placeholder.
 
 **AutoBot Documentation Focus:**
 
 **Multi-Modal AI Documentation:**
-```
-[Code example removed for token optimization (markdown)]
-```bash
-# Enable NPU acceleration
-export AUTOBOT_NPU_ENABLED=true
-export AUTOBOT_NPU_DEVICE=AUTO  # AUTO, CPU, GPU, NPU
+- Setup: the environment variables that enable NPU acceleration and select the device (read the names from the config SSOT), and the compose profile that starts the NPU worker.
+- Usage: one guide per modality (text, image, audio) and one for the combined path, each with the fallback behaviour when the NPU is unavailable.
 
-# Start with NPU profile
-docker compose -f docker-compose.hybrid.yml --profile npu up -d
-```
-[Code example removed for token optimization]
-```bash
-# Comprehensive documentation validation
-validate_documentation() {
-    echo "=== AutoBot Documentation Validation ==="
+**Documentation validation:** before finishing, check that (1) no function lacks a docstring in the files you touched, (2) every relative markdown link in the changed docs resolves, (3) every API router touched has a matching page under `docs/`, and (4) every component you documented exists in the tree. Report what each check found, not only that it ran.
 
-    # 1. Check for missing docstrings
-    echo "Checking for missing docstrings..."
-    python -c "
-import ast
-import sys
-import os
+**Cross-references:** when a component is added, add it to the relevant `docs/` index and link its feature page to the pages for the components it uses. Generate API reference text from docstrings and signatures, then add usage examples and error handling by hand.
 
-missing_docstrings = []
-for root, dirs, files in os.walk('src'):
-    for file in files:
-        if file.endswith('.py'):
-            filepath = os.path.join(root, file)
-            with open(filepath, 'r') as f:
-                try:
-                    tree = ast.parse(f.read())
-                    for node in ast.walk(tree):
-                        if isinstance(node, ast.FunctionDef):
-                            if not ast.get_docstring(node):
-                                missing_docstrings.append(f'{filepath}:{node.lineno}:{node.name}')
-                except SyntaxError:
-                    print(f'Syntax error in {filepath}')
+## Local-only editing
 
-if missing_docstrings:
-    print('Missing docstrings found:')
-    for item in missing_docstrings[:10]:  # Show first 10
-        print(f'  {item}')
-    if len(missing_docstrings) > 10:
-        print(f'  ... and {len(missing_docstrings) - 10} more')
-    exit(1)
-else:
-    print('✅ All functions have docstrings')
-"
-
-    # 2. Validate markdown links
-    echo "Validating markdown links..."
-    find docs/ -name "*.md" -exec grep -l "http\|\.md)" {} \; | while read file; do
-        echo "Checking links in $file"
-        # Basic link validation - would use markdown-link-check in real implementation
-    done
-
-    # 3. Check API documentation completeness
-    echo "Checking API documentation completeness..."
-    grep -r "@router\." backend/api/ | grep -o "backend/api/[^:]*" | sort -u | while read api_file; do
-        module_name=$(basename "$api_file" .py)
-        if [ ! -f "docs/features/${module_name}_api.md" ]; then
-            echo "⚠️  Missing API documentation: docs/features/${module_name}_api.md"
-        fi
-    done
-
-    # 4. Verify AutoBot component documentation
-    echo "Checking AutoBot component documentation..."
-    autobot_components=(
-        "multimodal_processor"
-        "computer_vision_system"
-        "voice_processing_system"
-        "context_aware_decision_system"
-        "modern_ai_integration"
-    )
-
-    for component in "${autobot_components[@]}"; do
-        if [ ! -f "docs/features/${component}.md" ]; then
-            echo "⚠️  Missing AutoBot documentation: docs/features/${component}.md"
-        fi
-    done
-
-    echo "Documentation validation complete."
-}
-```
-[Code example removed for token optimization]
-```python
-# Integration with markdown reference system
-from src.markdown_reference_system import MarkdownReferenceSystem
-
-def update_documentation_cross_references():
-    """Update documentation cross-references for multi-modal AI components."""
-    ref_system = MarkdownReferenceSystem()
-
-    # Scan for new multi-modal AI components
-    autobot_modules = [
-        'multimodal_processor',
-        'computer_vision_system',
-        'voice_processing_system',
-        'context_aware_decision_system',
-        'modern_ai_integration'
-    ]
-
-    for module in autobot_modules:
-        # Update reference tables
-        ref_system.add_reference(f"src/{module}.py", f"docs/features/{module}.md")
-
-        # Generate API reference documentation
-        generate_api_reference(module)
-
-        # Update navigation indexes
-        update_documentation_index(module)
-
-def generate_api_reference(module_name: str):
-    """Generate API reference documentation from code."""
-    # Extract docstrings and function signatures
-    # Generate markdown documentation
-    # Include usage examples and error handling
-    # Cross-reference related components
-```
-[Code example removed for token optimization]
-```bash
-# Edit locally first
-vim autobot-vue/src/components/MyComponent.vue
-
-# Then sync to the frontend role
-./scripts/utilities/sync-frontend.sh components/MyComponent.vue
-# OR
-./scripts/utilities/sync-to-vm.sh frontend autobot-vue/src/components/ /home/autobot/autobot-vue/src/components/
-```
-[Code example removed for token optimization]
-```bash
-# Edit locally first
-vim backend/api/chat.py
-
-# Then sync to the AI Stack role
-./scripts/utilities/sync-to-vm.sh ai-stack backend/api/ /home/autobot/backend/api/
-# OR, for a deployed fleet: the builtin updater (SLM Maintenance -> Updates -> Code Sync), never ad-hoc ansible
-```
-[Code example removed for token optimization]
-```bash
-# Edit locally first
-vim config/redis.conf
-
-# Then deploy via Ansible
-# Deployed hosts update through the builtin updater (SLM Maintenance -> Updates -> Code Sync); never an ad-hoc playbook run
-```
-[Code example removed for token optimization]
-```bash
-# Edit locally first
-vim docker-compose.yml
-
-# Then deploy via Ansible
-# Deployed hosts update through the builtin updater (SLM Maintenance -> Updates -> Code Sync); never an ad-hoc playbook run
-```
-[Code example removed for token optimization]
-```bash
-# WRONG - Direct editing on a remote host
-ssh autobot@<frontend-host> "vim /home/autobot/app.py"
-
-# WRONG - Remote configuration change  
-ssh autobot@<database-host> "sudo vim /etc/redis-stack.conf"
-
-# WRONG - Direct Docker changes on a remote host
-ssh autobot@<aiml-host> "docker-compose up -d"
-```
-[Code example removed for token optimization]
-```bash
-# RIGHT - Local edit + sync
-vim app.py
-./scripts/utilities/sync-to-vm.sh ai-stack app.py /home/autobot/app.py
-
-# RIGHT - Local config + Ansible
-vim config/redis.conf  
-# Deployed hosts update through the builtin updater (SLM Maintenance -> Updates -> Code Sync); never an ad-hoc playbook run
-
-# RIGHT - Local Docker + deployment
-vim docker-compose.yml
-# Deployed hosts update through the builtin updater (SLM Maintenance -> Updates -> Code Sync); never an ad-hoc playbook run
-```
-
-**This policy is NON-NEGOTIABLE. Violations will be corrected immediately.**
+Edit locally, never on a remote host. The policy is `.claude/docs/MANDATORY_LOCAL_EDIT_POLICY.md` in the AutoBot repo; system updates go through the builtin updater only (AutoBot `CLAUDE.md`, "Never violate").

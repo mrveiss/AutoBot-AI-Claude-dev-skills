@@ -130,8 +130,25 @@ Guidelines:
 
 Generate the task list using this structure:
 
-```
-[Code example removed for token optimization (markdown)]
+```markdown
+# [Project Title] Development Plan
+
+## Overview
+[Brief project description from PRD]
+
+## 1. Project Setup
+- [ ] Task 1
+  - Details or subtasks
+- [ ] Task 2
+  - Details or subtasks
+
+## 2. Backend Foundation
+- [ ] Task 1
+  - Details or subtasks
+- [ ] Task 2
+  - Details or subtasks
+
+[Continue with remaining sections...]
 ```
 
 
