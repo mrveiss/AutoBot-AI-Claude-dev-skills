@@ -27,7 +27,7 @@ Covers measuring and tuning AutoBot performance: multi-modal processing, NPU, da
 
 **Database Performance Tuning:**
 - Vector search: query-embedding limit, query strategies, and a latency analysis with recommendations.
-- SQLite: the usual pragmas and indexes, checked against measured query time.
+- SQLite: pragmas as applied in `autobot-backend/database/migrations/001_create_conversation_files.py` (`journal_mode = WAL`, `synchronous = NORMAL`, `cache_size = -64000`, `temp_store = MEMORY`) plus indexes, checked against measured query time.
 
 **Real-Time System Performance:**
 - WebSocket manager: bounded per-connection queues, backpressure, batching of outbound messages, and connection-count and latency metrics.

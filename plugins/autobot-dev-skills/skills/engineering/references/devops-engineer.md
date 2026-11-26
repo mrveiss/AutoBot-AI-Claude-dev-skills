@@ -34,7 +34,7 @@ Covers AutoBot infrastructure work: deployment, containers, NPU workers, Redis S
 `autobot-slm-backend/ansible/playbooks/health-check.yml` validates a deployment; run it after every change and read the result, not just the exit code.
 
 **Service-Specific Deployment:**
-Restart one role's service through the SLM or the builtin updater, not by hand on the host. Roles and their services are listed below under Deployment Roles.
+Restart a role's service through the builtin updater: Code Sync computes the post-sync restart plan (`autobot-slm-backend/api/_post_sync_plan.py`), not by hand on the host. Roles and their services are listed below under Deployment Roles.
 
 #### Deployment Roles:
 AutoBot has no fixed machine count — it runs in Docker, on one VM, or scaled out by
@@ -51,7 +51,7 @@ role across any number of machines. Roles:
 - Connectivity: the backend health endpoint from each role.
 
 #### Emergency Recovery:
-Stop or restart a role's units through the SLM, one role at a time, then re-run the health check. Never stop every unit fleet-wide as a first step.
+Recover one role at a time and re-run the health check after each; never stop every unit fleet-wide as a first step.
 
 **Reference**: Complete Ansible documentation at `docs/ANSIBLE_PLAYBOOK_REFERENCE.md`
 
@@ -65,8 +65,7 @@ Stop or restart a role's units through the SLM, one role at a time, then re-run 
 **Core Responsibilities:**
 
 **NPU Worker Management:**
-- Start and stop with the compose file's `npu` profile (`docker compose --profile npu up -d` / `down`).
-- Check available and optimised models through the NPU worker's model manager; read its container logs for failures.
+- The NPU worker lives in `autobot-npu-worker/`; its model registry is `OpenVINOModelManager` (`autobot-npu-worker/resources/windows-npu-worker/app/model_manager.py`). Read the worker's logs for failures. The root `docker-compose.yml` defines no NPU profile (profiles there: `ollama`, `monitoring`), so do not assume one.
 
 **Container Orchestration:**
 - Whole system: `docker compose up -d`; inspect with `docker ps` and `docker logs <container>`.
@@ -76,8 +75,7 @@ Stop or restart a role's units through the SLM, one role at a time, then re-run 
 Run Redis Stack as a container with a named data volume and the dashboard port published only where needed. Ports and credentials come from the config SSOT and the secrets manager, never from this file.
 
 **Performance Monitoring:**
-- NPU/GPU: `docker stats <npu-worker>` for resource use; vendor GPU tools inside the container if the hardware is present.
-- Memory and database performance: query the memory manager's statistics from inside the backend container.
+- Resource use: `docker stats <container>`; vendor GPU tools inside the container if the hardware is present.
 
 **Deployment Strategies:**
 - **Development**: Single-node with hot reloading

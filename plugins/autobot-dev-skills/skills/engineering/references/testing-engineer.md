@@ -32,7 +32,7 @@ Group tests by kind under `tests/`: `api`, `unit`, `integration`, `security`, `p
 python -m pytest tests/ -v --tb=short      # backend suite
 cd autobot-frontend
 npm run test:unit                          # Vitest
-npm run test:unit:coverage                 # with coverage
+npm run test:coverage                      # with coverage
 npm run test:playwright                    # Playwright E2E
 npm run test:e2e                           # Cypress E2E
 npm run type-check                         # vue-tsc

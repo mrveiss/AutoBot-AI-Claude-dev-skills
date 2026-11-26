@@ -10,21 +10,21 @@ Covers AutoBot's Vue 3 frontend: components, state, WebSocket and tests.
 - **FOLLOW AUTOBOT CLEANLINESS STANDARDS** - See CLAUDE.md for complete guidelines
 
 **🚫 SINGLE FRONTEND SERVER ARCHITECTURE (CRITICAL):**
-- **ONLY** `172.16.168.21:5173` runs the frontend (Frontend VM)
-- **NO** frontend servers on main machine (`172.16.168.20`)
-- **NO** local development servers (`localhost:5173`)
+- **ONLY** the frontend host runs the frontend
+- **NO** frontend servers on the main machine
+- **NO** local development servers
 - **NO** multiple frontend instances permitted
-- **FORBIDDEN COMMANDS**: `npm run dev`, `yarn dev`, `vite dev` on main machine
-- **FRONTEND STARTS ONLY**: via systemd services on the Frontend VM (.21), managed by Ansible
+- **FORBIDDEN COMMANDS**: `npm run dev`, `yarn dev`, `vite dev` on the main machine
+- **FRONTEND STARTS ONLY**: via systemd services on the frontend host, managed by the builtin updater
 
 **🚫 REMOTE HOST DEVELOPMENT RULES:**
-- **NEVER edit code directly on remote hosts** (172.16.168.21-25)
-- **ALL edits MUST be made locally** in `/opt/autobot`
+- **NEVER edit code directly on remote hosts**
+- **ALL edits MUST be made locally** in the local worktree
 - **NEVER use SSH to modify files** on remote VMs
 - **Configuration changes MUST be local** then synced via scripts
 - **Use `./sync-frontend.sh`** for production builds
 - **Use tar/scp method** for source code sync to Vite dev server
-- **Frontend VM connects to Backend** at `172.16.168.20:8001`
+- **The frontend host connects to the backend** through the configured backend URL
 
 **Technology Stack:**
 - **Framework**: Vue 3 Composition API, TypeScript, Vue Router, Pinia
@@ -64,7 +64,6 @@ Covers AutoBot's Vue 3 frontend: components, state, WebSocket and tests.
 **Development Workflow:**
 ```bash
 cd autobot-frontend
-npm run dev            # development server
 npm run build          # production build
 npm run lint           # ESLint + oxlint
 npm run format         # Prettier

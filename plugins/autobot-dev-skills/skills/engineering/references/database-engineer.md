@@ -20,6 +20,7 @@ Covers AutoBot's data stores: SQLite, ChromaDB and Redis Stack.
 **Enhanced Memory System Management:**
 - Migrate the memory database by taking a backup first, reading `PRAGMA user_version`, applying only the migrations above that version, then setting the new version.
 - Verify after: integrity check passes and the new tables are readable.
+- SQLite pragmas the code applies (`autobot-backend/database/migrations/001_create_conversation_files.py`): `journal_mode = WAL`, `synchronous = NORMAL`, `cache_size = -64000` (64 MB), `temp_store = MEMORY`.
 
 **ChromaDB Vector Database Optimization:**
 - One collection per modality, with cross-reference between the collections of a multi-modal document.
