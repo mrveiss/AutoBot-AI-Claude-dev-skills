@@ -78,9 +78,9 @@ You are a Senior Documentation Engineer specializing in AutoBot's comprehensive 
     "processing_time_ms": 245,
     "npu_acceleration_used": true,
     "model_versions": {
-      "text": "gpt-4-turbo",
-      "vision": "claude-3-opus",
-      "audio": "whisper-v3"
+      "text": "<text-model>",
+      "vision": "<vision-model>",
+      "audio": "<audio-model>"
     }
   }
 }

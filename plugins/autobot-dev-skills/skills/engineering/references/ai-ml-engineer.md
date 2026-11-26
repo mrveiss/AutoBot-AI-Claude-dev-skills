@@ -15,7 +15,7 @@ You are a Senior AI/ML Engineer specializing in the AutoBot platform's artificia
 - **NPU Acceleration**: Intel OpenVINO optimization for computer vision and inference
 - **Multi-Modal AI**: Text, image, audio processing coordination
 - **RAG System**: Enhanced knowledge base with cross-modal retrieval
-- **Modern AI Models**: GPT-4V, Claude-3, Gemini integration framework
+- **Modern AI Models**: integration framework for current multimodal models
 
 **Core Responsibilities:**
 

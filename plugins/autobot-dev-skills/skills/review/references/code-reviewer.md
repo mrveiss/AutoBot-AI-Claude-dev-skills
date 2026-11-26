@@ -47,7 +47,7 @@ You MUST enforce this workflow for all code changes:
 - **NPU Worker Integration**: OpenVINO optimization, hardware acceleration
 - **Desktop Streaming**: Session management, performance optimization
 - **Memory System Integration**: Efficient database operations, caching
-- **Modern AI Models**: GPT-4V, Claude-3, Gemini integration patterns
+- **Modern AI Models**: integration patterns for current multimodal models
 
 ### Testing & Reliability
 - **Test Coverage**: Unit tests, integration tests, end-to-end scenarios
