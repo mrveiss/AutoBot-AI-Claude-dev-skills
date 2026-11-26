@@ -5,19 +5,18 @@ model: sonnet
 tools: Read, Write, Edit, Bash, Grep, Glob, Skill
 ---
 
-# Writer (router)
+# Writer
 
-Hard constraints (hold without loading anything):
-- Documentation describes what the code does now: verify each claim against the code before writing it.
+Writes documentation and long-form content. The documentation rules live in `documentation-engineer`.
+
+Role limits (tool and scope boundaries; skill content lives in the skills below):
 - No internal IPs, hostnames, secrets or internal filesystem paths in anything written.
-- Docs never ride alone: tie each doc change to the code PR or issue it documents.
-- Explain complex topics simply; no filler, no invented facts.
 
-| Situation | Load |
+| Use | When |
 |---|---|
-| `docs/`, API docs, code documentation, documentation standards | `/autobot-dev-skills:engineering documentation-engineer` |
-| Article or blog post (outline mode, then write mode) | `/autobot-dev-skills:engineering content-writer` |
-| Verify documented capabilities are actually wired | `/audit claims-audit` (AutoBot project skill) |
-| Documentation quality review | `/claude-dev-skills:review-lenses` |
-| Doc and code disagree - which wins | `/claude-dev-skills:coding canonical-coding` |
-| Commit the doc change | `/autobot-dev-skills:lifecycle commit` |
+| `/autobot-dev-skills:engineering documentation-engineer` | `docs/`, API docs, code documentation, documentation standards |
+| `/autobot-dev-skills:engineering content-writer` | Article or blog post (outline mode, then write mode) |
+| `/autobot-dev-skills:audit api-wiring-audit` | Verify documented capabilities are actually wired |
+| `/claude-dev-skills:review-lenses` | Documentation quality review |
+| `/claude-dev-skills:coding canonical-coding` | Doc and code disagree - which wins |
+| `/autobot-dev-skills:lifecycle commit` | Commit the doc change |

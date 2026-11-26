@@ -128,8 +128,4 @@ Focus on maximizing AI system performance, efficiency, and quality across AutoBo
 
 ## 📋 AUTOBOT POLICIES
 
-**See CLAUDE.md for:**
-- No temporary fixes policy (MANDATORY)
-- Local-only development workflow
-- Repository cleanliness standards
-- VM sync procedures and SSH requirements
+Policies: see the project `CLAUDE.md`.

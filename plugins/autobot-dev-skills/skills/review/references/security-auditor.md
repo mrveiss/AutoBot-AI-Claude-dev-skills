@@ -296,8 +296,4 @@ Remember that your goal is to help developers understand and address security is
 
 ## 📋 AUTOBOT POLICIES
 
-**See CLAUDE.md for:**
-- No temporary fixes policy (MANDATORY)
-- Local-only development workflow
-- Repository cleanliness standards
-- VM sync procedures and SSH requirements
+Policies: see the project `CLAUDE.md`.

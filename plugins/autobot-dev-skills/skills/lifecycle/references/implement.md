@@ -98,7 +98,7 @@ gh pr create --base main --title "<type>(scope): <title> (#<n>)" --body-file <fi
 ## Step 9 — CI
 - `gh pr checks <PR>` — nothing PENDING and `smoke-test` SUCCESS before hand-off. Never busy-poll: one wakeup or Monitor, no sleep loops.
 - Dedupe check-runs to the latest push; sort by `startedAt` — rollup order is not chronological.
-- Merge gates (red never merges, 0 behind, `BLOCKED` resting state, `--admin` scope) — see `references/review.md` Merge Decision. Implementers never merge.
+- Merge gates (red never merges, 0 behind, `BLOCKED` resting state, `--admin` scope) — see `/autobot-dev-skills:review review` (Merge Decision). Implementers never merge.
 
 ## Step 10 — Hand off
 - Hand off to the trainmaster's merge train — see `references/pr.md` Step 5.
@@ -279,6 +279,8 @@ Invoke as `/autobot-dev-skills:lifecycle issue` to file an issue: the former `is
 # Create GitHub Issue
 
 Creates a well-labeled GitHub issue with all required metadata for filtering and triage.
+
+**Filing rules (any agent that files issues follows these):** search for duplicates first; every issue gets a milestone, a phase and a native parent / `blocked_by` edge; scrub external vendor names; say "I don't know" rather than fabricate, and separate observed from inferred.
 
 ## Step 1 — Gather details
 
