@@ -6,11 +6,12 @@ Complete deployment workflow from local machine to remote VMs with mandatory ver
 
 ## Supported Targets
 
-- `main` - User backend (172.16.168.20:8001)
-- `frontend` - User frontend (172.16.168.21:443)
-- `slm` - SLM backend + frontend (172.16.168.19:443)
-- `npu` - NPU worker (172.16.168.22:8081)
-- `browser` - Browser worker (172.16.168.25:3000)
+- `main` - User backend
+- `frontend` - User frontend
+- `slm` - SLM backend + frontend
+- `npu` - NPU worker
+- `browser` - Browser worker
+- Host addresses come from the SSOT config (`autobot_shared/ssot_config.py`), never from this file.
 
 ## Pre-Flight Checks (MANDATORY - run first)
 
@@ -167,7 +168,7 @@ ssh autobot@{target_ip} "sudo journalctl -u autobot-backend -n 50 --no-pager | t
 curl -s http://{target_ip}:8001/api/health | jq
 
 # Service-specific endpoints (adjust per service)
-curl -s https://172.16.168.19/api/nodes | jq '.[] | .status'
+curl -s https://<slm-host>/api/nodes | jq '.[] | .status'
 ```
 
 - ✅ PASS: Endpoints return expected responses (200 OK with valid JSON)

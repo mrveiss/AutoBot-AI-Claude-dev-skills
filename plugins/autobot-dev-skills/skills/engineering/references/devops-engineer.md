@@ -1,6 +1,6 @@
 When to use: Infrastructure specialist for AutoBot AutoBot platform. Use for Docker operations, Redis Stack management, NPU worker deployment, OpenVINO optimization, and production scaling. Proactively engage for infrastructure and deployment.
 
-You are a Senior DevOps Engineer specializing in the AutoBot AutoBot enterprise AI platform infrastructure. Your expertise covers:
+Covers AutoBot infrastructure work: deployment, containers, NPU workers, Redis Stack and backups.
 
 **🧹 REPOSITORY CLEANLINESS MANDATE:**
 - **NEVER place deployment scripts in root directory** - ALL scripts go in `scripts/deployment/`
@@ -25,24 +25,16 @@ You are a Senior DevOps Engineer specializing in the AutoBot AutoBot enterprise 
 #### Available Playbooks:
 
 **Full Production Deployment:**
-```
-[Code example removed for token optimization (bash)]
-```
+`autobot-slm-backend/ansible/playbooks/deploy-full.yml` deploys the full stack. For a running fleet, code and config updates go through the builtin updater (Maintenance, Updates, Code Sync), never an ad-hoc playbook run. Workflow: [deploy.md](../../lifecycle/references/deploy.md).
 
 **Development Environment:**
-```
-[Code example removed for token optimization (bash)]
-```
+`autobot-slm-backend/ansible/playbooks/deploy-development-services.yml` sets up the development environment.
 
 **Health Check & Validation:**
-```
-[Code example removed for token optimization (bash)]
-```
+`autobot-slm-backend/ansible/playbooks/health-check.yml` validates a deployment; run it after every change and read the result, not just the exit code.
 
 **Service-Specific Deployment:**
-```
-[Code example removed for token optimization (bash)]
-```
+Restart a role's service through the builtin updater: Code Sync computes the post-sync restart plan (`autobot-slm-backend/api/_post_sync_plan.py`), not by hand on the host. Roles and their services are listed below under Deployment Roles.
 
 #### Deployment Roles:
 AutoBot has no fixed machine count — it runs in Docker, on one VM, or scaled out by
@@ -54,14 +46,12 @@ role across any number of machines. Roles:
 - **Browser**: Playwright, VNC, desktop environment
 
 #### Health Monitoring:
-```
-[Code example removed for token optimization (bash)]
-```
+- Quick status: uptime and `systemctl is-active` for every AutoBot unit.
+- Logs: `journalctl -u <unit> --since '1 hour ago' --no-pager`, read-only.
+- Connectivity: the backend health endpoint from each role.
 
 #### Emergency Recovery:
-```
-[Code example removed for token optimization (bash)]
-```
+Recover one role at a time and re-run the health check after each; never stop every unit fleet-wide as a first step.
 
 **Reference**: Complete Ansible documentation at `docs/ANSIBLE_PLAYBOOK_REFERENCE.md`
 
@@ -75,24 +65,17 @@ role across any number of machines. Roles:
 **Core Responsibilities:**
 
 **NPU Worker Management:**
-```
-[Code example removed for token optimization (bash)]
-```
+- The NPU worker lives in `autobot-npu-worker/`; its model registry is `OpenVINOModelManager` (`autobot-npu-worker/resources/windows-npu-worker/app/model_manager.py`). Read the worker's logs for failures. The root `docker-compose.yml` defines no NPU profile (profiles there: `ollama`, `monitoring`), so do not assume one.
 
 **Container Orchestration:**
-```
-[Code example removed for token optimization (bash)]
-```
+- Whole system: `docker compose up -d`; inspect with `docker ps` and `docker logs <container>`.
+- Health: curl each service's health endpoint (backend, memory system, NPU worker) from the config SSOT, not from remembered ports.
 
 **Redis Stack Configuration:**
-```
-[Code example removed for token optimization (bash)]
-```
+Run Redis Stack as a container with a named data volume and the dashboard port published only where needed. Ports and credentials come from the config SSOT and the secrets manager, never from this file.
 
 **Performance Monitoring:**
-```
-[Code example removed for token optimization (bash)]
-```
+- Resource use: `docker stats <container>`; vendor GPU tools inside the container if the hardware is present.
 
 **Deployment Strategies:**
 - **Development**: Single-node with hot reloading
@@ -101,9 +84,8 @@ role across any number of machines. Roles:
 - **Hybrid**: CPU/GPU/NPU intelligent workload distribution
 
 **Backup and Recovery:**
-```
-[Code example removed for token optimization (bash)]
-```
+- Back up SQLite files with a timestamped copy, and Redis with `BGSAVE` plus a copy of the dump.
+- Backing up is automatic; deleting or rotating a backup is proposed to a human, never done by an agent.
 
 **Scaling and Optimization:**
 - NPU worker horizontal scaling based on inference load

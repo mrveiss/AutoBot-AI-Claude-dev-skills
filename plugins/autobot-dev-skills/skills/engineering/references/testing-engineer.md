@@ -1,6 +1,6 @@
 When to use: Testing specialist for AutoBot platform. Use for test strategy, automated testing, E2E workflows, multi-modal testing, NPU validation, and comprehensive quality assurance. Proactively engage for testing complex multi-agent workflows and AutoBot system integration.
 
-You are a Senior Testing Engineer specializing in the AutoBot AI platform. Your expertise covers:
+Covers AutoBot test strategy and execution: backend, Vue frontend, E2E, load and infrastructure tests.
 
 **AutoBot Testing Stack:**
 
@@ -24,73 +24,58 @@ You are a Senior Testing Engineer specializing in the AutoBot AI platform. Your 
 
 **ALL test files MUST be organized under `tests/` directory:**
 
-```
-[Code example removed for token optimization]
-```
+Group tests by kind under `tests/`: `api`, `unit`, `integration`, `security`, `performance` and `gui` (E2E); keep test data in `fixtures/` (images, audio, data); write outputs only to `results/`, `reports/`, `screenshots/` and `logs/`.
 
 **AutoBot Testing Commands:**
 
-```
-[Code example removed for token optimization (bash)]
+```bash
+python -m pytest tests/ -v --tb=short      # backend suite
+cd autobot-frontend
+npm run test:unit                          # Vitest
+npm run test:coverage                      # with coverage
+npm run test:playwright                    # Playwright E2E
+npm run test:e2e                           # Cypress E2E
+npm run type-check                         # vue-tsc
+npm run lint                               # ESLint + oxlint
 ```
 
 **Vue.js Testing Configuration:**
 
-```
-[Code example removed for token optimization (javascript)]
-```
+Vitest with a jsdom environment and a shared setup file for global stubs. Read the existing `vitest` config in `autobot-frontend` and extend it; do not add a second one.
 
 **AutoBot Core Testing:**
 
-```
-[Code example removed for token optimization (python)]
-```
+Cover the chat workflow, knowledge base, LLM interface, configuration and Redis database separation. Use fixtures and fakes for Redis and the LLM so tests never reach real services.
 
 **Vue.js Component Testing:**
 
-```
-[Code example removed for token optimization (javascript)]
-```
+Mount components with Vue Test Utils; assert rendered output, emitted events and store effects, not implementation details. Stub WebSocket and API clients.
 
 **AutoBot Infrastructure Testing:**
 
-```
-[Code example removed for token optimization (python)]
-```
+Cover Redis connectivity, container services, and desktop-streaming access with tests that skip cleanly when the service is absent, and report what was skipped.
 
 **AutoBot Workflow Testing:**
 
-```
-[Code example removed for token optimization (python)]
-```
+Drive the full path (message in, workflow, tool call, response out) against fakes for the LLM and external services; assert the end state and the events emitted.
 
 **Vue.js E2E Testing with Playwright:**
 
-```
-[Code example removed for token optimization (javascript)]
-```
+Playwright for user journeys: chat, knowledge browsing, system monitoring. Use role- and label-based locators, wait on conditions rather than timeouts, and keep screenshots in `tests/screenshots/`.
 
 **Vue.js Testing Best Practices:**
 
-```
-[Code example removed for token optimization (javascript)]
-```
+One behaviour per test, no shared mutable state, mock only boundaries (network, clock, storage), and a failing test must fail for one reason.
 
 **MVC Architecture and Configuration Testing:**
 
-```
-[Code example removed for token optimization (javascript)]
-```
+Config comes from the SSOT; test that components read it and that no URL or port is hardcoded.
 
-```
-[Code example removed for token optimization (python)]
-```
+Test that backend modules follow the layered structure and read configuration through the SSOT, not literals.
 
 **AutoBot Performance and Load Testing:**
 
-```
-[Code example removed for token optimization (python)]
-```
+Load-test chat processing, knowledge-base search and API endpoints; record latency percentiles and error rate, compare with a stored baseline and report regressions with the numbers.
 
 **Testing Strategy for AutoBot:**
 
@@ -106,14 +91,15 @@ You are a Senior Testing Engineer specializing in the AutoBot AI platform. Your 
 **CRITICAL**: ALL test results and outputs MUST be stored in organized subdirectories:
 
 ```
-[Code example removed for token optimization (bash)]
+tests/results/      # test execution results
+tests/reports/      # summary reports and analysis
+tests/logs/         # execution logs and debug output
+tests/screenshots/  # visual test artifacts
 ```
 
 **Quality Gates:**
 
-```
-[Code example removed for token optimization (bash)]
-```
+A change passes only when, from a clean checkout: backend and frontend suites pass, the type check and linters pass, and coverage on touched code has not dropped. Results go to a timestamped directory under `tests/results/`. CI is the final gate.
 
 **Available MCP Tools Integration:**
 Leverage these Model Context Protocol tools for enhanced testing workflows:

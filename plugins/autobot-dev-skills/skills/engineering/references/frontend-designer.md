@@ -76,8 +76,34 @@ If the user provides images or mockups:
 
 2. **Generate Comprehensive Design Schema**
    Create a detailed JSON schema that captures:
+   ```json
+   {
+     "designSystem": {
+       "colors": {},
+       "typography": {},
+       "spacing": {},
+       "breakpoints": {},
+       "shadows": {},
+       "borderRadius": {},
+       "animations": {}
+     },
+     "components": {
+       "[ComponentName]": {
+         "variants": [],
+         "states": [],
+         "props": {},
+         "accessibility": {},
+         "responsive": {},
+         "interactions": {}
+       }
+     },
+     "layouts": {},
+     "patterns": {}
+   }
    ```
-[Code example removed for token optimization (json)]
+
+3. **Deliver the spec** as `frontend-design-spec.md` in the user-confirmed location (suggest `docs/design/` if none is given), in this shape:
+
 ```markdown
 # Frontend Design Specification
 
@@ -107,8 +133,10 @@ If the user provides images or mockups:
 **Variants**: [List of variants with use cases]
 
 **Props Interface**:
-```
-[Code example removed for token optimization (typescript)]
+```typescript
+interface [ComponentName]Props {
+  // Detailed prop definitions
+}
 ```
 
 **Visual Specifications**:
@@ -119,8 +147,8 @@ If the user provides images or mockups:
 - [ ] Animation details
 
 **Implementation Example**:
-```
-[Code example removed for token optimization (jsx)]
+```jsx
+// Complete component code example
 ```
 
 **Accessibility Requirements**:
@@ -147,65 +175,7 @@ If the user provides images or mockups:
 ## Feedback & Iteration Notes
 [Space for user feedback and design iterations]
 ```
-[Code example removed for token optimization]
-```bash
-# Edit locally first
-vim autobot-vue/src/components/MyComponent.vue
 
-# Then sync to the frontend role
-./scripts/utilities/sync-frontend.sh components/MyComponent.vue
-# OR
-./scripts/utilities/sync-to-vm.sh frontend autobot-vue/src/components/ /home/autobot/autobot-vue/src/components/
-```
-[Code example removed for token optimization]
-```bash
-# Edit locally first
-vim backend/api/chat.py
+## Local-only editing
 
-# Then sync to the AI Stack role
-./scripts/utilities/sync-to-vm.sh ai-stack backend/api/ /home/autobot/backend/api/
-# OR, for a deployed fleet: the builtin updater (SLM Maintenance -> Updates -> Code Sync), never ad-hoc ansible
-```
-[Code example removed for token optimization]
-```bash
-# Edit locally first
-vim config/redis.conf
-
-# Then deploy via Ansible
-# Deployed hosts update through the builtin updater (SLM Maintenance -> Updates -> Code Sync); never an ad-hoc playbook run
-```
-[Code example removed for token optimization]
-```bash
-# Edit locally first
-vim docker-compose.yml
-
-# Then deploy via Ansible
-# Deployed hosts update through the builtin updater (SLM Maintenance -> Updates -> Code Sync); never an ad-hoc playbook run
-```
-[Code example removed for token optimization]
-```bash
-# WRONG - Direct editing on a remote host
-ssh autobot@<frontend-host> "vim /home/autobot/app.py"
-
-# WRONG - Remote configuration change  
-ssh autobot@<database-host> "sudo vim /etc/redis-stack.conf"
-
-# WRONG - Direct Docker changes on a remote host
-ssh autobot@<aiml-host> "docker-compose up -d"
-```
-[Code example removed for token optimization]
-```bash
-# RIGHT - Local edit + sync
-vim app.py
-./scripts/utilities/sync-to-vm.sh ai-stack app.py /home/autobot/app.py
-
-# RIGHT - Local config + Ansible
-vim config/redis.conf  
-# Deployed hosts update through the builtin updater (SLM Maintenance -> Updates -> Code Sync); never an ad-hoc playbook run
-
-# RIGHT - Local Docker + deployment
-vim docker-compose.yml
-# Deployed hosts update through the builtin updater (SLM Maintenance -> Updates -> Code Sync); never an ad-hoc playbook run
-```
-
-**This policy is NON-NEGOTIABLE. Violations will be corrected immediately.**
+Design files and components are edited locally only; see `.claude/docs/MANDATORY_LOCAL_EDIT_POLICY.md` and, for deploying, the builtin-updater rule in AutoBot `CLAUDE.md`.

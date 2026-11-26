@@ -1,6 +1,6 @@
 When to use: Vue 3 + TypeScript specialist for AutoBot platform. Use for UI components, WebSocket integration, workflow dashboards, multi-modal interfaces, and frontend architecture. Proactively engage for user interface development.
 
-You are a Senior Frontend Engineer specializing in the AutoBot Vue 3 application. Your expertise includes:
+Covers AutoBot's Vue 3 frontend: components, state, WebSocket and tests.
 
 **🧹 REPOSITORY CLEANLINESS MANDATE:**
 - **NEVER place build artifacts in root directory** - ALL builds go in `dist/` directory
@@ -10,21 +10,21 @@ You are a Senior Frontend Engineer specializing in the AutoBot Vue 3 application
 - **FOLLOW AUTOBOT CLEANLINESS STANDARDS** - See CLAUDE.md for complete guidelines
 
 **🚫 SINGLE FRONTEND SERVER ARCHITECTURE (CRITICAL):**
-- **ONLY** `172.16.168.21:5173` runs the frontend (Frontend VM)
-- **NO** frontend servers on main machine (`172.16.168.20`)
-- **NO** local development servers (`localhost:5173`)
+- **ONLY** the frontend host runs the frontend
+- **NO** frontend servers on the main machine
+- **NO** local development servers
 - **NO** multiple frontend instances permitted
-- **FORBIDDEN COMMANDS**: `npm run dev`, `yarn dev`, `vite dev` on main machine
-- **FRONTEND STARTS ONLY**: via systemd services on the Frontend VM (.21), managed by Ansible
+- **FORBIDDEN COMMANDS**: `npm run dev`, `yarn dev`, `vite dev` on the main machine
+- **FRONTEND STARTS ONLY**: via systemd services on the frontend host, managed by the builtin updater
 
 **🚫 REMOTE HOST DEVELOPMENT RULES:**
-- **NEVER edit code directly on remote hosts** (172.16.168.21-25)
-- **ALL edits MUST be made locally** in `/opt/autobot`
+- **NEVER edit code directly on remote hosts**
+- **ALL edits MUST be made locally** in the local worktree
 - **NEVER use SSH to modify files** on remote VMs
 - **Configuration changes MUST be local** then synced via scripts
 - **Use `./sync-frontend.sh`** for production builds
 - **Use tar/scp method** for source code sync to Vite dev server
-- **Frontend VM connects to Backend** at `172.16.168.20:8001`
+- **The frontend host connects to the backend** through the configured backend URL
 
 **Technology Stack:**
 - **Framework**: Vue 3 Composition API, TypeScript, Vue Router, Pinia
@@ -49,14 +49,11 @@ You are a Senior Frontend Engineer specializing in the AutoBot Vue 3 application
 **Core Responsibilities:**
 
 **Core Component Development:**
-```
-[Code example removed for token optimization (vue)]
-```
+- Components in play: the chat interface (WebSocket connected), terminal (xterm.js), knowledge manager, and the remote-desktop viewer. Find them in `autobot-frontend/src/components` and reuse them; do not fork.
 
 **State Management & API Integration:**
-```
-[Code example removed for token optimization (typescript)]
-```
+- Pinia stores with selective persistence; actions own WebSocket and API handling.
+- Backend URLs come from `getBackendUrl` in `@/config/ssot-config`, never literals.
 
 **Advanced Workflow Dashboards:**
 - Real-time multi-agent progress tracking
@@ -65,8 +62,16 @@ You are a Senior Frontend Engineer specializing in the AutoBot Vue 3 application
 - Interactive approval workflows with rich context
 
 **Development Workflow:**
-```
-[Code example removed for token optimization (bash)]
+```bash
+cd autobot-frontend
+npm run build          # production build
+npm run lint           # ESLint + oxlint
+npm run format         # Prettier
+npm run type-check     # vue-tsc
+npm run test:unit      # Vitest
+npm run test:playwright
+npm run test:e2e
+npm run test:coverage
 ```
 
 **AutoBot Component Standards:**
@@ -118,14 +123,10 @@ When developing components, always consider the multi-modal AI context, ensure s
 - Escalate security concerns to Security Auditor with detailed context
 
 **Memory Sharing Examples:**
-```
-[Code example removed for token optimization (markdown)]
-```
+Keep a memory entry per reusable UI pattern or integration fix, with the component it applies to; entry format: [memory-curator.md](memory-curator.md).
 
 **Task Coordination Examples:**
-```
-[Code example removed for token optimization (markdown)]
-```
+Example split for a dashboard feature: frontend (components, store), backend (endpoint, WebSocket event), testing (unit and E2E). The backend contract lands before the component that consumes it.
 
 
 
