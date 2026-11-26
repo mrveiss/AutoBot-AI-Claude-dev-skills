@@ -21,7 +21,7 @@ gh pr list --state open --json number,title --jq '.[]|"\(.number) \(.title)"'
 ~/.claude/scripts/backlog-governor.sh status     # advisory signal only
 ```
 
-Sweep → review → hand green to the trainmaster → close with evidence → remove worktree/branch.
+Sweep → review → hand green PRs to the PR coordinator (`references/pr.md` Step 5) → close with evidence → remove worktree/branch.
 A merged PR closes an issue; a new issue closes nothing.
 
 **Either queue non-empty → draining it IS the tick.** Land the top row of

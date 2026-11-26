@@ -116,13 +116,13 @@ gh pr create --base main --head issue-<n> --title "..." --body-file <file>
 - Wiring check: any new public module must have ≥1 production caller — HARD BLOCK if 0.
 - Linting: `python -m black --check <files>`
 
-Fix inline and re-push if validation fails, unless the head is queued in a train. Never merge a failing PR.
+Fix inline and re-push if validation fails, unless the coordinator or a trainmaster already holds the head. Never merge a failing PR.
 
 ---
 
 ## Step 6: Land
 
-Hand off to the trainmaster's merge train — see `references/pr.md` Step 5.
+Give each PR number and head to the PR coordinator (`references/pr.md` Step 5).
 
 ```bash
 git fetch origin && git log origin/main --oneline --grep="#<n>" | head -1  # confirm landed

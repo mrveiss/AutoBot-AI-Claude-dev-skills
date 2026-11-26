@@ -64,11 +64,13 @@ gh pr create --base main --title "<type>(scope): <description> (#issue-number)" 
 ## Step 4 — CI
 
 - Never busy-poll: schedule one wakeup or arm one Monitor, then `gh pr checks <pr>` once when it fires.
-- CI failing: root-cause, push a fix commit (not once the head is queued in a train).
+- CI failing: root-cause, push a fix commit (not once a trainmaster has queued the head; see Step 5).
 
 ## Step 5 — Land and close
 
-Approved PRs land via a merge train run by the trainmaster session — merge commit, never squash. Hand the trainmaster the PR number + head SHA; never push to a head once it is queued; the trainmaster merges and fixes small findings in-train.
+The PR coordinator owns every PR and lands it individually, merge commit, never squash: milestone first, then FIFO by submission. At most 2 PRs hold CI; a PR branch is synced with main before its CI run; Claude-edit PRs take the priority lane. Hand the coordinator the PR number + head SHA, then do not push to the head; further fixes go through the coordinator.
+
+**While a trainmaster runs** (only then): the trainmaster batches approved PRs into a merge train and fixes small findings in-train. Never push to a head once it is queued in a train, and never cancel a `train-*` run.
 
 The merger posts the per-AC evidence (Closes/Refs rule: Step 3).
 
@@ -96,4 +98,4 @@ Do not leave merged worktrees on disk. Stale worktrees waste disk and confuse `g
 - Uncommitted changes present
 - No issue reference in title or body
 - Skipped pre-push quality checks (Step 1.5)
-- Busy-polling CI or pushing to a head queued in a train
+- Busy-polling CI, or pushing to a head the coordinator or a trainmaster already holds

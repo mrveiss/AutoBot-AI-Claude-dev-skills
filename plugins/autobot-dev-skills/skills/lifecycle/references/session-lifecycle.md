@@ -67,15 +67,14 @@ Base branch: `main` (adjust if the dispatch says otherwise).
    `docs/developer/SESSION_END.md`) and pick up the open notes it lists. If a
    note's branch is unmerged, continue it (rebase onto base first) or start
    fresh — never duplicate its work blind.
-4. **No local test runs** — CI and merge trains are the gate. Run only the
-   targeted lint/guards for the files you touch.
+4. **No local test runs** — CI is the gate.
 
 ## DURING THE SESSION
 
 - One commit per logical change; reference issues (`fixes #NNNN`).
 - LICENSE, NOTICE, SPDX headers, and licensing statements are READ-ONLY.
   Flag concerns in the report; never modify.
-- Never push directly to the base branch. Never merge yourself — Hand off to the trainmaster's merge train — see `references/pr.md` Step 5.
+- Never push directly to the base branch. Never merge yourself; the PR coordinator lands it (`references/pr.md` Step 5).
 - If you discover another session has landed overlapping work: rebase onto
   latest base immediately and reconcile before continuing.
 

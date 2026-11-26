@@ -70,7 +70,7 @@ git commit -m "<type>(scope): <description> (#<n>)"
 ```
 - Format is `<type>(scope): <description> (#issue)`. `tech-debt` is NOT a valid type.
 - **No commit trailers.** mrveiss is sole author — never add `Co-Authored-By`.
-- Never `--no-verify`.
+- `git commit` never skips hooks: no hook-bypass flag on any commit.
 
 ## Step 7 — Pre-push quality checks (MANDATORY)
 ```bash
@@ -101,7 +101,7 @@ gh pr create --base main --title "<type>(scope): <title> (#<n>)" --body-file <fi
 - Merge gates (red never merges, 0 behind, `BLOCKED` resting state, `--admin` scope) — see `/autobot-dev-skills:review review` (Merge Decision). Implementers never merge.
 
 ## Step 10 — Hand off
-- Hand off to the trainmaster's merge train — see `references/pr.md` Step 5.
+- Landing: give the PR number and head to the PR coordinator; the rules are in `references/pr.md` Step 5.
 - Must wait: post ONE comment, set status `in_review`, STOP. Never busy-poll.
 - Closes/Refs rule — see `references/pr.md` Step 3.
 
@@ -134,7 +134,7 @@ gh issue view <n> --json state            # Closes fired at merge; Refs → clos
 - [ ] Commit format correct, no trailers, no `--no-verify`
 - [ ] PR targets `main` with the four required headings; smoke-test green; not behind base
 - [ ] Every new module has ≥1 caller, or a wire-in issue is filed and referenced
-- [ ] Handed to the trainmaster (PR number + head); `Closes` only if every AC is delivered, else `Refs`; AC evidence posted after merge
+- [ ] Handed to the PR coordinator (PR number + head); `Closes` only if every AC is delivered, else `Refs`; AC evidence posted after merge
 
 ---
 

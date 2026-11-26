@@ -24,7 +24,7 @@ For each PR, classify CI status as **passing**, **failing**, or **queued/running
 ```bash
 gh pr checks <number> --json name,state,conclusion
 ```
-- **Never cancel a `train-*` run or a run with a live ci-slot hold** (`ledger holds | grep ci-slot`) — CI priority belongs to the trainmaster; queued checks are running normally
+- **Never cancel a run under a live ci-slot hold** (`ledger holds | grep ci-slot`), nor a `train-*` run while a trainmaster runs; queued checks are running normally
 - Only act on checks in state `failure` or `error`
 - Treat `code-quality` as a required blocking check
 
@@ -45,11 +45,11 @@ For each PR with green or actionable CI:
 For PRs blocked only on Black/isort/flake8/mypy:
 1. Check out on a feature branch (if branch-protected, never push direct)
 2. Run: `black . && isort . && ruff check --fix .`
-3. Commit and push to the PR branch — never to a head queued in a train (the trainmaster fixes those in-train)
+3. Commit and push to the PR branch — never to a head the coordinator or a trainmaster already holds
 
 ## Merge Decision
 
-Approved PRs land via the trainmaster's merge train (merge commit, never squash). Hand off when:
+Approved PRs go to the PR coordinator (`lifecycle/references/pr.md` Step 5). Hand off when:
 - All required checks pass (not just code-quality)
 - No blocking findings from the review pass
 - The branch is not behind base — a green run describes a merge base that may have moved
