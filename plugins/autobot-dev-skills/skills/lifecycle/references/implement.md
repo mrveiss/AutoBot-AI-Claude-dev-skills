@@ -131,7 +131,7 @@ gh issue view <n> --json state            # Closes fired at merge; Refs → clos
 - [ ] Work done in a worktree off `origin/main`, committed incrementally
 - [ ] `security` issue: all 5 Step 5 gates passed, else fix withheld (`Refs`, failed gate on the issue)
 - [ ] Tests + lint + mypy pass; no `print(`/`console.` violations; formatted
-- [ ] Commit format correct, no trailers, no `--no-verify`
+- [ ] Commit format correct, no trailers, `git commit` never skips hooks
 - [ ] PR targets `main` with the four required headings; smoke-test green; not behind base
 - [ ] Every new module has ≥1 caller, or a wire-in issue is filed and referenced
 - [ ] Handed to the PR coordinator (PR number + head); `Closes` only if every AC is delivered, else `Refs`; AC evidence posted after merge
@@ -193,7 +193,7 @@ Before making ANY code changes:
 7. **Implement using incremental edits:**
    - Use `Edit` for existing files >50 lines (NOT Write)
    - Focus on one subtask at a time
-   - Run targeted lint/type/guard checks after each subtask (no local test runs - CI is the gate)
+   - Local runs: see `session-lifecycle.md` (No local test runs)
    - **Commit after completing each logical group (2-3 subtasks)**
 
    **Commit pattern:**
@@ -212,11 +212,7 @@ Before making ANY code changes:
 
 ## Verification Phase
 
-9. **Targeted checks (no local test runs - CI is the gate):**
-    ```bash
-    # Backend: lint/type/guards for touched files only
-    # Frontend (if applicable): vue-tsc / eslint for touched components
-    ```
+9. **Local runs:** see `session-lifecycle.md` (No local test runs).
 
 10. **Pre-commit validation:**
     - Run `git diff --staged` before committing

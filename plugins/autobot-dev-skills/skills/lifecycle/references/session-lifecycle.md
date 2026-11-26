@@ -67,7 +67,7 @@ Base branch: `main` (adjust if the dispatch says otherwise).
    `docs/developer/SESSION_END.md`) and pick up the open notes it lists. If a
    note's branch is unmerged, continue it (rebase onto base first) or start
    fresh — never duplicate its work blind.
-4. **No local test runs** — CI is the gate.
+4. **No local test runs** — CI is the gate. No local suite, guard, lint, type-check or ratchet run either: fix what reading the diff and the guards it obviously touches shows, push once, and CI (the coordinator's preboard-guard lane plus the suite) returns failures as one batch.
 
 ## DURING THE SESSION
 
