@@ -61,7 +61,7 @@ Covers AutoBot's Vue 3 frontend: components, state, WebSocket and tests.
 - Multi-modal processing pipeline visualization
 - Interactive approval workflows with rich context
 
-**Development Workflow:**
+**Development Workflow** (CI runs lint, type-check and tests; no local runs, see `lifecycle/references/session-lifecycle.md`):
 ```bash
 cd autobot-frontend
 npm run build          # production build

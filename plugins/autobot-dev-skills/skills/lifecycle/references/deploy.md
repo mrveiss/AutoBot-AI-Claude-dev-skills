@@ -46,26 +46,15 @@ Before deploying anything:
    ```
    - If uncommitted changes exist, ask user: commit first or deploy anyway?
 
-2. **Run local linting/type checks:**
+2. **Read CI for the head:** `gh pr checks <pr>`; no local lint or type runs (see `session-lifecycle.md` (No local test runs)).
 
-   For **backend** changes:
-   ```bash
-   ruff check autobot-backend/  # or autobot-slm-backend/
-   ```
-
-   For **frontend** changes:
-   ```bash
-   cd autobot-user-frontend && npm run type-check && npm run lint
-   # or cd autobot-slm-frontend && npm run type-check && npm run lint
-   ```
-
-   For **Ansible** changes:
+   For **Ansible** changes, the playbook syntax check is a deploy-time check, not a CI substitute:
    ```bash
    cd autobot-slm-backend/ansible
    ansible-playbook playbooks/<playbook>.yml --syntax-check
    ```
 
-   - If ANY checks fail, STOP - fix locally before deploying
+   - If ANY check fails, STOP and fix it through a PR before deploying
 
 3. **Confirm deployment target:**
    - Ask user to confirm: "Deploy to {target} server ({IP})?"

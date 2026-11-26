@@ -44,7 +44,7 @@ For each PR with green or actionable CI:
 
 For PRs blocked only on Black/isort/flake8/mypy:
 1. Check out on a feature branch (if branch-protected, never push direct)
-2. Run: `black . && isort . && ruff check --fix .`
+2. Fix the formatting by editing the files the CI check names (no local runs: see `lifecycle/references/session-lifecycle.md`)
 3. Commit and push to the PR branch — never to a head the coordinator or a trainmaster already holds
 
 ## Merge Decision

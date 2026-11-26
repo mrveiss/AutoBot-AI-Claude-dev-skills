@@ -26,7 +26,7 @@ Covers AutoBot test strategy and execution: backend, Vue frontend, E2E, load and
 
 Group tests by kind under `tests/`: `api`, `unit`, `integration`, `security`, `performance` and `gui` (E2E); keep test data in `fixtures/` (images, audio, data); write outputs only to `results/`, `reports/`, `screenshots/` and `logs/`.
 
-**AutoBot Testing Commands:**
+**AutoBot Testing Commands** (what CI runs; no local runs, see `lifecycle/references/session-lifecycle.md`):
 
 ```bash
 python -m pytest tests/ -v --tb=short      # backend suite

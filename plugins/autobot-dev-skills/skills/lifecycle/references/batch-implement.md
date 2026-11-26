@@ -85,7 +85,7 @@ Repeat batches until all issues are `SUCCESS`, `SKIPPED`, or `ESCALATED`.
 
 ---
 
-## Step 4: Pre-Push Verification (every PR before push)
+## Step 4: Pre-Push Check (every PR before push)
 
 ```bash
 # Re-fetch and abort if issue already closed during session

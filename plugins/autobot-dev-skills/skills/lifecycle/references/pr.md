@@ -12,22 +12,12 @@ git status && git diff             # must be clean; if not, run /commit first
 git log --oneline origin/main..HEAD
 ```
 
-## Step 1.5 — Pre-Push Quality Check (MANDATORY)
+## Step 1.5 — Pre-Push Quality (MANDATORY)
 
-```bash
-# Catch violations before they fail CI
-grep -rn 'print(' autobot-backend/ autobot_shared/ --include='*.py' | grep -v '#' | grep -v 'test_'
-grep -rn 'console\.\(log\|error\|warn\)' autobot-frontend/src/ --include='*.ts' --include='*.vue'
-# Auto-format Python
-black autobot-backend/ autobot_shared/ autobot-slm-backend/ 2>/dev/null || true
-isort autobot-backend/ autobot_shared/ autobot-slm-backend/ 2>/dev/null || true
-ruff check --fix autobot-backend/ autobot_shared/ 2>/dev/null || true
-# Commit formatting changes if any
-git add -u && git diff --cached --quiet || git commit -m "style(format): auto-format (#<issue-number>)"
-```
+No local runs: see `session-lifecycle.md` (No local test runs). Write to these, which CI checks:
 
-- `print()` → `get_logger(__name__)` from `autobot_shared.logging_manager`; `console.*` → `createLogger()` from `@/utils/debugUtils`
-- Fix all violations before proceeding.
+- `print()` → `get_logger(__name__)` from `autobot_shared.logging_manager`; `console.*` → `createLogger()` from `@/utils/debugUtils`.
+- Python formatting and import order follow the repo's black, isort and ruff configuration.
 
 ## Step 2 — Push Branch
 

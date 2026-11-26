@@ -48,19 +48,16 @@ ledger iam <session> && ledger claim worktree issue-<n> --ttl 168h
 ## Step 4 — Implement
 - <8 files: Read → Edit → verify syntax → next file. No subagents (implementer sessions; the merge/review session delegates by model tier).
 - ≥8 files or genuinely parallel work: subagents.
-- Run the relevant tests after each task; fix failures before continuing.
+- Tests: CI runs them; read the diff after each task and fix what it shows before continuing.
 
 ## Step 5 — Verify
-```bash
-git diff --name-only | grep '\.py$' | xargs flake8 --max-line-length=100
-mypy <files>
-```
+CI returns flake8, mypy and the tests for the head as one batch; local runs: see `session-lifecycle.md` (No local test runs).
 - **`security`-labelled issue:** run these gates in order, never trading an earlier for a later:
   1. **Applies** — the final diff contains only the intended change.
   2. **Closes** — re-run the issue's reproduction or test against the patch; it no longer reproduces.
   3. **Bypass review** — a separate subagent, given the patch but not the author's reasoning, tries variants (encodings, alternate route, sibling call site). The author re-reading their own diff does not count.
   4. **Preserved behaviour** — the legitimate case through the same path still works.
-  5. **Repo checks** — the flake8/mypy/test checks above.
+  5. **Repo checks** — the lint, type and test results CI returns for the head.
 - **Any gate fails → fix withheld:** no `Closes #N` (use `Refs`), and the failed gate is recorded on the issue.
 
 ## Step 6 — Commit
@@ -72,18 +69,10 @@ git commit -m "<type>(scope): <description> (#<n>)"
 - **No commit trailers.** mrveiss is sole author — never add `Co-Authored-By`.
 - `git commit` never skips hooks: no hook-bypass flag on any commit.
 
-## Step 7 — Pre-push quality checks (MANDATORY)
-```bash
-# print() outside tests → use get_logger(__name__)
-grep -r 'print(' autobot-backend/ autobot_shared/ --include='*.py' | grep -v '#' | grep -v 'test_'
-# console.* in TS/Vue → use createLogger()
-grep -r 'console\.' autobot-frontend/src/ --include='*.ts' --include='*.vue'
-black autobot-backend/ autobot_shared/ autobot-slm-backend/
-isort autobot-backend/ autobot_shared/ autobot-slm-backend/
-ruff check --fix autobot-backend/ autobot_shared/
-git add -u && git diff --cached --quiet || git commit -m "style(format): auto-format (#<n>)"
-```
-- Frontend lint is oxlint AND eslint — `npx eslint` alone passes while CI fails.
+## Step 7 — Pre-push quality (MANDATORY)
+No local runs: see `session-lifecycle.md` (No local test runs). Write to these, which CI checks:
+- `print()` outside tests → `get_logger(__name__)`; `console.*` in TS/Vue → `createLogger()`.
+- Frontend lint is oxlint AND eslint; CI runs both, so satisfy both.
 
 ## Step 8 — Push and open the PR
 ```bash
@@ -130,7 +119,7 @@ gh issue view <n> --json state            # Closes fired at merge; Refs → clos
 - [ ] Issue attached to the umbrella as a native sub-issue, and every blocker as a `blocked_by` edge
 - [ ] Work done in a worktree off `origin/main`, committed incrementally
 - [ ] `security` issue: all 5 Step 5 gates passed, else fix withheld (`Refs`, failed gate on the issue)
-- [ ] Tests + lint + mypy pass; no `print(`/`console.` violations; formatted
+- [ ] CI green (tests, lint, types); no `print(`/`console.` violations
 - [ ] Commit format correct, no trailers, `git commit` never skips hooks
 - [ ] PR targets `main` with the four required headings; smoke-test green; not behind base
 - [ ] Every new module has ≥1 caller, or a wire-in issue is filed and referenced
