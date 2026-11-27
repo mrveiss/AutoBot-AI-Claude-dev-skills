@@ -89,7 +89,7 @@ MILESTONE_NUM = re.compile(r"^\s*M(\d+)\b")
 ACTIVE = {"QUEUED", "IN_PROGRESS", "WAITING", "PENDING", "REQUESTED"}
 
 Q = """query($c:String){repository(owner:"mrveiss",name:"AutoBot-AI"){pullRequests(states:OPEN,first:100,after:$c){
-pageInfo{hasNextPage endCursor} nodes{number title createdAt updatedAt isDraft body changedFiles headRefName headRefOid headRepository{nameWithOwner} isCrossRepository maintainerCanModify mergeable milestone{title} author{login}}}}}"""
+pageInfo{hasNextPage endCursor} nodes{number title createdAt updatedAt isDraft body changedFiles headRefName headRefOid headRepository{nameWithOwner} isCrossRepository maintainerCanModify mergeStateStatus mergeable milestone{title} author{login}}}}}"""
 THREADS = """reviewThreads(first:60){nodes{id isResolved comments(first:1){nodes{author{login}}}
   last:comments(last:1){nodes{author{login} createdAt url}}}}"""
 CHECKS = """commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{
@@ -239,6 +239,7 @@ def ci_state(pr):
         red = []                                  # every failure is the #18106 draft gate: stale once ready
     if red and RECHECK.get(str(pr["number"])) == pr["headRefOid"][:9]:
         red = []                                  # owner-verified stale red at exactly this head: rerun in a slot
+    pr["action_required"] = [n for n in red if latest[n][1] == "ACTION_REQUIRED"]
     return red, active, len(latest)
 
 
@@ -321,13 +322,61 @@ def is_protected(branch, repo):
 
 
 def attribute_run(branch, sha, repo, prs):
-    """Which open PR a run belongs to: (PR or None, ambiguous). A branch name alone is not an identity (a fork may
-    name its branch like an own one), so match (head repo, branch); several candidates are narrowed by the run's
-    head SHA, and a run that still maps to more than one PR is ambiguous: the caller must not act on a guess."""
-    cands = [p for p in prs if p["headRefName"] == branch and pr_repo(p) in ("", repo)]
-    if len(cands) > 1:
-        cands = [p for p in cands if p["headRefOid"] == sha] or cands
-    return (cands[0], False) if len(cands) == 1 else (None, len(cands) > 1)
+    """Every open PR a run could belong to. A branch name alone is not an identity (a fork may name its branch like
+    an own one), so match (head repo, branch) strictly (a deleted fork is "" on both sides); several candidates
+    are narrowed by the run's head SHA."""
+    cands = [p for p in prs if p["headRefName"] == branch and pr_repo(p) == repo]
+    return [p for p in cands if p["headRefOid"] == sha] or cands if len(cands) > 1 else cands
+
+
+def classify_run(run, prs, verdict):
+    """(PR, reason) for one run. `verdict(p)` is the caller's cancel reason for a PR ("" = keep the run). PR is None
+    with reason "protected" (never touched), "ambiguous" (candidate PRs disagree: never act on a guess) or ""
+    (no open PR). Candidates that all agree are acted on."""
+    _rid, branch, sha, _event, repo = run
+    if is_protected(branch, repo):
+        return None, "protected"
+    cands = attribute_run(branch, sha, repo, prs)
+    verdicts = {verdict(p) for p in cands}
+    if len(verdicts) > 1:
+        return None, "ambiguous"
+    return (cands[0], verdicts.pop()) if cands else (None, "")
+
+
+def sweep_runs(runs, prs, verdict, keep_heads, orphan_reason, log):
+    """Cancel runs per `verdict`, once per run id; PR-less runs go unless their (repo, branch) is in keep_heads."""
+    for run in runs:
+        p, reason = classify_run(run, prs, verdict)
+        rid, branch, repo = run[0], run[1], run[4]
+        if reason == "protected":
+            continue
+        if reason == "ambiguous":
+            if f"ambiguous:{rid}" not in RECENT:  # say it once per run id (RECENT is persisted for 10 minutes)
+                RECENT[f"ambiguous:{rid}"] = time.time()
+                log.append(f"run {rid} {repo}:{branch} maps to PRs that disagree: left running")
+        elif p is None and (repo, branch) not in keep_heads:
+            cancel(rid, branch, "-", orphan_reason, log)
+        elif p is not None and reason:
+            cancel(rid, branch, p["number"], reason, log)
+
+
+def fork_stuck_behind(p):
+    """A fork head behind main whose author disallows maintainer edits: update-branch cannot fix it, a human must."""
+    return bool(p.get("isCrossRepository") and not p.get("maintainerCanModify") and p.get("mergeStateStatus") == "BEHIND")
+
+
+def fork_awaiting_approval(p, red):
+    """Every red check of a fork head is ACTION_REQUIRED: the fork's workflow runs await a maintainer approval."""
+    return bool(p.get("isCrossRepository") and red and set(red) <= set(p.get("action_required", [])))
+
+
+def page_manual_sync(n, p, seen, attention):
+    """One `needs manual sync` page per head (a fork we cannot update-branch)."""
+    k = f"{n}:needs-manual-sync:{p['headRefOid']}"
+    if k not in seen:
+        seen[k] = int(time.time())
+        attention.append({"pr": n, "kind": "needs manual sync", "owner": p["owner"], "owner_state": p["alive"],
+                          "branch": p["headRefName"], "head": p["headRefOid"][:9], "title": p["title"][:70]})
 
 
 def stale_pr_claims(claims, open_nums):
@@ -339,7 +388,7 @@ def stale_pr_claims(claims, open_nums):
 
 def owner_of(r, lg, pr):
     name = r.hget(f"lg:pr:{pr['number']}", "owner") or ""
-    if not name:
+    if not name and not pr.get("isCrossRepository"):   # claims are keyed by this repo's branch names, never a fork's
         name = (r.hgetall(f"lg:claim:worktree:{pr['headRefName']}") or r.hgetall(
             f"lg:claim:branch:{pr['headRefName']}")).get("owner", "")
     return (name, lg.alive(r, name)) if name else ("-", "unknown")
@@ -468,7 +517,7 @@ def start_ci_or_report(n, p, gate, seen, log, attention):
         return
     k = f"{n}:start-ci:{p['headRefOid']}"
     msg = sh("gh", "api", f"repos/{REPO}/commits/{p['headRefOid']}", "--jq", ".commit.message")
-    if "[skip ci]" in msg:
+    if "[skip ci]" in msg and not p.get("isCrossRepository"):   # the sync cannot push to or dispatch for a fork head
         if k not in seen:
             seen[k] = int(time.time())
             log.append(f"start-ci #{n} (head is a [skip ci] sync merge)")
@@ -763,12 +812,7 @@ def _update_step(n, p, blocked, seen, log, attention):
     if blocked and not sh(str(S / "ci-gate"), str(n)).endswith("GREEN"):
         return True
     if p.get("isCrossRepository") and not p.get("maintainerCanModify"):
-        # a fork head can be updated only when its author allows maintainer edits: ask a human, once per head
-        k = f"{n}:needs-manual-sync:{p['headRefOid']}"
-        if k not in seen:
-            seen[k] = int(time.time())
-            attention.append({"pr": n, "kind": "needs manual sync", "owner": p["owner"], "owner_state": p["alive"],
-                              "branch": p["headRefName"], "head": p["headRefOid"][:9], "title": p["title"][:70]})
+        page_manual_sync(n, p, seen, attention)   # a fork head can be updated only when its author allows maintainer edits
         return True
     log.append(f"update-branch #{n} ({bo})")
     if not DRY:
@@ -782,7 +826,7 @@ def _recheck_step(n, p, runs_here, blocked, seen, log):
     # A rerun replays the ORIGINAL event payload (labels/draft as they were), so a metadata-only fix never
     # clears by rerun. A fresh head does: ask the sync for its empty start-CI commit, once per head.
     k = f"{n}:recheck-start-ci:{p['headRefOid']}"
-    if k not in seen and not blocked:
+    if k not in seen and not blocked and not p.get("isCrossRepository"):
         seen[k] = int(time.time())
         log.append(f"start-ci #{n} (stale red at a recheck head: fresh event needed)")
         if not DRY:
@@ -875,6 +919,9 @@ def main():
         n, red, active, total = p["number"], *ci_state(p)
         p["red"], p["active"], p["total"] = red, active, total
         p["red"] = red = infra_rerun(p, seen, log)
+        p["awaiting"] = fork_awaiting_approval(p, red)
+        if p["awaiting"]:
+            p["red"] = red = []                   # not a failure: the fork's runs wait for a maintainer to approve them
         p["owner"], p["alive"] = owner_of(r, lg, p)
         rvb = r.hgetall(f"lg:pr:{n}")
         if rvb.get("review_verdict") == "blocked" and p["headRefOid"].startswith(rvb.get("review_sha", "-")) \
@@ -894,6 +941,10 @@ def main():
             p["why"] = "empty diff vs main"
         elif any(d in open_now for d in deps.get(str(n), [])):   # declared order: lands after its dependency
             p["why"] = "waits for #" + ", #".join(str(d) for d in deps[str(n)] if d in open_now)
+        elif fork_stuck_behind(p):                # no pre-emption would keep this slot forever: release it
+            p["why"] = "fork behind, maintainer edits off: needs manual sync"
+        elif p["awaiting"]:
+            p["why"] = "fork CI awaits workflow approval"
         elif red:
             p["why"] = "red"
         elif f"{n}:red:{p['headRefOid']}" in seen:   # paged red at THIS head; a later cancel must not hide it
@@ -909,6 +960,10 @@ def main():
                                   "branch": p["headRefName"], "head": p["headRefOid"][:9], "title": p["title"][:70], **extra})
         if p["why"] == "conflicts with main":     # a conflict makes every other verdict moot
             page("conflict", p["headRefOid"])
+        elif fork_stuck_behind(p):
+            page_manual_sync(n, p, seen, attention)
+        elif p["awaiting"]:
+            page("fork-approval", p["headRefOid"])
         elif red:                                 # rule 4
             page("red", p["headRefOid"], checks=red)
         fresh = [(tid, ts, url) for tid, ts, url in rabbit_threads(p) if f"{n}:coderabbit:{tid}:{ts}" not in seen]
@@ -948,28 +1003,18 @@ def main():
                 sh("gh", "pr", "edit", str(n), "--repo", REPO, "--add-label", SLOT_LABEL)
 
     pmap0 = {p["number"]: p for p in prs}
-    slot_heads = {(pr_repo(pmap0[n]) or REPO, pmap0[n]["headRefName"]) for n in slots if n in pmap0}
-    for rid, branch, sha, event, repo in runs:
-        if is_protected(branch, repo):            # main/release runs are main's own CI: never touched
-            continue
-        p, ambiguous = attribute_run(branch, sha, repo, prs)
-        if ambiguous:                             # one branch name, several PRs: never cancel on a guess
-            log.append(f"run {rid} {repo}:{branch} maps to more than one open PR: left running")
-            continue
-        if not p:                                 # a closed PR's or PR-less branch: it holds no slot (rule 2)
-            if (repo, branch) not in slot_heads:
-                cancel(rid, branch, "-", "rule2: branch has no open PR and no CI slot", log)
-            continue
-        if p["red"]:
-            cancel(rid, branch, p["number"], f"rule4: red at head ({', '.join(p['red'][:3])})", log)
-        elif p["number"] not in slots:
-            cancel(rid, branch, p["number"], "rule2: no CI slot (FIFO)", log)
+    slot_heads = {(pr_repo(pmap0[n]), pmap0[n]["headRefName"]) for n in slots if n in pmap0}
+    sweep_runs(runs, prs, lambda p: (f"rule4: red at head ({', '.join(p['red'][:3])})" if p["red"] else
+                                     "" if p["number"] in slots else "rule2: no CI slot (FIFO)"),
+               slot_heads, "rule2: branch has no open PR and no CI slot", log)
 
     pmap = {p["number"]: p for p in prs}
     def could_land(m):
         """An older slot PR blocks a newer one only if it could land itself (owner: a not-ready PR keeps its
         place but does not block): approved at a head the approval carries to, and 0 unresolved threads."""
         q, rv_m = pmap[m], r.hgetall(f"lg:pr:{m}")
+        if fork_stuck_behind(q):
+            return False                          # it cannot be brought to 0 behind by us: it must not block newer PRs
         if any(not t["isResolved"] for t in q["reviewThreads"]["nodes"]):
             return False
         return rv_m.get("review_verdict") == "approve" and review_carries(rv_m.get("review_sha", ""), q["headRefOid"])
@@ -1021,22 +1066,14 @@ def degraded_tick(err):
     if recent_path.exists():
         RECENT.update({k: v for k, v in json.loads(recent_path.read_text(encoding="utf-8")).items()
                        if time.time() - v < 600})
-    held = {k.rsplit(":", 1)[1] for k in r.scan_iter("lg:hold:ci-slot:*")}
+    held = {int(k.rsplit(":", 1)[1]) for k in r.scan_iter("lg:hold:ci-slot:*")}
     raw = sh("gh", "api", "--paginate", f"repos/{REPO}/pulls?state=open&per_page=100",
              "--jq", ".[]|[.number,.head.ref,.head.sha,(.head.repo.full_name // \"\")]|@tsv")
     prs = [{"number": int(f[0]), "headRefName": f[1], "headRefOid": f[2], "headRepository": {"nameWithOwner": f[3]}}
            for f in (line.split("\t") for line in raw.splitlines() if line)]
     log = []
-    for rid, branch, sha, _event, repo in actions_runs():
-        if is_protected(branch, repo):
-            continue
-        p, ambiguous = attribute_run(branch, sha, repo, prs)
-        if ambiguous:
-            log.append(f"run {rid} {repo}:{branch} maps to more than one open PR: left running")
-            continue
-        n = p and str(p["number"])
-        if n not in held:                         # an open PR without a slot, or a closed-PR / PR-less branch
-            cancel(rid, branch, n or "-", "rule2: no CI slot (FIFO, degraded tick)", log)
+    sweep_runs(actions_runs(), prs, lambda p: "" if p["number"] in held else "rule2: no CI slot (FIFO, degraded tick)",
+               set(), "rule2: no CI slot (FIFO, degraded tick)", log)
     if not DRY:
         write_atomic(recent_path, json.dumps(RECENT))
     print(f"DEGRADED tick ({err[:80]}): slots held={sorted(held)}")
