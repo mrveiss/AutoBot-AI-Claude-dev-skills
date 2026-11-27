@@ -89,7 +89,7 @@ MILESTONE_NUM = re.compile(r"^\s*M(\d+)\b")
 ACTIVE = {"QUEUED", "IN_PROGRESS", "WAITING", "PENDING", "REQUESTED"}
 
 Q = """query($c:String){repository(owner:"mrveiss",name:"AutoBot-AI"){pullRequests(states:OPEN,first:100,after:$c){
-pageInfo{hasNextPage endCursor} nodes{number title createdAt updatedAt isDraft body changedFiles headRefName headRefOid isCrossRepository maintainerCanModify mergeable milestone{title} author{login}}}}}"""
+pageInfo{hasNextPage endCursor} nodes{number title createdAt updatedAt isDraft body changedFiles headRefName headRefOid headRepository{nameWithOwner} isCrossRepository maintainerCanModify mergeable milestone{title} author{login}}}}}"""
 THREADS = """reviewThreads(first:60){nodes{id isResolved comments(first:1){nodes{author{login}}}
   last:comments(last:1){nodes{author{login} createdAt url}}}}"""
 CHECKS = """commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{
@@ -305,9 +305,29 @@ def actions_runs():
     runs = []
     for status in ("in_progress", "queued", "waiting", "pending"):
         raw = sh("gh", "api", f"repos/{REPO}/actions/runs?status={status}&per_page=100",
-                 "--jq", f'.workflow_runs[]|select(.created_at > "{_ghost_cutoff()}")|[.id,.head_branch,.head_sha,.event,.name]|@tsv')
+                 "--jq", f'.workflow_runs[]|select(.created_at > "{_ghost_cutoff()}")|[.id,.head_branch,.head_sha,.event,.head_repository.full_name,.name]|@tsv')
         runs += [line.split("\t") for line in raw.splitlines() if line]
-    return [r[:4] for r in {r[0]: r for r in runs}.values() if (r[4:5] or [""])[0] not in EXEMPT_WORKFLOWS]   # a run can appear under two status filters
+    return [r[:5] for r in {r[0]: r for r in runs}.values() if (r[5:6] or [""])[0] not in EXEMPT_WORKFLOWS]   # a run can appear under two status filters
+
+
+def pr_repo(p):
+    """Full name of the repo a PR's head branch lives in (a fork's differs from REPO); "" when the fork is gone."""
+    return ((p.get("headRepository") or {}).get("nameWithOwner")) or ""
+
+
+def is_protected(branch, repo):
+    """main/release of THIS repo are protected; a fork's branch of the same name is an ordinary PR head."""
+    return branch in PROTECTED and repo in ("", REPO)
+
+
+def attribute_run(branch, sha, repo, prs):
+    """Which open PR a run belongs to: (PR or None, ambiguous). A branch name alone is not an identity (a fork may
+    name its branch like an own one), so match (head repo, branch); several candidates are narrowed by the run's
+    head SHA, and a run that still maps to more than one PR is ambiguous: the caller must not act on a guess."""
+    cands = [p for p in prs if p["headRefName"] == branch and pr_repo(p) in ("", repo)]
+    if len(cands) > 1:
+        cands = [p for p in cands if p["headRefOid"] == sha] or cands
+    return (cands[0], False) if len(cands) == 1 else (None, len(cands) > 1)
 
 
 def stale_pr_claims(claims, open_nums):
@@ -841,7 +861,6 @@ def main():
         globals()["DRY"] = True
 
     prs = sorted(fetch_prs(), key=lambda p: (p["number"] in LAST, milestone_rank(p), p["createdAt"], p["number"]))
-    by_branch = {p["headRefName"]: p for p in prs if p["headRefName"] not in PROTECTED}
     runs = actions_runs()
     held = {int(k.rsplit(":", 1)[1]): r.hgetall(k) for k in r.scan_iter("lg:hold:ci-slot:*")}
     open_nums = {p["number"] for p in prs}
@@ -929,13 +948,16 @@ def main():
                 sh("gh", "pr", "edit", str(n), "--repo", REPO, "--add-label", SLOT_LABEL)
 
     pmap0 = {p["number"]: p for p in prs}
-    slot_branches = {pmap0[n]["headRefName"] for n in slots if n in pmap0}
-    for rid, branch, sha, event in runs:
-        if branch in PROTECTED:                   # main/release runs are main's own CI: never touched
+    slot_heads = {(pr_repo(pmap0[n]) or REPO, pmap0[n]["headRefName"]) for n in slots if n in pmap0}
+    for rid, branch, sha, event, repo in runs:
+        if is_protected(branch, repo):            # main/release runs are main's own CI: never touched
             continue
-        p = by_branch.get(branch)
+        p, ambiguous = attribute_run(branch, sha, repo, prs)
+        if ambiguous:                             # one branch name, several PRs: never cancel on a guess
+            log.append(f"run {rid} {repo}:{branch} maps to more than one open PR: left running")
+            continue
         if not p:                                 # a closed PR's or PR-less branch: it holds no slot (rule 2)
-            if branch not in slot_branches:
+            if (repo, branch) not in slot_heads:
                 cancel(rid, branch, "-", "rule2: branch has no open PR and no CI slot", log)
             continue
         if p["red"]:
@@ -1001,13 +1023,18 @@ def degraded_tick(err):
                        if time.time() - v < 600})
     held = {k.rsplit(":", 1)[1] for k in r.scan_iter("lg:hold:ci-slot:*")}
     raw = sh("gh", "api", "--paginate", f"repos/{REPO}/pulls?state=open&per_page=100",
-             "--jq", ".[]|[.number,.head.ref]|@tsv")
-    by_branch = {b: n for n, b in (line.split("\t") for line in raw.splitlines() if line) if b not in PROTECTED}
+             "--jq", ".[]|[.number,.head.ref,.head.sha,(.head.repo.full_name // \"\")]|@tsv")
+    prs = [{"number": int(f[0]), "headRefName": f[1], "headRefOid": f[2], "headRepository": {"nameWithOwner": f[3]}}
+           for f in (line.split("\t") for line in raw.splitlines() if line)]
     log = []
-    for rid, branch, _sha, _event in actions_runs():
-        if branch in PROTECTED:
+    for rid, branch, sha, _event, repo in actions_runs():
+        if is_protected(branch, repo):
             continue
-        n = by_branch.get(branch)
+        p, ambiguous = attribute_run(branch, sha, repo, prs)
+        if ambiguous:
+            log.append(f"run {rid} {repo}:{branch} maps to more than one open PR: left running")
+            continue
+        n = p and str(p["number"])
         if n not in held:                         # an open PR without a slot, or a closed-PR / PR-less branch
             cancel(rid, branch, n or "-", "rule2: no CI slot (FIFO, degraded tick)", log)
     if not DRY:

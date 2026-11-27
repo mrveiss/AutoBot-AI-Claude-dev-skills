@@ -34,5 +34,29 @@ class ForkUpdateStep(unittest.TestCase):
         self.assertFalse(hasattr(PC, "OWN_AUTHORS"))
 
 
+class RunAttribution(unittest.TestCase):
+    """A fork branch named like an own branch must never be mistaken for it (#73)."""
+
+    def pr(self, n, repo, branch="issue-1-x", head="c" * 40):
+        return {"number": n, "headRefName": branch, "headRefOid": head, "headRepository": {"nameWithOwner": repo}}
+
+    def test_same_branch_name_in_fork_and_base_resolves_by_repo(self):
+        own, fork = self.pr(1, PC.REPO), self.pr(2, "someone/fork")
+        self.assertEqual(PC.attribute_run("issue-1-x", "d" * 40, PC.REPO, [own, fork]), (own, False))
+        self.assertEqual(PC.attribute_run("issue-1-x", "d" * 40, "someone/fork", [own, fork]), (fork, False))
+
+    def test_two_forks_same_branch_are_narrowed_by_sha_else_ambiguous(self):
+        a, b = self.pr(3, "a/fork", head="a" * 40), self.pr(4, "a/fork", head="b" * 40)
+        self.assertEqual(PC.attribute_run("issue-1-x", "b" * 40, "a/fork", [a, b]), (b, False))
+        self.assertEqual(PC.attribute_run("issue-1-x", "z" * 40, "a/fork", [a, b]), (None, True))
+
+    def test_fork_run_without_open_pr_is_not_attributed_to_own_branch(self):
+        self.assertEqual(PC.attribute_run("issue-1-x", "d" * 40, "other/fork", [self.pr(1, PC.REPO)]), (None, False))
+
+    def test_protected_applies_only_to_this_repos_branches(self):
+        self.assertTrue(PC.is_protected("main", PC.REPO))
+        self.assertFalse(PC.is_protected("main", "someone/fork"))
+
+
 if __name__ == "__main__":
     unittest.main()
