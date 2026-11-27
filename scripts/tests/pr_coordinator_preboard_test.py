@@ -173,7 +173,7 @@ class LaneRunsNeverCancelled(Base):
     def test_lane_name_is_exempt_and_actions_runs_drops_it(self):
         self.assertEqual(PC.PREBOARD_LANE_NAME, "Dispatch Preboard Guards")
         self.assertIn(PC.PREBOARD_LANE_NAME, PC.EXEMPT_WORKFLOWS)
-        PC.sh = lambda *a, **k: "1\tissue-9\tsha\tworkflow_dispatch\tDispatch Preboard Guards\n2\tissue-9\tsha\tpull_request\tAutoBot CI/CD Pipeline"
+        PC.sh = lambda *a, **k: "1\tissue-9\tsha\tworkflow_dispatch\tmrveiss/AutoBot-AI\tDispatch Preboard Guards\n2\tissue-9\tsha\tpull_request\tmrveiss/AutoBot-AI\tAutoBot CI/CD Pipeline"
         self.assertEqual([r[0] for r in PC.actions_runs()], ["2"])
 
 
