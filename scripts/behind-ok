@@ -17,8 +17,9 @@
 set -u
 REPO=mrveiss/AutoBot-AI
 for p in "$@"; do
-  br=$(gh pr view "$p" --repo $REPO --json headRefName -q .headRefName) || { echo "#$p ?"; continue; }
-  c=$(gh api "repos/$REPO/compare/$br...main" 2>/dev/null) || { echo "#$p ?"; continue; }
+  # the head SHA, not the branch name: a fork's branch is not a ref of $REPO, but its commits are reachable
+  sha=$(gh pr view "$p" --repo $REPO --json headRefOid -q .headRefOid) || { echo "#$p ?"; continue; }
+  c=$(gh api "repos/$REPO/compare/$sha...main" 2>/dev/null) || { echo "#$p ?"; continue; }
   behind=$(jq -r .ahead_by <<<"$c")
   [ "$behind" = 0 ] && { echo "#$p OK behind=0"; continue; }
   mainfiles=$(jq -r '.files[].filename' <<<"$c" | sort -u)
