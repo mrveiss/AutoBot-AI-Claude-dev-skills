@@ -142,12 +142,38 @@ class ActionsRunsParsing(unittest.TestCase):
 
 
 class ForkGates(unittest.TestCase):
-    def test_behind_fork_without_maintainer_edits_is_stuck_but_not_an_own_pr(self):
-        fork = {"isCrossRepository": True, "maintainerCanModify": False, "mergeStateStatus": "BEHIND"}
-        self.assertTrue(PC.fork_stuck_behind(fork))
-        self.assertFalse(PC.fork_stuck_behind({**fork, "maintainerCanModify": True}))
-        self.assertFalse(PC.fork_stuck_behind({**fork, "mergeStateStatus": "CLEAN"}))
-        self.assertFalse(PC.fork_stuck_behind({**fork, "isCrossRepository": False}))
+    def fork(self, ahead, **extra):
+        restore_after(self)
+        self.calls = []
+        PC.sh = lambda *a, **k: self.calls.append(a) or ahead
+        return {"number": 9, "headRefOid": HEAD, "isCrossRepository": True, "maintainerCanModify": False, **extra}
+
+    def test_fork_behind_is_measured_by_compare_not_merge_state(self):
+        p = self.fork("158", mergeStateStatus="BLOCKED")
+        self.assertTrue(PC.fork_stuck_behind(p))
+        self.assertIn(f"repos/{PC.REPO}/compare/{HEAD}...main", self.calls[0])
+        PC.fork_stuck_behind(p)
+        self.assertEqual(len(self.calls), 1)          # cached for the tick
+
+    def test_fork_at_zero_behind_or_unreadable_compare_is_not_stuck(self):
+        self.assertFalse(PC.fork_stuck_behind(self.fork("0")))
+        self.assertFalse(PC.fork_stuck_behind(self.fork("")))
+
+    def test_only_forks_we_cannot_update_are_measured(self):
+        for extra in ({"maintainerCanModify": True}, {"isCrossRepository": False}):
+            p = self.fork("5", **extra)
+            self.assertFalse(PC.fork_stuck_behind(p))
+            self.assertEqual(self.calls, [])
+
+    def test_behind_merge_state_is_a_shortcut_when_compare_is_unreadable(self):
+        self.assertTrue(PC.fork_stuck_behind(self.fork("", mergeStateStatus="BEHIND")))
+
+    def test_runs_awaiting_approval_with_no_check_runs_are_detected(self):
+        p = self.fork("2")
+        self.assertTrue(PC.fork_runs_await_approval(p))
+        self.assertIn(f"actions/runs?head_sha={HEAD}", self.calls[0][2])
+        self.assertIn("action_required", self.calls[0][-1])
+        self.assertFalse(PC.fork_runs_await_approval(self.fork("0")))
 
     def test_action_required_only_on_a_fork_is_awaiting_approval_not_red(self):
         fork = {"isCrossRepository": True, "action_required": ["ci"]}

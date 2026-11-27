@@ -361,8 +361,23 @@ def sweep_runs(runs, prs, verdict, keep_heads, orphan_reason, log):
 
 
 def fork_stuck_behind(p):
-    """A fork head behind main whose author disallows maintainer edits: update-branch cannot fix it, a human must."""
-    return bool(p.get("isCrossRepository") and not p.get("maintainerCanModify") and p.get("mergeStateStatus") == "BEHIND")
+    """A fork head behind main whose author disallows maintainer edits: update-branch cannot fix it, a human must.
+    main's protection is not strict, so GitHub never reports BEHIND here: measure it (head...main ahead_by), once per
+    PR per tick, and only for the forks we cannot update. BEHIND stays as a shortcut."""
+    if not (p.get("isCrossRepository") and not p.get("maintainerCanModify")):
+        return False
+    if "fork_behind" not in p:
+        ahead = sh("gh", "api", f"repos/{REPO}/compare/{p['headRefOid']}...main", "--jq", ".ahead_by")
+        p["fork_behind"] = p.get("mergeStateStatus") == "BEHIND" or (ahead.strip().isdigit() and int(ahead) > 0)
+    return p["fork_behind"]
+
+
+def fork_runs_await_approval(p):
+    """A first-time contributor's runs may create no check runs at all: ask Actions for this head's runs that wait
+    for a maintainer's approval (conclusion action_required, or status waiting)."""
+    out = sh("gh", "api", f"repos/{REPO}/actions/runs?head_sha={p['headRefOid']}&per_page=100", "--jq",
+             '[.workflow_runs[]|select(.conclusion=="action_required" or .status=="waiting")]|length')
+    return out.strip().isdigit() and int(out) > 0
 
 
 def fork_awaiting_approval(p, red):
@@ -920,6 +935,9 @@ def main():
         p["red"], p["active"], p["total"] = red, active, total
         p["red"] = red = infra_rerun(p, seen, log)
         p["awaiting"] = fork_awaiting_approval(p, red)
+        if not p["awaiting"] and p.get("isCrossRepository") and not p["total"] and not p["isDraft"] \
+                and p["mergeable"] != "CONFLICTING":
+            p["awaiting"] = fork_runs_await_approval(p)   # no check runs at all: look at the Actions runs
         if p["awaiting"]:
             p["red"] = red = []                   # not a failure: the fork's runs wait for a maintainer to approve them
         p["owner"], p["alive"] = owner_of(r, lg, p)
