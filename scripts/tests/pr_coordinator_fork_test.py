@@ -166,13 +166,16 @@ class ForkGates(unittest.TestCase):
             self.assertEqual(self.calls, [])
 
     def test_behind_merge_state_is_a_shortcut_when_compare_is_unreadable(self):
-        self.assertTrue(PC.fork_stuck_behind(self.fork("", mergeStateStatus="BEHIND")))
+        p = self.fork("", mergeStateStatus="BEHIND")
+        self.assertTrue(PC.fork_stuck_behind(p))
+        self.assertEqual(self.calls, [])              # BEHIND short-circuits: no compare call
 
     def test_runs_awaiting_approval_with_no_check_runs_are_detected(self):
         p = self.fork("2")
         self.assertTrue(PC.fork_runs_await_approval(p))
         self.assertIn(f"actions/runs?head_sha={HEAD}", self.calls[0][2])
         self.assertIn("action_required", self.calls[0][-1])
+        self.assertNotIn("waiting", self.calls[0][-1])
         self.assertFalse(PC.fork_runs_await_approval(self.fork("0")))
 
     def test_action_required_only_on_a_fork_is_awaiting_approval_not_red(self):
