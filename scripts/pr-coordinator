@@ -3,7 +3,8 @@
 
   1 FIFO: PRs land milestone first (M1 → M2 → …, no milestone last), then submission order (createdAt). A PR that is draft, conflicting or red keeps
     its place but gets no CI slot; once fixed it is ahead of everything submitted after it.
-    The release promotion (#19456) is always last. Outside-contributor PRs are reported, not slotted.
+    The release promotion (#19456) is always last. External (fork) PRs are slotted like own PRs (owner 2026-11-27:
+    "we are owners, we do not need approval, we do the approval"); every landing gate still applies.
   2 At most WIDTH (2) PRs hold CI. Slots are ledger holds `ci-slot:N` (other sessions' holds count).
     Every other PR's in-flight Actions runs are cancelled through ci-cancel. A slot PR that is behind
     main is updated (update-branch); its cancelled runs are re-run. Only the oldest slot PR may land.
@@ -56,7 +57,6 @@ def reviewer_verdict_ok(cell):
     rest = re.sub("^" + VERDICT_LEAD, "", REVIEWER_SIGNER.sub("", rest, 1))
     return not NEGATIVE_VERDICT.match(rest) and bool(POSITIVE_VERDICT.match(rest))
 PROOF_COLUMNS = ["ac", "precondition", "postcondition", "establishing lines", "argument", "reviewer"]
-OWN_AUTHORS = {"mrveiss", "dependabot", "app/dependabot"}
 RED = {"FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ERROR", "ACTION_REQUIRED"}
 # Contexts that go red BECAUSE a PR is parked: ci-dispatch-watchdog fails any head with no executed CI
 # (#12823/#13045). For a parked PR that is the queue working, not a defect; counting it as red would bar
@@ -89,7 +89,7 @@ MILESTONE_NUM = re.compile(r"^\s*M(\d+)\b")
 ACTIVE = {"QUEUED", "IN_PROGRESS", "WAITING", "PENDING", "REQUESTED"}
 
 Q = """query($c:String){repository(owner:"mrveiss",name:"AutoBot-AI"){pullRequests(states:OPEN,first:100,after:$c){
-pageInfo{hasNextPage endCursor} nodes{number title createdAt updatedAt isDraft body changedFiles headRefName headRefOid isCrossRepository mergeable milestone{title} author{login}}}}}"""
+pageInfo{hasNextPage endCursor} nodes{number title createdAt updatedAt isDraft body changedFiles headRefName headRefOid isCrossRepository maintainerCanModify mergeable milestone{title} author{login}}}}}"""
 THREADS = """reviewThreads(first:60){nodes{id isResolved comments(first:1){nodes{author{login}}}
   last:comments(last:1){nodes{author{login} createdAt url}}}}"""
 CHECKS = """commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{
@@ -733,13 +733,22 @@ def infra_rerun(p, seen, log):
     return []
 
 
-def _update_step(n, p, blocked, log):
+def _update_step(n, p, blocked, seen, log, attention):
     """update-branch makes a plain merge commit that DOES trigger CI (it is not the `[skip ci]` sync head), so a
-    barred PR is not updated unless it is already green."""
+    barred PR is not updated unless it is already green. A fork head whose author disallows maintainer edits cannot
+    be updated by us: raise a "needs manual sync" attention item once per head instead of a failing API call."""
     bo = sh(str(S / "behind-ok"), str(n))
     if not (" UPDATE " in f" {bo} " or "UPDATE" in bo.split()[1:2]):
         return False
     if blocked and not sh(str(S / "ci-gate"), str(n)).endswith("GREEN"):
+        return True
+    if p.get("isCrossRepository") and not p.get("maintainerCanModify"):
+        # a fork head can be updated only when its author allows maintainer edits: ask a human, once per head
+        k = f"{n}:needs-manual-sync:{p['headRefOid']}"
+        if k not in seen:
+            seen[k] = int(time.time())
+            attention.append({"pr": n, "kind": "needs manual sync", "owner": p["owner"], "owner_state": p["alive"],
+                              "branch": p["headRefName"], "head": p["headRefOid"][:9], "title": p["title"][:70]})
         return True
     log.append(f"update-branch #{n} ({bo})")
     if not DRY:
@@ -764,7 +773,7 @@ def _recheck_step(n, p, runs_here, blocked, seen, log):
 def slot_ci_phase(n, p, blocked, seen, log, attention):
     """CI starters for one slot PR. Returns True when the tick for this PR ends here. `blocked` bars only the
     starters (recheck start-ci, cancelled-run rerun, start_ci_or_report, update-branch of a non-green PR)."""
-    if _update_step(n, p, blocked, log):
+    if _update_step(n, p, blocked, seen, log, attention):
         return True
     runs_here = sh("gh", "api", f"repos/{REPO}/actions/runs?head_sha={p['headRefOid']}&per_page=100",
                    "--jq", '.workflow_runs[]|[.id, .status, (.conclusion // "")]|@tsv').splitlines()
@@ -848,7 +857,6 @@ def main():
         p["red"], p["active"], p["total"] = red, active, total
         p["red"] = red = infra_rerun(p, seen, log)
         p["owner"], p["alive"] = owner_of(r, lg, p)
-        author = (p["author"] or {}).get("login", "")
         rvb = r.hgetall(f"lg:pr:{n}")
         if rvb.get("review_verdict") == "blocked" and p["headRefOid"].startswith(rvb.get("review_sha", "-")) \
                 and SIGNAL_RUN.get(str(n)) != rvb.get("review_sha", "")[:9]:
@@ -861,8 +869,6 @@ def main():
             p["why"] = "parked by owner (dependabot / release promotion): report only, no slot"
         elif p["headRefName"].startswith("train-") and not r.exists("lg:hold:trainmaster"):
             p["why"] = "old merge train: no slot without an active trainmaster"   # owner 2026-11-18
-        elif author not in OWN_AUTHORS:
-            p["why"] = f"external ({author})"
         elif p["mergeable"] == "CONFLICTING":
             p["why"] = "conflicts with main"
         elif p["changedFiles"] == 0:              # nothing to land: a full suite here buys nothing
