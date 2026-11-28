@@ -239,6 +239,39 @@ class Unpark(Base):
         self.assertTrue(any("--remove-label" in c and "ci-parked" in c for c in self.calls))
         self.assertFalse([c for c in self.calls if c[:4] == ("gh", "pr", "ready", "2")])   # author's draft untouched
 
+    def test_after_cutover_last_pr_stays_parked_others_unpark(self):
+        self.cut = True
+        last = next(iter(PC.LAST))
+        PC.unpark_phase([pr(last, draft=True, parked=True), pr(7, draft=True, parked=True)], [], [])
+        self.assertNotIn(("gh", "pr", "ready", str(last), "--repo", PC.REPO), self.calls)
+        self.assertFalse([c for c in self.calls if str(last) in c])
+        self.assertIn(("gh", "pr", "ready", "7", "--repo", PC.REPO), self.calls)
+
+    def test_before_cutover_last_pr_outside_slot_is_parked(self):
+        last = next(iter(PC.LAST))
+        PC.unpark_phase([pr(last)], [], [])
+        self.assertEqual([c for c in self.flat() if "--undo" in c], [f"gh pr ready --undo {last} --repo " + PC.REPO])
+
+    def test_before_cutover_fork_pr_outside_slot_is_parked(self):
+        fork = dict(pr(8), isCrossRepository=True)
+        PC.unpark_phase([fork], [], [])
+        flat = self.flat()
+        self.assertEqual([c for c in flat if "--undo" in c], ["gh pr ready --undo 8 --repo " + PC.REPO])
+        self.assertTrue(any("--add-label ci-parked" in c and " 8 " in c for c in flat))
+
+    def test_park_and_unpark_same_tick_in_order_without_flapping(self):
+        prs = [pr(1), pr(2, draft=True, parked=True)]   # 1 lost its slot, 2 was admitted
+        PC.unpark_phase(prs, [2], [])
+        flat = self.flat()
+        label1 = next(i for i, c in enumerate(flat) if "--add-label" in c and " 1 " in c)
+        undo1 = next(i for i, c in enumerate(flat) if "--undo 1 " in c)
+        ready2 = next(i for i, c in enumerate(flat) if c.startswith("gh pr ready 2 "))
+        self.assertLess(label1, undo1)
+        self.assertLess(undo1, ready2)
+        self.assertEqual(len([c for c in flat if " 1 " in c and ("--undo" in c or "--add-label" in c)]), 2)
+        self.assertEqual(len([c for c in flat if c.startswith("gh pr ready 2 ")]), 1)
+        self.assertFalse([c for c in flat if "--add-label" in c and " 2 " in c or "--undo 2 " in c])
+
     def test_dry_only_logs(self):
         PC.DRY, log = True, []
         PC.unpark_phase([pr(1), pr(2, draft=True, parked=True)], [2], log)

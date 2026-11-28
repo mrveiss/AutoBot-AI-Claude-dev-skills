@@ -1684,7 +1684,7 @@ def unpark_phase(prs, slots, log, seen=None, attention=None):
     """Before cutover (#20825: dev-skills #78 stopped parking too early) every pull_request event starts a suite, so
     every open non-draft non-slot PR is drafted and labelled `ci-parked`, and an admitted PR carrying the label is
     made ready again. AFTER cutover (main's ci.yml has no pull_request trigger) nothing is parked and every remaining
-    `ci-parked` PR is unparked once. Unreadable cutover: do nothing. A draft without the label is the author's own and
+    `ci-parked` PR is unparked once, except LAST (the release promotion PR, promoted by hand). Unreadable cutover: do nothing. A draft without the label is the author's own and
     is never touched. Returns the admitted PRs whose unpark failed."""
     attention = [] if attention is None else attention
     failed, cut, state = set(), cutover_state(), {"label_made": False}
@@ -1692,7 +1692,7 @@ def unpark_phase(prs, slots, log, seen=None, attention=None):
         return failed
     for p in prs:
         n = p["number"]
-        if is_parked(p) and (n in slots or cut):
+        if is_parked(p) and (n in slots or (cut and n not in LAST)):   # LAST stays a draft: promoted by hand
             log.append(f"unpark #{n} ({'admitted to a slot' if n in slots else 'cutover: parking is over'}): gh pr ready, drop {PARK_LABEL}")
             if not DRY and not _unpark(n, p, log, attention):
                 failed.add(n)
