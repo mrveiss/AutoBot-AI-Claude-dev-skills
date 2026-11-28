@@ -224,7 +224,7 @@ class Main(Base):
         PC.ledger_mod, PC.ci_state = FakeLedger, lambda p: ([], 0, 0)
         PC.infra_rerun, PC.owner_of = lambda p, seen, log: p["red"], lambda r, lg, p: ("o", "alive")
         PC.rabbit_threads, PC.actions_runs = lambda p: [], lambda: []
-        PC.stale_pr_claims, PC.proof_blocked = lambda c, o: [], lambda *a: False
+        PC.stale_pr_claims, PC.proof_blocked, PC.proof_status = lambda c, o: [], lambda *a: False, lambda *a: ""
         (PC.STATE / "notified.json").write_text("{}", encoding="utf-8")
 
     def tick(self):
