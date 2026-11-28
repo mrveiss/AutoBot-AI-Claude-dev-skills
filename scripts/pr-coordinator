@@ -785,8 +785,10 @@ def _walk_carries(review_sha, head):
 
 
 PATCH_GIT = STATE / "patchid.git"           # bare cache clone: holds the commits whose diffs we compare
-PATCH_CACHE = STATE / "patchid-cache.json"  # "sha:merge_base" -> sha256 of the raw diff; both ends are immutable
-PATCH_LOCK = STATE / "patchid.lock"         # flock: serialises the clone fetch and the cache read-modify-write
+PATCH_CACHE = STATE / "patchid-cache.json"  # "sha:merge_base" -> sha256 of the normalised diff; both ends are immutable
+PATCH_LOCK = STATE / "patchid.lock"         # flock: serialises only the cache read-modify-write, never a fetch
+PATCH_LOCK_WAIT = 5.0                       # seconds of LOCK_NB retries before failing closed
+PATCH_TMP_MAX_AGE = 3600
 PATCH_TIMEOUT = int(os.environ.get("PR_COORDINATOR_PATCH_TIMEOUT", "120"))
 PATCH_CACHE_MAX_AGE = 14 * 86400
 PATCH_CACHE_MAX_ENTRIES = 2000
@@ -861,32 +863,88 @@ def _cache_store(cache):
     tmp = PATCH_CACHE.with_name(f"{PATCH_CACHE.name}.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(live), encoding="utf-8")
     os.replace(tmp, PATCH_CACHE)
+    for old in PATCH_CACHE.parent.glob(f"{PATCH_CACHE.name}.*.tmp"):
+        try:
+            if now - old.stat().st_mtime > PATCH_TMP_MAX_AGE:
+                old.unlink()
+        except OSError:
+            pass
     if len(live) % PATCH_GC_EVERY == 0:
         _pgit("gc", "--auto", "-q")
 
 
-def _diff_id(sha, pr=None):
-    """sha256 over the raw bytes of the PR's own diff (merge-base..sha), nothing stripped or normalised: any
-    whitespace or binary change is a different id. "" = unavailable or empty: never carry."""
-    PATCH_LOCK.parent.mkdir(parents=True, exist_ok=True)
-    with open(PATCH_LOCK, "a+") as lk:
-        fcntl.flock(lk, fcntl.LOCK_EX)
-        if not _fetch_commit(sha, pr):
-            return ""
-        rc, base, _ = _pgit("merge-base", "refs/remotes/origin/main", sha)
-        base = base.decode("ascii", "replace").strip()
-        if rc or not base:
-            return ""
-        key = f"{sha}:{base}"
+def _normalise_diff(diff):
+    """Drop what main can change under an identical PR change: `index <old>..<new>` blob ids and the numbers and
+    section text of `@@` headers. Every other byte stays (+/-/context lines, modes, renames, binary payloads)."""
+    out = []
+    for line in diff.split(b"\n"):
+        if line.startswith(b"index "):
+            continue
+        out.append(b"@@" if line.startswith(b"@@ ") else line)
+    return b"\n".join(out)
+
+
+class _PatchLock:
+    """Non-blocking flock with a short bounded retry; `.held` False = busy, the caller fails closed."""
+    def __init__(self):
+        PATCH_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        self.fh, self.held = open(PATCH_LOCK, "a+"), False
+        deadline = time.monotonic() + PATCH_LOCK_WAIT
+        while True:
+            try:
+                fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.held = True
+                return
+            except OSError:
+                if time.monotonic() >= deadline:
+                    return
+                time.sleep(0.1)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.fh.close()                       # closing releases the flock
+
+
+def _cached_id(key):
+    """(busy, id): the lock covers only the cache read."""
+    with _PatchLock() as lk:
+        if not lk.held:
+            return True, ""
+        entry = _cache_load().get(key)
+        return False, entry["id"] if isinstance(entry, dict) and entry.get("id") else ""
+
+
+def _store_id(key, diff_id):
+    with _PatchLock() as lk:
+        if not lk.held:
+            return False
         cache = _cache_load()
-        if key in cache:
-            return cache[key]["id"]
-        rc, diff, _ = _pgit("diff", "--no-color", "--binary", "--full-index", base, sha)
-        if rc or not diff:
-            return ""                         # empty diff: nothing to compare
-        cache[key] = {"id": hashlib.sha256(diff).hexdigest(), "t": time.time()}
+        cache[key] = {"id": diff_id, "t": time.time()}
         _cache_store(cache)
-        return cache[key]["id"]
+        return True
+
+
+def _diff_id(sha, pr=None):
+    """sha256 over the normalised diff of the PR's own change (merge-base..sha); see _normalise_diff. Whitespace
+    and binary content still count. Network fetches run outside the lock. "" = unavailable, empty or the lock
+    busy: never carry."""
+    if not _fetch_commit(sha, pr):
+        return ""
+    rc, base, _ = _pgit("merge-base", "refs/remotes/origin/main", sha)
+    base = base.decode("ascii", "replace").strip()
+    if rc or not base:
+        return ""
+    key = f"{sha}:{base}"
+    busy, cached = _cached_id(key)
+    if busy or cached:
+        return cached
+    rc, diff, _ = _pgit("diff", "--no-color", "--binary", "--full-index", base, sha)
+    if rc or not diff:
+        return ""                             # empty diff: nothing to compare
+    diff_id = hashlib.sha256(_normalise_diff(diff)).hexdigest()
+    return diff_id if _store_id(key, diff_id) else ""
 
 
 def _same_patch(review_sha, head, pr=None):

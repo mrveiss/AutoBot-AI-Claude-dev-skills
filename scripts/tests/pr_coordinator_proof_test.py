@@ -326,6 +326,66 @@ class PatchIdCarry(unittest.TestCase):
         self.assertEqual(len(kept), self.mod.PATCH_CACHE_MAX_ENTRIES)
         self.assertFalse(any(k.startswith("k") for k in kept))
 
+    def _shift_pair(self, main_edit):
+        """PR A on c1; main moves to c2 (main_edit applied to f.txt); PR B = the same line-15 edit on c2."""
+        lines = [f"line{i}\n" for i in range(1, 31)]
+        self.git("checkout", "-q", "main")
+        c1 = self.commit("f.txt", "".join(lines))
+        edit = list(lines)
+        edit[14] = "PR CHANGE\n"
+        self.git("checkout", "-q", "-b", "sa", c1)
+        a = self.commit("f.txt", "".join(edit))
+        self.git("checkout", "-q", "main")
+        c2 = self.commit("f.txt", "".join(main_edit(lines)))
+        self.git("checkout", "-q", "-b", "sb", c2)
+        edit2 = main_edit(lines)
+        edit2[14 + (len(edit2) - len(lines))] = "PR CHANGE\n"
+        b = self.commit("f.txt", "".join(edit2))
+        self.git("update-ref", "refs/remotes/origin/main", c2)
+        self.git("push", "-q", "-f", str(self.mod.PATCH_GIT), "refs/remotes/origin/main:refs/remotes/origin/main",
+                 "sa:refs/heads/sa", "sb:refs/heads/sb")
+        self.api = {a: a}
+        return a, b
+
+    def test_main_shifting_lines_above_identical_hunk_carries(self):
+        a, b = self._shift_pair(lambda ls: ["new top\n", "new top2\n"] + ls)
+        self.assertTrue(self.mod.review_carries(a, b))
+
+    def test_changed_context_line_in_hunk_does_not_carry(self):
+        def edit(ls):
+            out = list(ls)
+            out[13] = "main changed the line above\n"
+            return out
+        a, b = self._shift_pair(edit)
+        self.assertFalse(self.mod.review_carries(a, b))
+
+    def test_busy_lock_fails_closed(self):
+        import fcntl
+        self.mod.PATCH_LOCK = self.mod.PATCH_CACHE.parent / "busy.lock"
+        self.mod.PATCH_LOCK_WAIT = 0.3
+        self.api = {self.approved: self.approved}
+        with open(self.mod.PATCH_LOCK, "a+") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            self.assertFalse(self.mod.review_carries(self.approved, self.merged))
+        self.assertTrue(self.mod.review_carries(self.approved, self.merged))   # free again: carries
+
+    def test_cache_entry_without_id_is_a_miss(self):
+        self.mod.PATCH_LOCK = self.mod.PATCH_CACHE.parent / "p.lock"
+        self.api = {self.approved: self.approved}
+        base = self.git("merge-base", self.merged, self.main2)
+        self.mod.PATCH_CACHE.write_text(json.dumps({f"{self.approved}:{base}": {"t": time.time()}}), encoding="utf-8")
+        self.assertTrue(self.mod.review_carries(self.approved, self.merged))
+
+    def test_stale_tmp_files_are_cleaned_on_write(self):
+        old = self.mod.PATCH_CACHE.with_name(self.mod.PATCH_CACHE.name + ".999.tmp")
+        fresh = self.mod.PATCH_CACHE.with_name(self.mod.PATCH_CACHE.name + ".998.tmp")
+        for f in (old, fresh):
+            f.write_text("x", encoding="utf-8")
+        os.utime(old, (time.time() - 7200,) * 2)
+        self.mod._cache_store({})
+        self.assertFalse(old.exists())
+        self.assertTrue(fresh.exists())
+
     def test_exception_in_carry_path_fails_closed(self):
         def boom(*a, **k):
             raise RuntimeError("boom")
