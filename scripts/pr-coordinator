@@ -11,8 +11,8 @@
     A granted slot is kept through red and conflict until the PR merges, closes or gets a ledger hold
     (owner 2026-11-28: finish one landing before taking the next); a red slot PR is reported, never replaced.
     CI is DISPATCHED by this tool for slot PRs (workflow_dispatch; dual mode with the legacy path until main's ci.yml
-    loses `pull_request`; PR_COORDINATOR_DISPATCH=0 is the kill switch). Parking is over (owner 2026-11-28): no new
-    `ci-parked` drafts; existing ones are unparked once after cutover. A draft without that label is the author's own.
+    loses `pull_request`; PR_COORDINATOR_DISPATCH=0 is the kill switch). Parking holds BEFORE cutover (every
+    non-slot ready PR is drafted + `ci-parked`); after cutover it is over and existing ones are unparked once. A draft without that label is the author's own.
     A ledger approve is required for EXTERNAL PRs only (fork or non-owner author); own PRs merge on quality.
     The release promotion (#19456) gets a slot only by a manual ledger ci-slot hold.
     Every other PR's in-flight Actions runs are cancelled through ci-cancel. A slot PR that is behind
@@ -1667,22 +1667,39 @@ def _unpark(n, p, log, attention):
     return True
 
 
+def _park(n, p, state, log, attention):
+    """Label FIRST, then `--undo`: a partial failure leaves a labelled ready PR, which the next tick re-drafts."""
+    if not is_parked(p):
+        if not state["label_made"]:
+            if not _gh(n, p, "label create", attention, log, "gh", "label", "create", PARK_LABEL, "--repo", REPO,
+                       "--force", "--color", "ededed", "--description", "drafted by pr-coordinator: not admitted to a CI slot"):
+                return
+            state["label_made"] = True
+        if not _gh(n, p, "add label", attention, log, "gh", "pr", "edit", str(n), "--repo", REPO, "--add-label", PARK_LABEL):
+            return
+    _gh(n, p, "gh pr ready --undo", attention, log, "gh", "pr", "ready", "--undo", str(n), "--repo", REPO)
+
+
 def unpark_phase(prs, slots, log, seen=None, attention=None):
-    """Owner 2026-11-28 (Q3): parking is OVER. No PR is drafted or labelled `ci-parked` any more. What remains is
-    undoing the old parks: an admitted PR carrying the label is made ready again (before cutover its ready event
-    starts its suite), and ONLY after cutover (main's ci.yml has no pull_request trigger, so nothing can start a run
-    from the event) every remaining `ci-parked` PR is unparked once. Before cutover a parked PR stays parked: the
-    event WOULD start its suite. A draft without the label is the author's own and is never touched. Returns the
-    admitted PRs whose unpark failed."""
+    """Before cutover (#20825: dev-skills #78 stopped parking too early) every pull_request event starts a suite, so
+    every open non-draft non-slot PR is drafted and labelled `ci-parked`, and an admitted PR carrying the label is
+    made ready again. AFTER cutover (main's ci.yml has no pull_request trigger) nothing is parked and every remaining
+    `ci-parked` PR is unparked once, except LAST (the release promotion PR, promoted by hand). Unreadable cutover: do nothing. A draft without the label is the author's own and
+    is never touched. Returns the admitted PRs whose unpark failed."""
     attention = [] if attention is None else attention
-    failed, cut = set(), cutover_done()          # unreadable == not cut over: only admitted slot PRs are touched
+    failed, cut, state = set(), cutover_state(), {"label_made": False}
+    if cut is None:
+        return failed
     for p in prs:
         n = p["number"]
-        if not is_parked(p) or not (n in slots or cut):
-            continue
-        log.append(f"unpark #{n} ({'admitted to a slot' if n in slots else 'cutover: parking is over'}): gh pr ready, drop {PARK_LABEL}")
-        if not DRY and not _unpark(n, p, log, attention):
-            failed.add(n)
+        if is_parked(p) and (n in slots or (cut and n not in LAST)):   # LAST stays a draft: promoted by hand
+            log.append(f"unpark #{n} ({'admitted to a slot' if n in slots else 'cutover: parking is over'}): gh pr ready, drop {PARK_LABEL}")
+            if not DRY and not _unpark(n, p, log, attention):
+                failed.add(n)
+        elif not cut and n not in slots and not p["isDraft"]:
+            log.append(f"park #{n} (no CI slot, before cutover): gh pr ready --undo, label {PARK_LABEL}")
+            if not DRY:
+                _park(n, p, state, log, attention)
     return failed
 
 
