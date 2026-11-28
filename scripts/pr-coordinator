@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """pr-coordinator [--dry] — one tick of the cross-session PR traffic light (owner rules 2026-11-18).
 
-  1 FIFO: PRs land milestone first (M1 → M2 → …, no milestone last), then submission order (createdAt). A PR that is draft, conflicting or red keeps
+  1 FIFO: PRs are admitted strictly in ARRIVAL order (ascending PR number = creation order; owner 2026-11-28), after the
+    unblocker lane (batch=unblocker) and with deps.json pins kept; the milestone no longer orders anything, it is only displayed. A PR that is draft, conflicting or red keeps
     its place but gets no CI slot; once fixed it is ahead of everything submitted after it.
+    Approval of an external PR (ledger approve; --fork-approved for forks) is recorded by an OWNER-side session after a reviewer pass; this tool's own identity never approves.
     The release promotion (#19456) is always last. External (fork) PRs are slotted like own PRs (owner 2026-11-27:
     "we are owners, we do not need approval, we do the approval"); every landing gate still applies.
   2 At most WIDTH (2) PRs hold CI. Slots are ledger holds `ci-slot:N` (other sessions' holds count).
     A granted slot is kept through red and conflict until the PR merges, closes or gets a ledger hold
     (owner 2026-11-28: finish one landing before taking the next); a red slot PR is reported, never replaced.
-    Every other PR is parked as a draft with label `ci-parked` (#20825); admission runs `gh pr ready` and drops
-    the label. A draft without that label is the author's own and is left alone.
-    The release promotion (#19456) stays parked: promoting it is a manual `gh pr ready` plus a ledger ci-slot hold.
+    CI is DISPATCHED by this tool for slot PRs (workflow_dispatch; dual mode with the legacy path until main's ci.yml
+    loses `pull_request`; PR_COORDINATOR_DISPATCH=0 is the kill switch). Parking is over (owner 2026-11-28): no new
+    `ci-parked` drafts; existing ones are unparked once after cutover. A draft without that label is the author's own.
+    A ledger approve is required for EXTERNAL PRs only (fork or non-owner author); own PRs merge on quality.
+    The release promotion (#19456) gets a slot only by a manual ledger ci-slot hold.
     Every other PR's in-flight Actions runs are cancelled through ci-cancel. A slot PR that is behind
     main is updated (update-branch); its cancelled runs are re-run. Only the oldest slot PR may land.
   3 CodeRabbit threads awaiting a reply are reported for EVERY open PR, at once, regardless of CI.
@@ -36,10 +40,12 @@ DRY = "--dry" in sys.argv
 # Every live pass takes this lock itself (#57). It must NOT be the loop's `flock -n /tmp/pr-coordinator.lock` file:
 # flock(1) holds that one on its own open file description, so a second flock() on the same path would always block.
 LOCK_PATH = os.environ.get("PR_COORDINATOR_PASS_LOCK", "/tmp/pr-coordinator.pass.lock")
-USAGE = """usage: pr-coordinator [--dry | --proof-check PR | -h | --help]
+USAGE = """usage: pr-coordinator [--dry | --proof-check PR | --dispatch PR | --findings-gate PR | -h | --help]
   (no args)           one live coordinator pass (takes the pass lock)
   --dry               read-only pass, no lock
   --proof-check PR    validate PR's requirement-proof table, no lock
+  --dispatch PR       dispatch CI for one slot PR's head now (push-and-park); 3 = PR holds no slot
+  --findings-gate PR  dispatch pr-blocking-findings for the head and wait (safe-merge); 0 ok, 1 fail, 3 not applicable
   -h, --help          this text"""
 # Owner 2026-11-23: a head pushed after this instant needs a valid requirement-proof table in the PR body before CI starts.
 PROOF_CUTOFF = os.environ.get("PR_COORDINATOR_PROOF_CUTOFF", "2026-11-23T11:36:00Z")
@@ -96,7 +102,7 @@ MILESTONE_NUM = re.compile(r"^\s*M(\d+)\b")
 ACTIVE = {"QUEUED", "IN_PROGRESS", "WAITING", "PENDING", "REQUESTED"}
 
 Q = """query($c:String){repository(owner:"mrveiss",name:"AutoBot-AI"){pullRequests(states:OPEN,first:100,after:$c){
-pageInfo{hasNextPage endCursor} nodes{number title createdAt updatedAt isDraft body changedFiles headRefName headRefOid headRepository{nameWithOwner} isCrossRepository maintainerCanModify mergeStateStatus mergeable milestone{title} author{login} labels(first:30){nodes{name}}}}}}"""
+pageInfo{hasNextPage endCursor} nodes{number title createdAt updatedAt isDraft body changedFiles headRefName headRefOid baseRefName headRepository{nameWithOwner} isCrossRepository maintainerCanModify mergeStateStatus mergeable milestone{title} author{login} labels(first:30){nodes{name}}}}}}"""
 THREADS = """reviewThreads(first:60){nodes{id isResolved comments(first:1){nodes{author{login}}}
   last:comments(last:1){nodes{author{login} createdAt url}}}}"""
 CHECKS = """commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{
@@ -166,6 +172,11 @@ def milestone_rank(p):
     or a non-M title -> NO_MILESTONE_RANK, so those PRs land after every numbered milestone."""
     m = MILESTONE_NUM.match((p.get("milestone") or {}).get("title") or "")
     return int(m.group(1)) if m else NO_MILESTONE_RANK
+
+
+def admission_key(p):
+    """Admission order: strictly arrival order (ascending PR number); only the explicit LAST set goes after."""
+    return (p["number"] in LAST, p["number"])
 
 
 def ms_label(p):
@@ -557,6 +568,469 @@ def start_ci_or_report(n, p, gate, seen, log, attention):
         seen[k] = int(time.time())
         attention.append({"pr": n, "kind": "no-ci", "owner": p["owner"], "owner_state": p["alive"],
                           "branch": p["headRefName"], "head": p["headRefOid"][:9]})
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# CI dispatch (AutoBot-AI#20825, plan ci-dispatch-plan-2026-11-28): the coordinator STARTS CI for slot PRs with
+# workflow_dispatch. DUAL MODE: until main's ci.yml loses `pull_request`, a 422 from the dispatch falls back to the
+# legacy path (start_ci_or_report / sync start_ci_for_pr). PR_COORDINATOR_DISPATCH=0 is the kill switch.
+# ---------------------------------------------------------------------------------------------------------------
+SUITE_WORKFLOWS = ("ci.yml", "no-commit-trailers.yml")            # key: head SHA
+META_WORKFLOWS = ("pr-blocking-findings.yml", "pr-template-check.yml",
+                  "pr-issue-validation.yml", "pr-structure.yml")  # key: head SHA + metadata digest
+FINDINGS_WORKFLOW = "pr-blocking-findings.yml"
+DISPATCH_GRACE_SECS = int(os.environ.get("PR_COORDINATOR_DISPATCH_GRACE_SECS", "180"))
+DISPATCH_MAX_TRIES = int(os.environ.get("PR_COORDINATOR_DISPATCH_MAX_TRIES", "3"))
+FINDINGS_WAIT_SECS = int(os.environ.get("PR_COORDINATOR_FINDINGS_WAIT_SECS", "300"))
+LOCK_RETRIES, LOCK_RETRY_SLEEP = 10, 2                              # dispatch_cli waits ~20s for the pass lock
+SEEN_MAX_AGE_SECS = 14 * 86400
+MIRROR_PREFIX = "ci/pr-"
+RUNAWAY_THRESHOLD = int(os.environ.get("PR_COORDINATOR_RUNAWAY_THRESHOLD", "25"))   # pr-queue-gate.yml RUNAWAY_THRESHOLD
+NOT_STARTED = {"cancelled", "skipped", "startup_failure"}          # same definition as branch_sync_core.suite_already_started
+DISPATCH_UNAVAILABLE = re.compile(r"HTTP 422|HTTP 404|workflow_dispatch|unexpected inputs", re.I)
+_CUT, _REDIS = {}, []
+
+
+def dispatch_enabled():
+    return os.environ.get("PR_COORDINATOR_DISPATCH", "1") != "0"
+
+
+def _trigger_tokens(text):
+    """Trigger names under the top-level `on:` key of a workflow file (mapping, list and inline forms)."""
+    lines, toks, inside = text.splitlines(), set(), False
+    for line in lines:
+        bare = re.sub(r"\s+#.*$|^\s*#.*$", "", line).rstrip()
+        m = re.match(r"""^["']?(?:on|true)["']?\s*:(.*)$""", bare)
+        if m:
+            inside = True
+            toks |= set(re.findall(r"[A-Za-z_]+", m.group(1)))
+            continue
+        if inside and bare and not bare[0].isspace():
+            inside = False
+        if inside:
+            m = re.match(r"""^\s*(?:-\s*)?["']?([A-Za-z_]+)["']?\s*(?::.*)?$""", bare)
+            if m:
+                toks.add(m.group(1))
+    return toks
+
+
+def workflow_cut_over(text):
+    """Cutover = the workflow has `workflow_dispatch` and NO `pull_request` / `pull_request_target` trigger."""
+    toks = _trigger_tokens(text)
+    return "workflow_dispatch" in toks and not toks & {"pull_request", "pull_request_target"}
+
+
+def cutover_state():
+    """Three states of main's ci.yml: True = cut over (workflow_dispatch, no pull_request), False = readable and not
+    cut over, None = UNREADABLE (a gh error or an empty body). Callers that gate a merge or a one-time action treat
+    None as "do nothing". A readable answer is read once per process; an unreadable one is retried."""
+    if "v" not in _CUT:
+        rc, out, _ = sh_rc("gh", "api", "-H", "Accept: application/vnd.github.raw",
+                           f"repos/{REPO}/contents/.github/workflows/ci.yml?ref=main")
+        if rc or not (out or "").strip():
+            return None
+        _CUT["v"] = workflow_cut_over(out)
+    return _CUT["v"]
+
+
+def cutover_done():
+    """True ONLY for a readable, cut-over main ci.yml. Unreadable is not "done" (fail closed)."""
+    return cutover_state() is True
+
+
+def _redis():
+    if not _REDIS:
+        _REDIS.append(ledger_mod().conn())
+    return _REDIS[0]
+
+
+def fork_approved(n, sha):
+    """A human recorded `ledger set <n> --fork-approved <sha>` for exactly this head. Never written by this tool."""
+    return bool(sha) and (_redis().hget(f"lg:pr:{n}", "fork_approved") or "") == sha
+
+
+def dispatch_ref(n, p, seen, log, attention):
+    """Branch to dispatch at: the head branch; ci/pr-<n> for an approved fork; "" = not dispatchable (paged)."""
+    if p.get("isCrossRepository"):
+        return mirror_fork_head(n, p, seen, log, attention)
+    return p["headRefName"]
+
+
+def merge_base(p):
+    base = p.get("baseRefName") or "main"
+    return sh("gh", "api", f"repos/{REPO}/compare/{base}...{p['headRefOid']}", "--jq", ".merge_base_commit.sha").strip()
+
+
+def meta_digest(p):
+    labels = sorted(l["name"] for l in (p.get("labels") or {}).get("nodes", []) if l["name"] not in (SLOT_LABEL, PARK_LABEL))
+    blob = json.dumps([p.get("title", ""), p.get("body") or "", (p.get("milestone") or {}).get("title", ""), labels])
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:12]
+
+
+def dispatch_key(n, wf, sha, digest="", generation=0):
+    return f"{n}:dispatch:{wf}:{sha}:{digest}:{generation}"
+
+
+def dispatched_runs(sha):
+    """workflow_dispatch runs at this head (id, path, status, conclusion), or None when unreadable."""
+    rc, out, _ = sh_rc("gh", "api", f"repos/{REPO}/actions/runs?head_sha={sha}&event=workflow_dispatch&per_page=100", "--jq",
+                       "[.workflow_runs[]|{id,path,status,conclusion,created_at,head_branch}]")
+    try:
+        return json.loads(out) if rc == 0 else None
+    except ValueError:
+        return None
+
+
+def _iso(ts):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+def _runs_of(runs, wf):
+    return [r for r in runs if (r.get("path") or "").endswith("/" + wf)]
+
+
+def suite_started(runs, wf):
+    return any((r.get("conclusion") or "") not in NOT_STARTED for r in _runs_of(runs, wf))
+
+
+def _ent_started(ent, runs, wf):
+    """The run THIS dispatch created has started: by its recorded run_id, else (no id returned) the workflow's run at
+    this head created after the dispatch ts on the dispatched ref. Valid for every generation."""
+    mine = _runs_of(runs, wf)
+    if ent.get("run_id"):
+        cand = [r for r in mine if r.get("id") == ent["run_id"]]
+    else:
+        since, ref = _iso(ent.get("ts", 0) - 5), ent.get("ref")
+        cand = [r for r in mine if (r.get("created_at") or "") >= since and (not ref or r.get("head_branch") in (None, ref))]
+    return any((r.get("conclusion") or "") not in NOT_STARTED for r in cand)
+
+
+def _decide(n, wf, sha, digest, generation, runs, seen, now):
+    """'go' | 'skip' | 'page' for one workflow at one head."""
+    key = dispatch_key(n, wf, sha, digest, generation)
+    mine = _runs_of(runs, wf) if generation == 0 else []
+    if any((r.get("conclusion") or "") == "cancelled" for r in mine) and not suite_started(runs, wf):
+        return "skip"                                 # a cancelled run is the rerun path's, not a lost dispatch
+    ent = seen.get(key)
+    if not isinstance(ent, dict):
+        other = any(k.startswith(f"{n}:dispatch:{wf}:{sha}:") and k != key for k in seen)
+        if generation == 0 and suite_started(runs, wf) and not (digest and other):
+            seen[key] = {"ts": now, "run_id": (mine[-1] or {}).get("id"), "tries": 0}   # state lost: adopt, never double
+            return "skip"
+        return "go"
+    if (suite_started(runs, wf) and generation == 0) or _ent_started(ent, runs, wf) \
+            or now - ent.get("ts", 0) < DISPATCH_GRACE_SECS:
+        return "skip"
+    return "go" if ent.get("tries", 1) < DISPATCH_MAX_TRIES else "page"
+
+
+def dispatch_workflow(n, p, wf, ref, key, base, digest, seen, log, attention):
+    """One POST .../dispatches. Returns 'ok' | 'unavailable' (422/404) | 'error'. Key written only on success."""
+    sha = p["headRefOid"]
+    log.append(f"dispatch #{n} {wf} @ {ref} ({sha[:9]})")
+    if DRY:
+        return "ok"
+    rc, out, err = sh_rc("gh", "api", "-X", "POST", f"repos/{REPO}/actions/workflows/{wf}/dispatches", "-f", f"ref={ref}",
+                         "-f", f"inputs[pr_number]={n}", "-f", f"inputs[head_sha]={sha}", "-f", f"inputs[base_sha]={base}")
+    if rc:
+        if DISPATCH_UNAVAILABLE.search(err):
+            return "unavailable"
+        log.append(f"ATTENTION #{n} dispatch {wf} failed rc={rc}: {err[:120]}")
+        return "error"
+    try:
+        run_id = json.loads(out).get("workflow_run_id") if out else None
+    except ValueError:
+        run_id = None
+    prev = seen.get(key) if isinstance(seen.get(key), dict) else {}
+    seen[key] = {"ts": int(time.time()), "run_id": run_id, "ref": ref, "tries": prev.get("tries", 0) + 1}
+    return "ok"
+
+
+def _sync_head(n, p, log, attention, seen):
+    """Merge main into the head (Q2: test the head == the merge result)."""
+    if p.get("isCrossRepository") and not p.get("maintainerCanModify"):
+        page_manual_sync(n, p, seen, attention)
+        return
+    log.append(f"update-branch #{n} (behind main: sync before dispatch)")
+    if not DRY:
+        sh("gh", "api", "-X", "PUT", f"repos/{REPO}/pulls/{n}/update-branch", "-f", f"expected_head_sha={p['headRefOid']}")
+
+
+def ref_dispatchable(n, p, seen):
+    """Dual mode: dispatch only when the head's own ci.yml is cut over (workflow_dispatch AND no pull_request /
+    pull_request_target), else its events would run the suite a second time. Memoised per head, with a timestamp."""
+    k = f"{n}:ref-dispatchable:{p['headRefOid']}"
+    if not isinstance(seen.get(k), dict):
+        rc, out, _ = sh_rc("gh", "api", "-H", "Accept: application/vnd.github.raw",
+                           f"repos/{REPO}/contents/.github/workflows/ci.yml?ref={p['headRefOid']}")
+        if rc:
+            return False
+        seen[k] = {"ok": workflow_cut_over(out), "ts": int(time.time())}
+    return bool(seen[k]["ok"])
+
+
+def _page_once(n, p, kind, key, seen, attention, **extra):
+    k = f"{n}:{kind}:{key}"
+    if k not in seen:
+        seen[k] = int(time.time())
+        attention.append({"pr": n, "kind": kind, "owner": p.get("owner"), "owner_state": p.get("alive"),
+                          "branch": p.get("headRefName"), "head": p["headRefOid"][:9], **extra})
+
+
+def _unavailable(n, p, seen, log, attention):
+    """ci.yml cannot be dispatched at this head. Before cutover the legacy events still run: legacy path (False).
+    After it nothing else can start CI: sync a behind head (new head carries the inputs), else page."""
+    sha = p["headRefOid"]
+    seen[f"{n}:dispatch-unavailable:{sha}"] = int(time.time())
+    log.append(f"dispatch #{n} unavailable at {sha[:9]} (no workflow_dispatch inputs on that ref)")
+    cut = cutover_state()
+    if cut is None:
+        log.append(f"dispatch #{n}: main ci.yml unreadable, doing nothing this tick")
+        return True
+    if not cut:
+        return False
+    if _compare_ahead(sha) > 0:
+        _sync_head(n, p, log, attention, seen)
+    else:
+        _page_once(n, p, "no-ci", f"undispatchable:{sha}", seen, attention, reason="dispatch refused (422) and no event can start CI")
+    return True
+
+
+def dispatch_ci(n, p, seen, log, attention, generation=0):
+    """The single entry point. True = the dispatch path owns CI for this PR (legacy starters must stay quiet);
+    False = use the legacy path (kill switch, dispatch unavailable before cutover, fork without approval before cutover)."""
+    sha, cut = p["headRefOid"], cutover_state()
+    if not dispatch_enabled() or f"{n}:dispatch-unavailable:{sha}" in seen:
+        return False
+    if cut is None:
+        log.append(f"dispatch #{n}: main ci.yml unreadable, doing nothing this tick")
+        return True                                   # unknown cutover: neither dispatch nor start a legacy run
+    if p.get("isCrossRepository") and not cut and not fork_approved(n, sha):
+        return False                                  # forks keep their approval-gated event runs until cutover
+    ref = dispatch_ref(n, p, seen, log, attention)
+    if not ref:
+        return True
+    if not cut and not ref_dispatchable(n, p, seen):
+        return False                                  # dual mode: the head has no dispatch inputs yet, events run it
+    if _compare_ahead(sha) > 0:
+        _sync_head(n, p, log, attention, seen)
+        return True
+    live = sh("gh", "api", f"repos/{REPO}/pulls/{n}", "--jq", ".head.sha").strip()
+    if live and live != sha:
+        log.append(f"dispatch #{n}: head moved ({sha[:9]} -> {live[:9]}), next tick")
+        return True
+    base = merge_base(p)
+    if not base:
+        log.append(f"dispatch #{n}: merge base unreadable, retry next tick")
+        return True
+    runs = dispatched_runs(sha)
+    if runs is None:
+        log.append(f"dispatch #{n}: run list unreadable, retry next tick")
+        return True
+    return _dispatch_all(n, p, ref, base, runs, generation, seen, log, attention)
+
+
+def _dispatch_all(n, p, ref, base, runs, generation, seen, log, attention):
+    sha, digest, now = p["headRefOid"], meta_digest(p), int(time.time())
+    for wf in SUITE_WORKFLOWS + META_WORKFLOWS:
+        dg = digest if wf in META_WORKFLOWS else ""
+        key = dispatch_key(n, wf, sha, dg, generation)
+        verdict = _decide(n, wf, sha, dg, generation, runs, seen, now)
+        if verdict == "page":
+            _page_once(n, p, "no-ci", f"lost-dispatch:{wf}:{sha}", seen, attention, workflow=wf, tries=DISPATCH_MAX_TRIES)
+        if verdict != "go":
+            continue
+        res = dispatch_workflow(n, p, wf, ref, key, base, dg, seen, log, attention)
+        if res == "unavailable" and wf == SUITE_WORKFLOWS[0]:
+            return _unavailable(n, p, seen, log, attention)
+        if res == "unavailable":
+            _page_once(n, p, "dispatch-unavailable", f"{wf}:{sha}", seen, attention, workflow=wf)
+    return True
+
+
+def mirror_fork_head(n, p, seen, log, attention):
+    """Mirror a fork head to ci/pr-<n> at the SAME sha, ONLY with a recorded human approval of that exact sha
+    (`ledger set <n> --fork-approved <sha>`). Without one: ATTENTION, no mirror, no dispatch. Never approves itself."""
+    sha, ref = p["headRefOid"], f"{MIRROR_PREFIX}{n}"
+    if not fork_approved(n, sha):
+        _page_once(n, p, "fork-approval", f"ci:{sha}", seen, attention,
+                   detail=f"fork head {sha[:9]} awaits owner approval to run with repo secrets")
+        return ""
+    k = f"{n}:fork-mirror:{sha}"
+    if k in seen and _mirror_sha(ref) == sha:
+        return ref                                    # trust the key only while the ref still carries this sha
+    seen.pop(k, None)
+    log.append(f"mirror fork head #{n} -> {ref} @ {sha[:9]}")
+    if DRY:
+        return ref
+    rc, _, err = sh_rc("gh", "api", "-X", "POST", f"repos/{REPO}/git/refs", "-f", f"ref=refs/heads/{ref}", "-f", f"sha={sha}")
+    if rc and "already exists" in err:
+        rc, _, err = sh_rc("gh", "api", "-X", "PATCH", f"repos/{REPO}/git/refs/heads/{ref}", "-f", f"sha={sha}", "-F", "force=true")
+    if rc:
+        log.append(f"ATTENTION #{n} mirror {ref} failed rc={rc}: {err[:120]}")
+        attention.append({"pr": n, "kind": "gh-failed", "step": "mirror fork head", "rc": rc, "head": sha[:9]})
+        return ""
+    seen[k] = int(time.time())
+    return ref
+
+
+def _mirror_sha(ref):
+    """Current sha of refs/heads/<ref>, "" when missing or unreadable."""
+    rc, out, _ = sh_rc("gh", "api", f"repos/{REPO}/git/ref/heads/{ref}", "--jq", ".object.sha")
+    return out.strip() if rc == 0 else ""
+
+
+def mirror_keep_heads(prs, slots):
+    return {(REPO, f"{MIRROR_PREFIX}{p['number']}") for p in prs if p["number"] in slots and p.get("isCrossRepository")}
+
+
+def mirror_cleanup(prs, slots, log, seen=None):
+    """Delete ci/pr-<n> mirrors whose PR is gone, holds no slot, or whose head moved (they are refs we created)."""
+    want = {f"{MIRROR_PREFIX}{p['number']}": p["headRefOid"] for p in prs if p["number"] in slots and p.get("isCrossRepository")}
+    out = sh("gh", "api", f"repos/{REPO}/git/matching-refs/heads/{MIRROR_PREFIX}", "--jq", '.[]|"\\(.ref) \\(.object.sha)"')
+    for line in out.splitlines():
+        ref, _, sha = line.partition(" ")
+        short = ref.removeprefix("refs/heads/")
+        if short.startswith(MIRROR_PREFIX) and want.get(short) != sha:
+            log.append(f"delete mirror {short}")
+            if not DRY:
+                sh("gh", "api", "-X", "DELETE", f"repos/{REPO}/git/refs/heads/{short}")
+            if seen is not None:
+                for k in [k for k in seen if k.startswith(f"{short.removeprefix(MIRROR_PREFIX)}:fork-mirror:")]:
+                    del seen[k]
+
+
+def prune_seen(seen, now=None):
+    """Drop notified.json keys older than 14 days: dispatch records, ref-dispatchable memos and per-day keys."""
+    cut = int(now or time.time()) - SEEN_MAX_AGE_SECS
+    for k, v in list(seen.items()):
+        if ":dispatch:" in k or ":ref-dispatchable:" in k:
+            ts = v.get("ts") if isinstance(v, dict) else None
+            if not isinstance(ts, (int, float)) or ts < cut:
+                del seen[k]
+        elif re.match(r"^queue-runaway:\d{4}-\d{2}-\d{2}$", k):
+            if not isinstance(v, (int, float)) or v < cut:
+                del seen[k]
+
+
+def runaway_page(prs, seen, attention):
+    """Q6: the open-PR count reached pr-queue-gate's runaway threshold (a detector, not a cap). Once per day."""
+    k = f"queue-runaway:{time.strftime('%F')}"
+    if len(prs) >= RUNAWAY_THRESHOLD and k not in seen:
+        seen[k] = int(time.time())
+        attention.append({"pr": None, "kind": "pr-queue-runaway", "open": len(prs), "threshold": RUNAWAY_THRESHOLD})
+
+
+def is_external(p):
+    """External contributor: a fork head or an author other than the repo owner. Only these need a ledger approve."""
+    author = ((p.get("author") or {}).get("login")) or ""
+    return bool(p.get("isCrossRepository")) or author != REPO.split("/")[0]
+
+
+def fetch_pr_rest(n):
+    """One PR in the shape of fetch_prs (the fields dispatch needs), via REST, for the one-PR CLI paths."""
+    out = sh("gh", "api", f"repos/{REPO}/pulls/{n}", "--jq",
+             '{number,title,body,isDraft:.draft,headRefName:.head.ref,headRefOid:.head.sha,baseRefName:.base.ref,'
+             'headRepository:{nameWithOwner:(.head.repo.full_name // "")},isCrossRepository:(.head.repo.full_name != .base.repo.full_name),'
+             'maintainerCanModify:.maintainer_can_modify,milestone:(if .milestone then {title:.milestone.title} else null end),'
+             'author:{login:.user.login},labels:{nodes:[.labels[]|{name}]},state}')
+    try:
+        p = json.loads(out)
+    except ValueError:
+        return None
+    return p if p.get("state") == "open" else None
+
+
+def dispatch_cli(n):
+    """`--dispatch PR`: one-PR dispatch pass under the pass lock (push-and-park calls it right after a push).
+    0 = done / nothing to do, 3 = refused (no slot), 1 = error."""
+    lock = take_pass_lock()
+    for _ in range(LOCK_RETRIES if lock is None else 0):
+        time.sleep(LOCK_RETRY_SLEEP)
+        if (lock := take_pass_lock()) is not None:
+            break
+    if lock is None:
+        print(f"#{n}: coordinator pass lock still held after {LOCK_RETRIES * LOCK_RETRY_SLEEP}s; nothing dispatched, retry")
+        return 1
+    try:
+        r = _redis()
+        if not r.exists(f"lg:hold:ci-slot:{n}"):
+            print(f"#{n} holds no CI slot: nothing dispatched")
+            return 3
+        p = fetch_pr_rest(n)
+        if not p:
+            print(f"#{n} is not an open PR")
+            return 1
+        p["owner"], p["alive"] = owner_of(r, ledger_mod(), p)
+        STATE.mkdir(parents=True, exist_ok=True)
+        seen_path = STATE / "notified.json"
+        seen = json.loads(seen_path.read_text(encoding="utf-8")) if seen_path.exists() else {}
+        log, attention = [], []
+        reason = proof_status(p, seen)
+        if reason:
+            print(f"#{n} barred by the requirement-proof gate: {reason}")
+            return 0
+        owned = dispatch_ci(n, p, seen, log, attention)
+        print("\n".join(f"ACTION {l}" for l in log) or f"#{n}: nothing to dispatch")
+        print("dispatch path" if owned else "legacy path (dispatch unavailable)")
+        prune_seen(seen)
+        write_atomic(seen_path, json.dumps(seen))
+        if attention:
+            with open(STATE / "attention.jsonl", "a", encoding="utf-8") as fh:
+                fh.writelines(json.dumps({"ts": int(time.time()), **a}) + "\n" for a in attention)
+        return 0
+    finally:
+        lock.close()
+
+
+def findings_gate_cli(n):
+    """`--findings-gate PR` (safe-merge, immediately before the merge): dispatch pr-blocking-findings.yml for the head
+    and wait for its conclusion (bounded). 0 = success, 1 = failed / timed out / cannot run, 3 = not applicable
+    (dual mode before cutover, or the kill switch): the caller keeps today's behaviour."""
+    if not dispatch_enabled():
+        print("findings gate not applicable (dispatch disabled)")
+        return 3
+    cut = cutover_state()
+    if cut is None:
+        print(f"#{n} findings gate cannot run: main ci.yml unreadable (no merge)")
+        return 1
+    if not cut:
+        print("findings gate not applicable (dual mode before cutover)")
+        return 3
+    p = fetch_pr_rest(n)
+    if not p:
+        print(f"#{n} is not an open PR")
+        return 1
+    seen, log, att = {}, [], []
+    ref = p["headRefName"] if not p.get("isCrossRepository") else (f"{MIRROR_PREFIX}{n}" if fork_approved(n, p["headRefOid"]) else "")
+    base = merge_base(p)
+    if not ref or not base:
+        print(f"#{n} findings gate cannot run (no dispatchable ref or merge base)")
+        return 1
+    t0 = time.time()
+    res = dispatch_workflow(n, p, FINDINGS_WORKFLOW, ref, "k", base, "", seen, log, att)
+    if res != "ok":
+        print(f"#{n} findings dispatch {res}")
+        return 1
+    return _wait_findings(n, p["headRefOid"], t0, (seen.get("k") or {}).get("run_id"))
+
+
+def _wait_findings(n, sha, t0, run_id=None):
+    """Wait for THE run this gate dispatched (by id), else the newest findings run at this head created after t0."""
+    deadline = time.time() + FINDINGS_WAIT_SECS
+    while time.time() < deadline:
+        runs = [r for r in (dispatched_runs(sha) or []) if (r.get("path") or "").endswith("/" + FINDINGS_WORKFLOW)
+                and r.get("created_at", "9") >= _iso(t0 - 5)]
+        if run_id:
+            runs = [r for r in runs if r.get("id") == run_id] or runs
+        newest = max(runs, key=lambda r: r.get("created_at", ""), default=None)
+        if newest and newest.get("status") == "completed":
+            concl = newest.get("conclusion")
+            print(f"#{n} findings gate: {concl}")
+            return 0 if concl == "success" else 1
+        time.sleep(10)
+    print(f"#{n} findings gate: no conclusion within {FINDINGS_WAIT_SECS}s")
+    return 1
 
 
 def merges_only_main(others):
@@ -1028,11 +1502,13 @@ def _update_step(n, p, blocked, seen, log, attention):
     return True
 
 
-def _recheck_step(n, p, runs_here, blocked, seen, log):
+def _recheck_step(n, p, runs_here, blocked, seen, log, dispatching=False):
     if not (RECHECK.get(str(n)) == p["headRefOid"][:9] and any(r.endswith("\tfailure") for r in runs_here)):
         return False
-    # A rerun replays the ORIGINAL event payload (labels/draft as they were), so a metadata-only fix never
-    # clears by rerun. A fresh head does: ask the sync for its empty start-CI commit, once per head.
+    if dispatching:
+        return True       # the fresh evaluation is a new dispatch GENERATION at the same head (slot_ci_phase bumped it)
+    # Legacy: a rerun replays the ORIGINAL event payload, so a metadata-only fix never clears by rerun. A fresh
+    # head does: ask the sync for its empty start-CI commit, once per head.
     k = f"{n}:recheck-start-ci:{p['headRefOid']}"
     if k not in seen and not blocked and not p.get("isCrossRepository"):
         seen[k] = int(time.time())
@@ -1042,14 +1518,20 @@ def _recheck_step(n, p, runs_here, blocked, seen, log):
     return True
 
 
-def slot_ci_phase(n, p, blocked, seen, log, attention):
+def slot_ci_phase(n, p, blocked, seen, log, attention, skip_dispatch=False):
     """CI starters for one slot PR. Returns True when the tick for this PR ends here. `blocked` bars only the
     starters (recheck start-ci, cancelled-run rerun, start_ci_or_report, update-branch of a non-green PR)."""
     if _update_step(n, p, blocked, seen, log, attention):
         return True
+    gen_k, rk = f"{n}:dispatch-gen:{p['headRefOid']}", f"{n}:recheck-gen:{p['headRefOid']}"
+    if RECHECK.get(str(n)) == p["headRefOid"][:9] and rk not in seen and not blocked and not DRY:
+        seen[rk] = int(time.time())               # owner-verified stale red: ask for a fresh evaluation, same head
+        seen[gen_k] = seen.get(gen_k, 0) + 1
+        log.append(f"dispatch #{n} again (stale red at a recheck head), generation {seen[gen_k]}")
+    dispatching = not blocked and not skip_dispatch and dispatch_ci(n, p, seen, log, attention, seen.get(gen_k, 0))   # False = legacy
     runs_here = sh("gh", "api", f"repos/{REPO}/actions/runs?head_sha={p['headRefOid']}&per_page=100",
                    "--jq", '.workflow_runs[]|[.id, .status, (.conclusion // "")]|@tsv').splitlines()
-    if _recheck_step(n, p, runs_here, blocked, seen, log):
+    if _recheck_step(n, p, runs_here, blocked, seen, log, dispatching):
         return True
     cancelled = [r.split("\t")[0] for r in runs_here if r.endswith("\tcancelled")]
     live = any(r.split("\t")[1] != "completed" for r in runs_here if r)
@@ -1062,7 +1544,7 @@ def slot_ci_phase(n, p, blocked, seen, log, attention):
     gate = sh(str(S / "ci-gate"), str(n))
     if gate.endswith("GREEN"):
         return False
-    if not blocked and not p.get("unparked"):     # an unparked PR's ready_for_review event starts its own suite
+    if not blocked and not dispatching and not p.get("unparked"):   # legacy only: an unparked PR's ready_for_review event starts its own suite
         # never stall silently: ask Actions whether a run is live
         start_ci_or_report(n, p, gate, seen, log, attention)
     return True
@@ -1072,12 +1554,17 @@ def slot_land_phase(n, p, landing_head, r, seen, log, attention):
     """Review, threads, migration-gate, FIFO and merge for a green slot PR. Never gated by the proof gate."""
     rv = r.hgetall(f"lg:pr:{n}")
     unresolved = sum(1 for t in p["reviewThreads"]["nodes"] if not t["isResolved"])
-    if rv.get("review_verdict") != "approve" or not review_carries(rv.get("review_sha", ""), p["headRefOid"], n):
-        k = f"{n}:review:{p['headRefOid']}"
+    if is_external(p) and (rv.get("review_verdict") != "approve" or not review_carries(rv.get("review_sha", ""), p["headRefOid"], n)):
+        k = f"{n}:review:{p['headRefOid']}"   # owner 2026-11-28: a ledger approve applies to EXTERNAL PRs only
         if k not in seen:
             seen[k] = int(time.time())
             attention.append({"pr": n, "kind": "review", "owner": p["owner"], "owner_state": p["alive"],
                               "branch": p["headRefName"], "head": p["headRefOid"][:9]})
+    elif not is_external(p) and proof_status(p, seen):
+        k = f"{n}:land-proof:{p['headRefOid']}"   # own PRs merge on quality: green, 0 threads, not behind, proof table valid
+        if k not in seen:
+            seen[k] = int(time.time())
+            log.append(f"#{n} green but the requirement-proof check fails: no merge")
     elif unresolved:
         k = f"{n}:threads:{p['headRefOid']}:{unresolved}"   # say it once per head and count, not every tick
         if k not in seen:
@@ -1180,48 +1667,29 @@ def _unpark(n, p, log, attention):
     return True
 
 
-def _park(n, p, state, log, attention, seen):
-    """Label FIRST, then `--undo`: a partial failure leaves a labelled ready PR, which the next tick re-drafts."""
-    if not is_parked(p):
-        if not state["label_made"]:
-            if not _gh(n, p, "label create", attention, log, "gh", "label", "create", PARK_LABEL, "--repo", REPO,
-                       "--force", "--color", "ededed", "--description", "drafted by pr-coordinator: not admitted to a CI slot"):
-                return
-            state["label_made"] = True
-        if not _gh(n, p, "add label", attention, log, "gh", "pr", "edit", str(n), "--repo", REPO, "--add-label", PARK_LABEL):
-            return
-    _gh(n, p, "gh pr ready --undo", attention, log, "gh", "pr", "ready", "--undo", str(n), "--repo", REPO)
-
-
-def park_phase(prs, slots, log, seen=None, attention=None):
-    """Only the slot PRs may run CI (#20825): every other open non-draft PR becomes a draft labelled `ci-parked`;
-    an admitted PR carrying the label is made ready again (one full suite) and loses it. A draft without the label
-    is the author's own and is never touched. Fork PRs follow the same rule. Returns the admitted PRs whose
-    unpark failed. A parked PR the author marked ready is parked again, logged once per head, label untouched."""
-    seen, attention = {} if seen is None else seen, [] if attention is None else attention
-    state, failed = {"label_made": False}, set()
+def unpark_phase(prs, slots, log, seen=None, attention=None):
+    """Owner 2026-11-28 (Q3): parking is OVER. No PR is drafted or labelled `ci-parked` any more. What remains is
+    undoing the old parks: an admitted PR carrying the label is made ready again (before cutover its ready event
+    starts its suite), and ONLY after cutover (main's ci.yml has no pull_request trigger, so nothing can start a run
+    from the event) every remaining `ci-parked` PR is unparked once. Before cutover a parked PR stays parked: the
+    event WOULD start its suite. A draft without the label is the author's own and is never touched. Returns the
+    admitted PRs whose unpark failed."""
+    attention = [] if attention is None else attention
+    failed, cut = set(), cutover_done()          # unreadable == not cut over: only admitted slot PRs are touched
     for p in prs:
         n = p["number"]
-        if n in slots and is_parked(p):
-            log.append(f"unpark #{n} (admitted to a slot): gh pr ready, drop {PARK_LABEL}")
-            if not DRY and not _unpark(n, p, log, attention):
-                failed.add(n)
-        elif n not in slots and not p["isDraft"]:
-            k = f"{n}:reparked:{p['headRefOid']}"
-            if is_parked(p) and k in seen:
-                pass                              # the author re-readied it again at the same head: park silently
-            else:
-                if is_parked(p):
-                    seen[k] = int(time.time())
-                log.append(f"park #{n} (no CI slot): gh pr ready --undo, label {PARK_LABEL}")
-            if not DRY:
-                _park(n, p, state, log, attention, seen)
+        if not is_parked(p) or not (n in slots or cut):
+            continue
+        log.append(f"unpark #{n} ({'admitted to a slot' if n in slots else 'cutover: parking is over'}): gh pr ready, drop {PARK_LABEL}")
+        if not DRY and not _unpark(n, p, log, attention):
+            failed.add(n)
     return failed
 
 
 def main():
     lg = ledger_mod()
     r = lg.conn()
+    _REDIS[:] = [r]
     STATE.mkdir(parents=True, exist_ok=True)
     seen_path = STATE / "notified.json"
     seen = json.loads(seen_path.read_text(encoding="utf-8")) if seen_path.exists() else {}
@@ -1233,7 +1701,7 @@ def main():
         print("trainmaster active — train rules apply; pr-coordinator reports only")
         globals()["DRY"] = True
 
-    prs = sorted(fetch_prs(), key=lambda p: (p["number"] in LAST, milestone_rank(p), p["createdAt"], p["number"]))
+    prs = sorted(fetch_prs(), key=admission_key)
     runs = actions_runs()
     held = {int(k.rsplit(":", 1)[1]): r.hgetall(k) for k in r.scan_iter("lg:hold:ci-slot:*")}
     open_nums = {p["number"] for p in prs}
@@ -1243,6 +1711,7 @@ def main():
     open_now = {p["number"] for p in prs}
     pr_claims = {int(k.rsplit(":", 1)[1]): r.hget(k, "owner") or "?" for k in r.scan_iter("lg:claim:pr:*")}
     log.extend(stale_pr_claims(pr_claims, open_now))
+    runaway_page(prs, seen, attention)
 
     for p in prs:
         n, red, active, total = p["number"], *ci_state(p)
@@ -1311,7 +1780,9 @@ def main():
     # red, conflict and fork-awaiting-approval (owner 2026-11-28); it is released only for an empty diff, an unmet
     # declared dependency or a fork stuck behind. Only FREE slots are filled in FIFO order
     release = {p["number"] for p in prs if p["changedFiles"] == 0 or fork_stuck_behind(p)
-               or any(d in open_now for d in deps.get(str(p["number"]), []))}
+               or any(d in open_now for d in deps.get(str(p["number"]), []))
+               or (p.get("isCrossRepository") and dispatch_enabled() and cutover_done()
+                   and not fork_approved(p["number"], p["headRefOid"]))}   # no CI path for an unapproved fork: do not hold the slot
     slots += [n for n in kept_slots(held, open_nums, r, release) if n not in slots][:max(0, WIDTH - len(slots))]
     # unblocker lane (owner 2026-11-18): a PR that fixes main itself or stops data loss takes the next
     # FREE slot ahead of FIFO and may land ahead of older slot PRs; it never pre-empts a running slot.
@@ -1323,7 +1794,7 @@ def main():
             break
         if n not in slots:
             slots.append(n)
-    unpark_failed = park_phase(prs, slots, log, seen, attention)   # unpark BEFORE `land-next` is added below
+    unpark_failed = unpark_phase(prs, slots, log, seen, attention)   # unpark BEFORE `land-next` is added below
     stuck_slot_pages(prs, slots, seen, log, attention)
     for n, h in held.items():
         if h.get("by") == ME and n not in slots:
@@ -1341,7 +1812,9 @@ def main():
                     sh("gh", "pr", "edit", str(n), "--repo", REPO, "--add-label", SLOT_LABEL)
 
     pmap0 = {p["number"]: p for p in prs}
-    slot_heads = {(pr_repo(pmap0[n]), pmap0[n]["headRefName"]) for n in slots if n in pmap0}
+    slot_heads = {(pr_repo(pmap0[n]), pmap0[n]["headRefName"]) for n in slots if n in pmap0} | mirror_keep_heads(prs, slots)
+    if not DRY:
+        mirror_cleanup(prs, slots, log, seen)
     sweep_runs(runs, prs, lambda p: ("" if p["number"] in slots else      # an admitted PR's runs are never cancelled, red or not
                                      f"rule4: red at head ({', '.join(p['red'][:3])})" if p["red"] else "rule2: no CI slot (FIFO)"),
                slot_heads, "rule2: branch has no open PR and no CI slot", log)
@@ -1355,23 +1828,26 @@ def main():
             return False                          # it cannot be brought to 0 behind by us: it must not block newer PRs
         if any(not t["isResolved"] for t in q["reviewThreads"]["nodes"]):
             return False
+        if not is_external(q):
+            return True                           # own PRs need no per-head approval (owner 2026-11-28)
         return rv_m.get("review_verdict") == "approve" and review_carries(rv_m.get("review_sha", ""), q["headRefOid"], q.get("number"))
 
     for i, n in enumerate(slots):
         p = pmap[n]
         if n in held and held[n].get("by") != ME:
             continue                              # another session drives its own slot
-        if p["awaiting"]:
-            approve_fork_runs(n, p, seen, log, attention)
+        if p["awaiting"] and (not dispatch_enabled() or cutover_state() is False):
+            approve_fork_runs(n, p, seen, log, attention)   # legacy, secretless event runs (dropped in PR-B)
         blocked = proof_blocked(p, seen, log, attention)   # gates ONLY the CI starters; every other page still runs
         if not blocked:
             preboard_advisory(n, p, seen, log, attention)  # advisory only: never changes what happens next (#49)
-        if slot_ci_phase(n, p, blocked, seen, log, attention):
+        if slot_ci_phase(n, p, blocked, seen, log, attention, skip_dispatch=n in unpark_failed):
             continue
         landing_head = n in unblock or not any(could_land(m) for m in slots[:i] if m in open_nums)
         slot_land_phase(n, p, landing_head, r, seen, log, attention)
 
     if not DRY:
+        prune_seen(seen)
         write_atomic(seen_path, json.dumps(seen))
         write_atomic(recent_path, json.dumps(RECENT))
         sh("redis-cli", "--no-auth-warning", "-n", "15", "DEL", "claude:landing-order")
@@ -1439,6 +1915,10 @@ def run_cli(argv):
         return 0
     if len(argv) == 2 and argv[0] == "--proof-check":
         return proof_check_cli(argv[1])
+    if len(argv) == 2 and argv[0] == "--dispatch" and argv[1].isdigit():
+        return dispatch_cli(int(argv[1]))
+    if len(argv) == 2 and argv[0] == "--findings-gate" and argv[1].isdigit():
+        return findings_gate_cli(int(argv[1]))
     if argv not in ([], ["--dry"]):
         print(f"pr-coordinator: unknown arguments {argv}\n{USAGE}", file=sys.stdout)
         return 2
