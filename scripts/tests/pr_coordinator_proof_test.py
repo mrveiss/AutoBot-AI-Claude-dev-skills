@@ -1,5 +1,5 @@
 """Requirement-proof gate of scripts/pr-coordinator (#37): table validation, cutoff exemption, main-merge syncs."""
-import importlib.machinery, importlib.util, unittest
+import importlib.machinery, importlib.util, json, os, subprocess, tempfile, time, unittest
 from pathlib import Path
 
 PATH = str(Path(__file__).resolve().parents[1] / "pr-coordinator")
@@ -225,6 +225,209 @@ class Gating(unittest.TestCase):
         PC.sh = lambda *a, **k: (self.calls.append(a), "RED" if a[0].endswith("ci-gate") else "")[1]
         self.assertTrue(PC.slot_ci_phase(7, self.p, True, {}, [], []))
         self.assertFalse(any(c[:2] in (("gh", "run"), ("gh", "workflow")) for c in self.calls))
+
+
+class PatchIdCarry(unittest.TestCase):
+    """Owner 2026-11-28: an approval carries when the PR's own diff (vs its merge-base with main) is unchanged."""
+    def git(self, *a):
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+        return subprocess.run(["git", "-C", self.work, *a], check=True, capture_output=True, text=True, env=env).stdout.strip()
+
+    def commit(self, name, text):
+        Path(self.work, name).write_text(text, encoding="utf-8")
+        self.git("add", name)
+        self.git("commit", "-q", "-m", name)
+        return self.git("rev-parse", "HEAD")
+
+    def setUp(self):
+        self.mod = load()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.work, bare = str(Path(tmp.name, "work")), Path(tmp.name, "cache.git")
+        self.git_init(bare)
+        self.base = self.commit("base.txt", "base\n")
+        self.git("checkout", "-q", "-b", "pr")
+        self.approved = self.commit("pr.txt", "own change\n")
+        self.git("checkout", "-q", "main")
+        self.main2 = self.commit("main.txt", "later main\n")
+        self.git("checkout", "-q", "pr")
+        self.git("merge", "-q", "--no-ff", "-m", "Merge branch 'main' into pr", "main")   # a hand-made main merge
+        self.merged = self.git("rev-parse", "HEAD")
+        self.git("update-ref", "refs/remotes/origin/main", self.main2)
+        self.git("push", "-q", str(bare), "refs/remotes/origin/main:refs/remotes/origin/main", "pr:refs/heads/pr")
+        self.mod.PATCH_GIT, self.mod.PATCH_CACHE = bare, Path(tmp.name, "cache.json")
+        self.mod._MAIN_FETCHED.append(1)
+        self.mod.sh = lambda *a, **k: self.api.get(a[2].rsplit("/", 1)[-1], "")
+        self.api = {}
+
+    def git_init(self, bare):
+        subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+        os.makedirs(self.work)
+        self.git("init", "-q", "-b", "main")
+
+    def test_identical_patch_through_human_main_merge_carries(self):
+        self.api = {self.approved: self.approved}
+        self.assertTrue(self.mod.review_carries(self.approved, self.merged))
+        self.assertTrue(self.mod.PATCH_CACHE.exists())   # diff ids are cached
+
+    def test_changed_content_does_not_carry(self):
+        self.git("checkout", "-q", "-b", "pr2", self.approved)
+        changed = self.commit("pr.txt", "different change\n")
+        self.git("push", "-q", str(self.mod.PATCH_GIT), "pr2:refs/heads/pr2")
+        self.api = {self.approved: self.approved}
+        self.assertFalse(self.mod.review_carries(self.approved, changed))
+
+    def _variant(self, branch, name, data):
+        """A sibling of the approved head, from the same base, writing `data` (bytes) to `name`."""
+        self.git("checkout", "-q", "-b", branch, self.base)
+        Path(self.work, name).write_bytes(data)
+        self.git("add", name)
+        self.git("commit", "-q", "-m", branch)
+        sha = self.git("rev-parse", "HEAD")
+        self.git("push", "-q", str(self.mod.PATCH_GIT), f"{branch}:refs/heads/{branch}")
+        return sha
+
+    def test_indentation_only_change_does_not_carry(self):
+        a = self._variant("ws1", "m.py", b"def f():\n    return 1\n")
+        b = self._variant("ws2", "m.py", b"def f():\n  return 1\n")
+        c = self._variant("ws3", "m.py", b"def f():\n\treturn 1\n")
+        self.api = {a: a}
+        self.assertFalse(self.mod.review_carries(a, b))
+        self.assertFalse(self.mod.review_carries(a, c))
+
+    def test_different_binary_content_does_not_carry(self):
+        a = self._variant("bin1", "x.bin", b"\x00\x01\x02\xff")
+        b = self._variant("bin2", "x.bin", b"\x00\x01\x03\xff")
+        self.api = {a: a}
+        self.assertFalse(self.mod.review_carries(a, b))
+
+    def test_same_diff_different_commit_carries(self):
+        a = self._variant("same1", "x.bin", b"\x00\x01\x02")
+        self.git("commit", "-q", "--amend", "-m", "reworded", "--allow-empty")
+        b = self.git("rev-parse", "HEAD")
+        self.git("push", "-q", "-f", str(self.mod.PATCH_GIT), "same1:refs/heads/same2")
+        self.api = {a: a}
+        self.assertNotEqual(a, b)
+        self.assertTrue(self.mod.review_carries(a, b))
+
+    def test_cache_key_has_merge_base_and_corrupt_cache_is_empty(self):
+        self.mod.PATCH_CACHE.write_text("{not json", encoding="utf-8")
+        self.api = {self.approved: self.approved}
+        self.assertTrue(self.mod.review_carries(self.approved, self.merged))
+        keys = list(json.loads(self.mod.PATCH_CACHE.read_text(encoding="utf-8")))
+        self.assertTrue(all(":" in k and len(k.split(":")) == 2 for k in keys), keys)
+        self.assertFalse(list(self.mod.PATCH_CACHE.parent.glob("*.tmp")))
+
+    def test_cache_prunes_old_and_excess_entries(self):
+        old = {f"k{i}": {"id": "x", "t": time.time() - 15 * 86400} for i in range(3)}
+        new = {f"n{i}": {"id": "x", "t": time.time() - i} for i in range(self.mod.PATCH_CACHE_MAX_ENTRIES + 5)}
+        self.mod._cache_store({**old, **new})
+        kept = json.loads(self.mod.PATCH_CACHE.read_text(encoding="utf-8"))
+        self.assertEqual(len(kept), self.mod.PATCH_CACHE_MAX_ENTRIES)
+        self.assertFalse(any(k.startswith("k") for k in kept))
+
+    def _shift_pair(self, main_edit):
+        """PR A on c1; main moves to c2 (main_edit applied to f.txt); PR B = the same line-15 edit on c2."""
+        lines = [f"line{i}\n" for i in range(1, 31)]
+        self.git("checkout", "-q", "main")
+        c1 = self.commit("f.txt", "".join(lines))
+        edit = list(lines)
+        edit[14] = "PR CHANGE\n"
+        self.git("checkout", "-q", "-b", "sa", c1)
+        a = self.commit("f.txt", "".join(edit))
+        self.git("checkout", "-q", "main")
+        c2 = self.commit("f.txt", "".join(main_edit(lines)))
+        self.git("checkout", "-q", "-b", "sb", c2)
+        edit2 = main_edit(lines)
+        edit2[14 + (len(edit2) - len(lines))] = "PR CHANGE\n"
+        b = self.commit("f.txt", "".join(edit2))
+        self.git("update-ref", "refs/remotes/origin/main", c2)
+        self.git("push", "-q", "-f", str(self.mod.PATCH_GIT), "refs/remotes/origin/main:refs/remotes/origin/main",
+                 "sa:refs/heads/sa", "sb:refs/heads/sb")
+        self.api = {a: a}
+        return a, b
+
+    def test_main_shifting_lines_above_identical_hunk_carries(self):
+        a, b = self._shift_pair(lambda ls: ["new top\n", "new top2\n"] + ls)
+        self.assertTrue(self.mod.review_carries(a, b))
+
+    def test_identical_hunk_at_other_position_carries_by_design(self):
+        """Accepted limit: the same +/- lines with identical context at a DIFFERENT position in the same
+        pre-existing file hash equal, so the approval carries. Accepted because every changed line is still
+        hashed (nothing new can ride along) and CI on the new head is the check."""
+        block = [f"blk{i}\n" for i in range(1, 8)]
+        lines = [f"line{i}\n" for i in range(1, 11)] + block + [f"tail{i}\n" for i in range(1, 11)] + block
+        self.git("checkout", "-q", "main")
+        c1 = self.commit("f.txt", "".join(lines))
+        first, second = lines.index(block[3]), len(lines) - len(block) + 3
+        self.git("checkout", "-q", "-b", "sa", c1)
+        a_lines = list(lines)
+        a_lines[first] = "PR CHANGE\n"
+        a = self.commit("f.txt", "".join(a_lines))
+        self.git("checkout", "-q", "-b", "sb", c1)
+        b_lines = list(lines)
+        b_lines[second] = "PR CHANGE\n"
+        b = self.commit("f.txt", "".join(b_lines))
+        self.git("update-ref", "refs/remotes/origin/main", c1)
+        self.git("push", "-q", "-f", str(self.mod.PATCH_GIT), "refs/remotes/origin/main:refs/remotes/origin/main",
+                 "sa:refs/heads/sa", "sb:refs/heads/sb")
+        self.api = {a: a}
+        self.assertTrue(self.mod.review_carries(a, b))
+
+    def test_changed_context_line_in_hunk_does_not_carry(self):
+        def edit(ls):
+            out = list(ls)
+            out[13] = "main changed the line above\n"
+            return out
+        a, b = self._shift_pair(edit)
+        self.assertFalse(self.mod.review_carries(a, b))
+
+    def test_busy_lock_fails_closed(self):
+        import fcntl
+        self.mod.PATCH_LOCK = self.mod.PATCH_CACHE.parent / "busy.lock"
+        self.mod.PATCH_LOCK_WAIT = 0.3
+        self.api = {self.approved: self.approved}
+        with open(self.mod.PATCH_LOCK, "a+") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            self.assertFalse(self.mod.review_carries(self.approved, self.merged))
+        self.assertTrue(self.mod.review_carries(self.approved, self.merged))   # free again: carries
+
+    def test_cache_entry_without_id_is_a_miss(self):
+        self.mod.PATCH_LOCK = self.mod.PATCH_CACHE.parent / "p.lock"
+        self.api = {self.approved: self.approved}
+        base = self.git("merge-base", self.merged, self.main2)
+        self.mod.PATCH_CACHE.write_text(json.dumps({f"{self.approved}:{base}": {"t": time.time()}}), encoding="utf-8")
+        self.assertTrue(self.mod.review_carries(self.approved, self.merged))
+
+    def test_stale_tmp_files_are_cleaned_on_write(self):
+        old = self.mod.PATCH_CACHE.with_name(self.mod.PATCH_CACHE.name + ".999.tmp")
+        fresh = self.mod.PATCH_CACHE.with_name(self.mod.PATCH_CACHE.name + ".998.tmp")
+        for f in (old, fresh):
+            f.write_text("x", encoding="utf-8")
+        os.utime(old, (time.time() - 7200,) * 2)
+        self.mod._cache_store({})
+        self.assertFalse(old.exists())
+        self.assertTrue(fresh.exists())
+
+    def test_exception_in_carry_path_fails_closed(self):
+        def boom(*a, **k):
+            raise RuntimeError("boom")
+        self.mod._diff_id = boom
+        self.api = {self.approved: self.approved}
+        self.assertFalse(self.mod.review_carries(self.approved, self.merged))
+
+    def test_failed_main_fetch_fails_closed(self):
+        self.mod._MAIN_FETCHED.clear()          # origin is not configured on the cache clone: the fetch fails
+        self.api = {self.approved: self.approved}
+        self.assertFalse(self.mod.review_carries(self.approved, self.merged))
+
+    def test_missing_sha_does_not_carry(self):
+        gone = "f" * 40
+        self.api = {gone: gone}
+        self.assertFalse(self.mod.review_carries(gone, self.merged))
+
+    def test_unresolvable_review_sha_does_not_carry(self):
+        self.assertFalse(self.mod.review_carries("abc1234", self.merged))
 
 
 class CutoffEnv(unittest.TestCase):
