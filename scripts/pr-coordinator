@@ -6,6 +6,10 @@
     The release promotion (#19456) is always last. External (fork) PRs are slotted like own PRs (owner 2026-11-27:
     "we are owners, we do not need approval, we do the approval"); every landing gate still applies.
   2 At most WIDTH (2) PRs hold CI. Slots are ledger holds `ci-slot:N` (other sessions' holds count).
+    A granted slot is kept through red and conflict until the PR merges, closes or gets a ledger hold
+    (owner 2026-11-28: finish one landing before taking the next); a red slot PR is reported, never replaced.
+    Every other PR is parked as a draft with label `ci-parked` (#20825); admission runs `gh pr ready` and drops
+    the label. A draft without that label is the author's own and is left alone.
     Every other PR's in-flight Actions runs are cancelled through ci-cancel. A slot PR that is behind
     main is updated (update-branch); its cancelled runs are re-run. Only the oldest slot PR may land.
   3 CodeRabbit threads awaiting a reply are reported for EVERY open PR, at once, regardless of CI.
@@ -21,6 +25,7 @@ from pathlib import Path
 
 REPO, WIDTH, LAST = "mrveiss/AutoBot-AI", 2, {19456}
 ME = "pr-coordinator"
+PARK_LABEL = "ci-parked"   # we drafted this PR to keep it off CI (AutoBot-AI#20825); admission undoes it
 SLOT_LABEL = "land-next"   # marks slot PRs; the sync workflow merges main only into these (owner 2026-11-18)
 PROTECTED = {"main", "release", "master"}   # a promotion PR's head is main: its runs are main's own CI
 S = Path.home() / ".claude/scripts"
@@ -89,7 +94,7 @@ MILESTONE_NUM = re.compile(r"^\s*M(\d+)\b")
 ACTIVE = {"QUEUED", "IN_PROGRESS", "WAITING", "PENDING", "REQUESTED"}
 
 Q = """query($c:String){repository(owner:"mrveiss",name:"AutoBot-AI"){pullRequests(states:OPEN,first:100,after:$c){
-pageInfo{hasNextPage endCursor} nodes{number title createdAt updatedAt isDraft body changedFiles headRefName headRefOid headRepository{nameWithOwner} isCrossRepository maintainerCanModify mergeStateStatus mergeable milestone{title} author{login}}}}}"""
+pageInfo{hasNextPage endCursor} nodes{number title createdAt updatedAt isDraft body changedFiles headRefName headRefOid headRepository{nameWithOwner} isCrossRepository maintainerCanModify mergeStateStatus mergeable milestone{title} author{login} labels(first:30){nodes{name}}}}}}"""
 THREADS = """reviewThreads(first:60){nodes{id isResolved comments(first:1){nodes{author{login}}}
   last:comments(last:1){nodes{author{login} createdAt url}}}}"""
 CHECKS = """commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{
@@ -531,9 +536,10 @@ def start_ci_or_report(n, p, gate, seen, log, attention):
     parts = gate.split()
     if len(parts) >= 2 and not p["headRefOid"].startswith(parts[1]):
         return                                    # the head moved mid-tick (sync push): next tick sees it
+    advisory = json.dumps(sorted(EXEMPT_WORKFLOWS - REQUIRED_CONTEXT_PUBLISHERS))   # advisory lane / notes runs are not "the suite": they must not mask an idle slot
     queued = sh("gh", "api", f"repos/{REPO}/actions/runs?head_sha={p['headRefOid']}&per_page=100",
-                "--jq", '[.workflow_runs[]|select(.status!="completed")]|length')
-    if queued not in ("", "0"):                   # an Actions run is live (queued or running): CI is underway
+                "--jq", f'[.workflow_runs[]|select(.status!="completed" and (.name as $n|{advisory}|index($n)|not))]|length')
+    if queued not in ("", "0"):                   # a suite run is live (queued or running): CI is underway
         return
     k = f"{n}:start-ci:{p['headRefOid']}"
     msg = sh("gh", "api", f"repos/{REPO}/commits/{p['headRefOid']}", "--jq", ".commit.message")
@@ -910,6 +916,44 @@ def slot_land_phase(n, p, landing_head, r, seen, log, attention):
             log.append(sh(str(S / "safe-merge"), str(n)))
 
 
+def is_parked(p):
+    return any(l["name"] == PARK_LABEL for l in (p.get("labels") or {}).get("nodes", []))
+
+
+def kept_slots(held, open_nums, r):
+    """Slots this tool granted stay until the PR merges, closes or gets a ledger hold (owner 2026-11-28): red and
+    conflict do not release them. A ledger hold also re-arms the 6h TTL while the PR is still landing."""
+    keep = [n for n, h in held.items() if h.get("by") == ME and n in open_nums and not r.exists(f"lg:hold:pr:{n}")]
+    for n in keep:
+        if not DRY and r.ttl(f"lg:hold:ci-slot:{n}") < 3600:
+            sh(str(S / "ledger"), "--as", ME, "hold", f"ci-slot:{n}", "FIFO slot (pr-coordinator)", "--ttl", "6h")
+    return keep
+
+
+def park_phase(prs, slots, log):
+    """Only the slot PRs may run CI (#20825): every other open non-draft PR becomes a draft labelled `ci-parked`;
+    an admitted PR carrying the label is made ready again (one full suite) and loses it. A draft without the label
+    is the author's own and is never touched. Fork PRs follow the same rule."""
+    made = False
+    for p in prs:
+        n = p["number"]
+        if n in slots and is_parked(p):
+            log.append(f"unpark #{n} (admitted to a slot): gh pr ready, drop {PARK_LABEL}")
+            if not DRY:
+                sh("gh", "pr", "ready", str(n), "--repo", REPO)
+                sh("gh", "pr", "edit", str(n), "--repo", REPO, "--remove-label", PARK_LABEL)
+                p["isDraft"] = False
+        elif n not in slots and not p["isDraft"]:
+            log.append(f"park #{n} (no CI slot): gh pr ready --undo, label {PARK_LABEL}")
+            if not DRY:
+                if not made:
+                    sh("gh", "label", "create", PARK_LABEL, "--repo", REPO, "--color", "ededed",
+                       "--description", "drafted by pr-coordinator: not admitted to a CI slot")
+                    made = True
+                sh("gh", "pr", "ready", "--undo", str(n), "--repo", REPO)
+                sh("gh", "pr", "edit", str(n), "--repo", REPO, "--add-label", PARK_LABEL)
+
+
 def main():
     lg = ledger_mod()
     r = lg.conn()
@@ -952,7 +996,7 @@ def main():
             p["why"] = "review BLOCKED at this head: changes requested, so no slot until a new head"
         elif r.exists(f"lg:hold:pr:{n}"):       # a session's `ledger hold pr:<n>` parks it: no slot, no merge
             p["why"] = "held: " + (r.hget(f"lg:hold:pr:{n}", "reason") or "")[:60]
-        elif p["isDraft"]:
+        elif p["isDraft"] and not is_parked(p):   # a parked draft is ours: it can still be admitted
             p["why"] = "draft"
         elif p["headRefName"].startswith("dependabot/") or n in LAST:   # owner 2026-11-18: "release and dependabots can wait"
             p["why"] = "parked by owner (dependabot / release promotion): report only, no slot"
@@ -998,9 +1042,9 @@ def main():
     # rule 2 + 1: slots = live holds by others first, then FIFO-eligible up to WIDTH
     slots = [n for n in sorted(held, key=lambda x: next((i for i, p in enumerate(prs) if p["number"] == x), 999))
              if n in open_nums and held[n].get("by") != ME]
-    # no pre-emption: a slot this tool granted is kept until the PR lands, goes red or conflicts;
-    # only FREE slots are filled in FIFO order (a reopened older PR must not cancel a running suite)
-    slots += [n for n in eligible if held.get(n, {}).get("by") == ME and n not in slots][:max(0, WIDTH - len(slots))]
+    # no pre-emption: a slot this tool granted is kept until the PR merges, closes or gets a ledger hold, even
+    # through red or a conflict (owner 2026-11-28); only FREE slots are filled in FIFO order
+    slots += [n for n in kept_slots(held, open_nums, r) if n not in slots][:max(0, WIDTH - len(slots))]
     # unblocker lane (owner 2026-11-18): a PR that fixes main itself or stops data loss takes the next
     # FREE slot ahead of FIFO and may land ahead of older slot PRs; it never pre-empts a running slot.
     # Marked with `ledger set <pr> --batch unblocker`.
@@ -1025,10 +1069,11 @@ def main():
                 sh(str(S / "ledger"), "--as", ME, "hold", f"ci-slot:{n}", "FIFO slot (pr-coordinator)", "--ttl", "6h")
                 sh("gh", "pr", "edit", str(n), "--repo", REPO, "--add-label", SLOT_LABEL)
 
+    park_phase(prs, slots, log)
     pmap0 = {p["number"]: p for p in prs}
     slot_heads = {(pr_repo(pmap0[n]), pmap0[n]["headRefName"]) for n in slots if n in pmap0}
-    sweep_runs(runs, prs, lambda p: (f"rule4: red at head ({', '.join(p['red'][:3])})" if p["red"] else
-                                     "" if p["number"] in slots else "rule2: no CI slot (FIFO)"),
+    sweep_runs(runs, prs, lambda p: ("" if p["number"] in slots else      # an admitted PR's runs are never cancelled, red or not
+                                     f"rule4: red at head ({', '.join(p['red'][:3])})" if p["red"] else "rule2: no CI slot (FIFO)"),
                slot_heads, "rule2: branch has no open PR and no CI slot", log)
 
     pmap = {p["number"]: p for p in prs}
