@@ -302,5 +302,59 @@ class StartCiIgnoresAdvisory(Base):
         self.assertEqual(self.count([{"name": "Python Suite", "status": "queued"}]), [])
 
 
+class AdmissionOrder(unittest.TestCase):
+    """Owner 2026-11-28: land all PRs in arrival order. A parked draft's red is by design, not evidence."""
+
+    class R:
+        def hgetall(self, k): return {}
+        def exists(self, k): return False
+        def hget(self, k, f): return ""
+
+    def mk(self, n, parked=False, branch="issue-x", author="mrveiss"):
+        return {"number": n, "isDraft": parked, "headRefOid": HEAD, "headRefName": branch, "mergeable": "MERGEABLE",
+                "changedFiles": 1, "awaiting": False, "isCrossRepository": False, "author": {"login": author},
+                "labels": {"nodes": [{"name": "ci-parked"}] if parked else []}}
+
+    def why(self, p, red=("python-suite",), seen=()):
+        return PC.admission_why(p, self.R(), list(red), {}, {p["number"]}, set(seen))
+
+    def test_parked_draft_with_red_is_eligible_in_arrival_order(self):
+        prs = sorted([self.mk(30), self.mk(10, parked=True), self.mk(20, parked=True)], key=PC.admission_key)
+        red = {10: ["a"], 20: ["b"], 30: []}
+        got = [p["number"] for p in prs if not self.why(p, red[p["number"]])]
+        self.assertEqual(got, [10, 20, 30])
+
+    def test_parked_draft_red_paged_at_head_still_eligible(self):
+        self.assertEqual(self.why(self.mk(10, parked=True), seen=[f"10:red:{HEAD}"]), "")
+
+    def test_parked_draft_keeps_other_exclusions(self):
+        p = self.mk(10, parked=True); p["mergeable"] = "CONFLICTING"
+        self.assertEqual(self.why(p), "conflicts with main")
+        p = self.mk(11, parked=True); p["changedFiles"] = 0
+        self.assertEqual(self.why(p), "empty diff vs main")
+
+    def test_non_parked_red_still_excluded(self):
+        self.assertEqual(self.why(self.mk(10)), "red")
+        self.assertIn("red at this head", self.why(self.mk(11), red=(), seen=[f"11:red:{HEAD}"]))
+
+    def test_plain_draft_still_excluded(self):
+        p = self.mk(10); p["isDraft"] = True
+        self.assertEqual(self.why(p), "draft")
+
+    def test_dependabot_eligible_like_any_external_pr(self):
+        p = self.mk(40, branch="dependabot/npm/x", author="dependabot[bot]")
+        self.assertTrue(PC.is_external(p))   # approval gate applies in could_land
+        self.assertEqual(self.why(p, red=()), "")
+        self.assertEqual(self.why(p), "red")
+
+    def test_release_promotion_stays_excluded(self):
+        self.assertIn("release promotion", self.why(self.mk(19456), red=()))
+
+    def test_unblocker_admitted_first_even_parked_and_red(self):
+        prs = sorted([self.mk(22176, parked=True), self.mk(22380, parked=True)], key=PC.admission_key)
+        elig = [p["number"] for p in prs if not self.why(p)]
+        self.assertEqual(PC.unblocker_first(elig, {22380}), [22380, 22176])
+
+
 if __name__ == "__main__":
     unittest.main()
