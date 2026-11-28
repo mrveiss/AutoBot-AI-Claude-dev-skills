@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """pr-coordinator [--dry] — one tick of the cross-session PR traffic light (owner rules 2026-11-18).
 
-  1 FIFO: PRs land milestone first (M1 → M2 → …, no milestone last), then submission order (createdAt). A PR that is draft, conflicting or red keeps
+  1 FIFO: PRs are admitted strictly in ARRIVAL order (ascending PR number = creation order; owner 2026-11-28), after the
+    unblocker lane (batch=unblocker) and with deps.json pins kept; the milestone no longer orders anything, it is only displayed. A PR that is draft, conflicting or red keeps
     its place but gets no CI slot; once fixed it is ahead of everything submitted after it.
+    Approval of an external PR (ledger approve; --fork-approved for forks) is recorded by an OWNER-side session after a reviewer pass; this tool's own identity never approves.
     The release promotion (#19456) is always last. External (fork) PRs are slotted like own PRs (owner 2026-11-27:
     "we are owners, we do not need approval, we do the approval"); every landing gate still applies.
   2 At most WIDTH (2) PRs hold CI. Slots are ledger holds `ci-slot:N` (other sessions' holds count).
@@ -170,6 +172,11 @@ def milestone_rank(p):
     or a non-M title -> NO_MILESTONE_RANK, so those PRs land after every numbered milestone."""
     m = MILESTONE_NUM.match((p.get("milestone") or {}).get("title") or "")
     return int(m.group(1)) if m else NO_MILESTONE_RANK
+
+
+def admission_key(p):
+    """Admission order: strictly arrival order (ascending PR number); only the explicit LAST set goes after."""
+    return (p["number"] in LAST, p["number"])
 
 
 def ms_label(p):
@@ -575,6 +582,8 @@ FINDINGS_WORKFLOW = "pr-blocking-findings.yml"
 DISPATCH_GRACE_SECS = int(os.environ.get("PR_COORDINATOR_DISPATCH_GRACE_SECS", "180"))
 DISPATCH_MAX_TRIES = int(os.environ.get("PR_COORDINATOR_DISPATCH_MAX_TRIES", "3"))
 FINDINGS_WAIT_SECS = int(os.environ.get("PR_COORDINATOR_FINDINGS_WAIT_SECS", "300"))
+LOCK_RETRIES, LOCK_RETRY_SLEEP = 10, 2                              # dispatch_cli waits ~20s for the pass lock
+SEEN_MAX_AGE_SECS = 14 * 86400
 MIRROR_PREFIX = "ci/pr-"
 RUNAWAY_THRESHOLD = int(os.environ.get("PR_COORDINATOR_RUNAWAY_THRESHOLD", "25"))   # pr-queue-gate.yml RUNAWAY_THRESHOLD
 NOT_STARTED = {"cancelled", "skipped", "startup_failure"}          # same definition as branch_sync_core.suite_already_started
@@ -611,14 +620,22 @@ def workflow_cut_over(text):
     return "workflow_dispatch" in toks and not toks & {"pull_request", "pull_request_target"}
 
 
-def cutover_done():
-    """True once main's ci.yml has no pull_request trigger (and is readable and has workflow_dispatch). Unreadable
-    means NOT cut over (fail closed: parking and the legacy path stay). Read once per process."""
+def cutover_state():
+    """Three states of main's ci.yml: True = cut over (workflow_dispatch, no pull_request), False = readable and not
+    cut over, None = UNREADABLE (a gh error or an empty body). Callers that gate a merge or a one-time action treat
+    None as "do nothing". A readable answer is read once per process; an unreadable one is retried."""
     if "v" not in _CUT:
         rc, out, _ = sh_rc("gh", "api", "-H", "Accept: application/vnd.github.raw",
                            f"repos/{REPO}/contents/.github/workflows/ci.yml?ref=main")
-        _CUT["v"] = rc == 0 and workflow_cut_over(out)
+        if rc or not (out or "").strip():
+            return None
+        _CUT["v"] = workflow_cut_over(out)
     return _CUT["v"]
+
+
+def cutover_done():
+    """True ONLY for a readable, cut-over main ci.yml. Unreadable is not "done" (fail closed)."""
+    return cutover_state() is True
 
 
 def _redis():
@@ -657,11 +674,15 @@ def dispatch_key(n, wf, sha, digest="", generation=0):
 def dispatched_runs(sha):
     """workflow_dispatch runs at this head (id, path, status, conclusion), or None when unreadable."""
     rc, out, _ = sh_rc("gh", "api", f"repos/{REPO}/actions/runs?head_sha={sha}&event=workflow_dispatch&per_page=100", "--jq",
-                       "[.workflow_runs[]|{id,path,status,conclusion,created_at}]")
+                       "[.workflow_runs[]|{id,path,status,conclusion,created_at,head_branch}]")
     try:
         return json.loads(out) if rc == 0 else None
     except ValueError:
         return None
+
+
+def _iso(ts):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
 
 
 def _runs_of(runs, wf):
@@ -670,6 +691,18 @@ def _runs_of(runs, wf):
 
 def suite_started(runs, wf):
     return any((r.get("conclusion") or "") not in NOT_STARTED for r in _runs_of(runs, wf))
+
+
+def _ent_started(ent, runs, wf):
+    """The run THIS dispatch created has started: by its recorded run_id, else (no id returned) the workflow's run at
+    this head created after the dispatch ts on the dispatched ref. Valid for every generation."""
+    mine = _runs_of(runs, wf)
+    if ent.get("run_id"):
+        cand = [r for r in mine if r.get("id") == ent["run_id"]]
+    else:
+        since, ref = _iso(ent.get("ts", 0) - 5), ent.get("ref")
+        cand = [r for r in mine if (r.get("created_at") or "") >= since and (not ref or r.get("head_branch") in (None, ref))]
+    return any((r.get("conclusion") or "") not in NOT_STARTED for r in cand)
 
 
 def _decide(n, wf, sha, digest, generation, runs, seen, now):
@@ -685,7 +718,8 @@ def _decide(n, wf, sha, digest, generation, runs, seen, now):
             seen[key] = {"ts": now, "run_id": (mine[-1] or {}).get("id"), "tries": 0}   # state lost: adopt, never double
             return "skip"
         return "go"
-    if suite_started(runs, wf) and generation == 0 or now - ent.get("ts", 0) < DISPATCH_GRACE_SECS:
+    if (suite_started(runs, wf) and generation == 0) or _ent_started(ent, runs, wf) \
+            or now - ent.get("ts", 0) < DISPATCH_GRACE_SECS:
         return "skip"
     return "go" if ent.get("tries", 1) < DISPATCH_MAX_TRIES else "page"
 
@@ -708,7 +742,7 @@ def dispatch_workflow(n, p, wf, ref, key, base, digest, seen, log, attention):
     except ValueError:
         run_id = None
     prev = seen.get(key) if isinstance(seen.get(key), dict) else {}
-    seen[key] = {"ts": int(time.time()), "run_id": run_id, "tries": prev.get("tries", 0) + 1}
+    seen[key] = {"ts": int(time.time()), "run_id": run_id, "ref": ref, "tries": prev.get("tries", 0) + 1}
     return "ok"
 
 
@@ -723,15 +757,16 @@ def _sync_head(n, p, log, attention, seen):
 
 
 def ref_dispatchable(n, p, seen):
-    """The head's own ci.yml declares workflow_dispatch (the canary before cutover). Memoised per head."""
+    """Dual mode: dispatch only when the head's own ci.yml is cut over (workflow_dispatch AND no pull_request /
+    pull_request_target), else its events would run the suite a second time. Memoised per head, with a timestamp."""
     k = f"{n}:ref-dispatchable:{p['headRefOid']}"
-    if k not in seen:
+    if not isinstance(seen.get(k), dict):
         rc, out, _ = sh_rc("gh", "api", "-H", "Accept: application/vnd.github.raw",
                            f"repos/{REPO}/contents/.github/workflows/ci.yml?ref={p['headRefOid']}")
         if rc:
             return False
-        seen[k] = int("workflow_dispatch" in _trigger_tokens(out))
-    return bool(seen[k])
+        seen[k] = {"ok": workflow_cut_over(out), "ts": int(time.time())}
+    return bool(seen[k]["ok"])
 
 
 def _page_once(n, p, kind, key, seen, attention, **extra):
@@ -748,7 +783,11 @@ def _unavailable(n, p, seen, log, attention):
     sha = p["headRefOid"]
     seen[f"{n}:dispatch-unavailable:{sha}"] = int(time.time())
     log.append(f"dispatch #{n} unavailable at {sha[:9]} (no workflow_dispatch inputs on that ref)")
-    if not cutover_done():
+    cut = cutover_state()
+    if cut is None:
+        log.append(f"dispatch #{n}: main ci.yml unreadable, doing nothing this tick")
+        return True
+    if not cut:
         return False
     if _compare_ahead(sha) > 0:
         _sync_head(n, p, log, attention, seen)
@@ -760,9 +799,12 @@ def _unavailable(n, p, seen, log, attention):
 def dispatch_ci(n, p, seen, log, attention, generation=0):
     """The single entry point. True = the dispatch path owns CI for this PR (legacy starters must stay quiet);
     False = use the legacy path (kill switch, dispatch unavailable before cutover, fork without approval before cutover)."""
-    sha, cut = p["headRefOid"], cutover_done()
+    sha, cut = p["headRefOid"], cutover_state()
     if not dispatch_enabled() or f"{n}:dispatch-unavailable:{sha}" in seen:
         return False
+    if cut is None:
+        log.append(f"dispatch #{n}: main ci.yml unreadable, doing nothing this tick")
+        return True                                   # unknown cutover: neither dispatch nor start a legacy run
     if p.get("isCrossRepository") and not cut and not fork_approved(n, sha):
         return False                                  # forks keep their approval-gated event runs until cutover
     ref = dispatch_ref(n, p, seen, log, attention)
@@ -815,8 +857,9 @@ def mirror_fork_head(n, p, seen, log, attention):
                    detail=f"fork head {sha[:9]} awaits owner approval to run with repo secrets")
         return ""
     k = f"{n}:fork-mirror:{sha}"
-    if k in seen:
-        return ref
+    if k in seen and _mirror_sha(ref) == sha:
+        return ref                                    # trust the key only while the ref still carries this sha
+    seen.pop(k, None)
     log.append(f"mirror fork head #{n} -> {ref} @ {sha[:9]}")
     if DRY:
         return ref
@@ -831,11 +874,17 @@ def mirror_fork_head(n, p, seen, log, attention):
     return ref
 
 
+def _mirror_sha(ref):
+    """Current sha of refs/heads/<ref>, "" when missing or unreadable."""
+    rc, out, _ = sh_rc("gh", "api", f"repos/{REPO}/git/ref/heads/{ref}", "--jq", ".object.sha")
+    return out.strip() if rc == 0 else ""
+
+
 def mirror_keep_heads(prs, slots):
     return {(REPO, f"{MIRROR_PREFIX}{p['number']}") for p in prs if p["number"] in slots and p.get("isCrossRepository")}
 
 
-def mirror_cleanup(prs, slots, log):
+def mirror_cleanup(prs, slots, log, seen=None):
     """Delete ci/pr-<n> mirrors whose PR is gone, holds no slot, or whose head moved (they are refs we created)."""
     want = {f"{MIRROR_PREFIX}{p['number']}": p["headRefOid"] for p in prs if p["number"] in slots and p.get("isCrossRepository")}
     out = sh("gh", "api", f"repos/{REPO}/git/matching-refs/heads/{MIRROR_PREFIX}", "--jq", '.[]|"\\(.ref) \\(.object.sha)"')
@@ -846,6 +895,22 @@ def mirror_cleanup(prs, slots, log):
             log.append(f"delete mirror {short}")
             if not DRY:
                 sh("gh", "api", "-X", "DELETE", f"repos/{REPO}/git/refs/heads/{short}")
+            if seen is not None:
+                for k in [k for k in seen if k.startswith(f"{short.removeprefix(MIRROR_PREFIX)}:fork-mirror:")]:
+                    del seen[k]
+
+
+def prune_seen(seen, now=None):
+    """Drop notified.json keys older than 14 days: dispatch records, ref-dispatchable memos and per-day keys."""
+    cut = int(now or time.time()) - SEEN_MAX_AGE_SECS
+    for k, v in list(seen.items()):
+        if ":dispatch:" in k or ":ref-dispatchable:" in k:
+            ts = v.get("ts") if isinstance(v, dict) else None
+            if not isinstance(ts, (int, float)) or ts < cut:
+                del seen[k]
+        elif re.match(r"^queue-runaway:\d{4}-\d{2}-\d{2}$", k):
+            if not isinstance(v, (int, float)) or v < cut:
+                del seen[k]
 
 
 def runaway_page(prs, seen, attention):
@@ -880,9 +945,13 @@ def dispatch_cli(n):
     """`--dispatch PR`: one-PR dispatch pass under the pass lock (push-and-park calls it right after a push).
     0 = done / nothing to do, 3 = refused (no slot), 1 = error."""
     lock = take_pass_lock()
+    for _ in range(LOCK_RETRIES if lock is None else 0):
+        time.sleep(LOCK_RETRY_SLEEP)
+        if (lock := take_pass_lock()) is not None:
+            break
     if lock is None:
-        print("another coordinator pass is running; its tick will dispatch")
-        return 0
+        print(f"#{n}: coordinator pass lock still held after {LOCK_RETRIES * LOCK_RETRY_SLEEP}s; nothing dispatched, retry")
+        return 1
     try:
         r = _redis()
         if not r.exists(f"lg:hold:ci-slot:{n}"):
@@ -904,6 +973,7 @@ def dispatch_cli(n):
         owned = dispatch_ci(n, p, seen, log, attention)
         print("\n".join(f"ACTION {l}" for l in log) or f"#{n}: nothing to dispatch")
         print("dispatch path" if owned else "legacy path (dispatch unavailable)")
+        prune_seen(seen)
         write_atomic(seen_path, json.dumps(seen))
         if attention:
             with open(STATE / "attention.jsonl", "a", encoding="utf-8") as fh:
@@ -917,8 +987,15 @@ def findings_gate_cli(n):
     """`--findings-gate PR` (safe-merge, immediately before the merge): dispatch pr-blocking-findings.yml for the head
     and wait for its conclusion (bounded). 0 = success, 1 = failed / timed out / cannot run, 3 = not applicable
     (dual mode before cutover, or the kill switch): the caller keeps today's behaviour."""
-    if not dispatch_enabled() or not cutover_done():
-        print("findings gate not applicable (dual mode before cutover or dispatch disabled)")
+    if not dispatch_enabled():
+        print("findings gate not applicable (dispatch disabled)")
+        return 3
+    cut = cutover_state()
+    if cut is None:
+        print(f"#{n} findings gate cannot run: main ci.yml unreadable (no merge)")
+        return 1
+    if not cut:
+        print("findings gate not applicable (dual mode before cutover)")
         return 3
     p = fetch_pr_rest(n)
     if not p:
@@ -935,17 +1012,20 @@ def findings_gate_cli(n):
     if res != "ok":
         print(f"#{n} findings dispatch {res}")
         return 1
-    return _wait_findings(n, p["headRefOid"], t0)
+    return _wait_findings(n, p["headRefOid"], t0, (seen.get("k") or {}).get("run_id"))
 
 
-def _wait_findings(n, sha, t0):
+def _wait_findings(n, sha, t0, run_id=None):
+    """Wait for THE run this gate dispatched (by id), else the newest findings run at this head created after t0."""
     deadline = time.time() + FINDINGS_WAIT_SECS
     while time.time() < deadline:
         runs = [r for r in (dispatched_runs(sha) or []) if (r.get("path") or "").endswith("/" + FINDINGS_WORKFLOW)
-                and r.get("created_at", "9") >= time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t0 - 5))]
-        done = [r for r in runs if r.get("status") == "completed"]
-        if done:
-            concl = done[-1].get("conclusion")
+                and r.get("created_at", "9") >= _iso(t0 - 5)]
+        if run_id:
+            runs = [r for r in runs if r.get("id") == run_id] or runs
+        newest = max(runs, key=lambda r: r.get("created_at", ""), default=None)
+        if newest and newest.get("status") == "completed":
+            concl = newest.get("conclusion")
             print(f"#{n} findings gate: {concl}")
             return 0 if concl == "success" else 1
         time.sleep(10)
@@ -1595,7 +1675,7 @@ def unpark_phase(prs, slots, log, seen=None, attention=None):
     event WOULD start its suite. A draft without the label is the author's own and is never touched. Returns the
     admitted PRs whose unpark failed."""
     attention = [] if attention is None else attention
-    failed, cut = set(), cutover_done()
+    failed, cut = set(), cutover_done()          # unreadable == not cut over: only admitted slot PRs are touched
     for p in prs:
         n = p["number"]
         if not is_parked(p) or not (n in slots or cut):
@@ -1621,7 +1701,7 @@ def main():
         print("trainmaster active — train rules apply; pr-coordinator reports only")
         globals()["DRY"] = True
 
-    prs = sorted(fetch_prs(), key=lambda p: (p["number"] in LAST, milestone_rank(p), p["createdAt"], p["number"]))
+    prs = sorted(fetch_prs(), key=admission_key)
     runs = actions_runs()
     held = {int(k.rsplit(":", 1)[1]): r.hgetall(k) for k in r.scan_iter("lg:hold:ci-slot:*")}
     open_nums = {p["number"] for p in prs}
@@ -1734,7 +1814,7 @@ def main():
     pmap0 = {p["number"]: p for p in prs}
     slot_heads = {(pr_repo(pmap0[n]), pmap0[n]["headRefName"]) for n in slots if n in pmap0} | mirror_keep_heads(prs, slots)
     if not DRY:
-        mirror_cleanup(prs, slots, log)
+        mirror_cleanup(prs, slots, log, seen)
     sweep_runs(runs, prs, lambda p: ("" if p["number"] in slots else      # an admitted PR's runs are never cancelled, red or not
                                      f"rule4: red at head ({', '.join(p['red'][:3])})" if p["red"] else "rule2: no CI slot (FIFO)"),
                slot_heads, "rule2: branch has no open PR and no CI slot", log)
@@ -1756,7 +1836,7 @@ def main():
         p = pmap[n]
         if n in held and held[n].get("by") != ME:
             continue                              # another session drives its own slot
-        if p["awaiting"] and not (dispatch_enabled() and cutover_done()):
+        if p["awaiting"] and (not dispatch_enabled() or cutover_state() is False):
             approve_fork_runs(n, p, seen, log, attention)   # legacy, secretless event runs (dropped in PR-B)
         blocked = proof_blocked(p, seen, log, attention)   # gates ONLY the CI starters; every other page still runs
         if not blocked:
@@ -1767,6 +1847,7 @@ def main():
         slot_land_phase(n, p, landing_head, r, seen, log, attention)
 
     if not DRY:
+        prune_seen(seen)
         write_atomic(seen_path, json.dumps(seen))
         write_atomic(recent_path, json.dumps(RECENT))
         sh("redis-cli", "--no-auth-warning", "-n", "15", "DEL", "claude:landing-order")

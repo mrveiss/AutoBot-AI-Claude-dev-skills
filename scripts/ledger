@@ -9,6 +9,7 @@ Usage:  ledger iam <name> [--takeover OLD]              register this session's 
         ledger heartbeat <kind> <id> | ledger orphan <kind> <id> --snapshot DIR [--owner N]   reaper liveness + orphan event (#19452)
         ledger review <pr> <sha> approve|blocked [--note T]  a verdict for THAT head; a head move makes it stale
         ledger set <pr> [--batch B] [--merger NAME] [--owner NAME] [--fork-approved SHA]
+        (--fork-approved is a HUMAN action: it records the caller as fork_approved_by and is refused for pr-coordinator)
         ledger pr <n> | ledger prs [--batch B] [--owner NAME] [--all] | ledger ready
         ledger hold <scope> <reason> [--ttl 2h] | ledger unhold <scope> | ledger holds
         ledger events [-n 20] [--for NAME] | ledger watch [--for NAME]   (watch blocks: run it under a Monitor)
@@ -257,6 +258,8 @@ def cmd_review(r, a):
     if not SHA.match(a.sha):
         sys.exit("ledger review: sha must be 7-40 hex chars from the PR's head")
     key = f"lg:pr:{a.pr}"
+    if a.verdict == "approve" and me(r) == "pr-coordinator":
+        sys.exit("ledger review: the coordinator identity never approves; approval is recorded by an owner-side session after a reviewer pass")
     r.hset(key, mapping={"review_sha": a.sha, "review_verdict": a.verdict, "reviewer": me(r), "review_note": a.note or "", "review_ts": now()})
     ev(r, "review", pr=a.pr, sha=a.sha[:9], verdict=a.verdict, owner=pr_owner(r, a.pr), merger=r.hget(key, "merger"))
     # Compare against the live head: the poller's copy can lag a fresh push by one cycle. Read-only on
@@ -272,7 +275,10 @@ def cmd_set(r, a):
     if a.fork_approved is not None:
         if not re.match(r"^[0-9a-f]{40}$", a.fork_approved):
             sys.exit("ledger set --fork-approved: the FULL 40-hex head sha of the fork PR (a human approval of that exact head)")
-        fields.update(fork_approved=a.fork_approved, fork_approved_by=me(r), fork_approved_ts=now())
+        who = me(r)
+        if who == "pr-coordinator":
+            sys.exit("ledger set --fork-approved: refused for the coordinator identity. Approving a fork head to run with repo secrets is a human action; the coordinator never self-approves")
+        fields.update(fork_approved=a.fork_approved, fork_approved_by=who, fork_approved_ts=now())
     if not fields:
         sys.exit("ledger set: give --batch, --merger, --owner or --fork-approved")
     r.hset(f"lg:pr:{a.pr}", mapping=fields)

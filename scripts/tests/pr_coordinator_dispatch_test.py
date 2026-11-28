@@ -22,9 +22,10 @@ class Base(unittest.TestCase):
         self.posts, self.calls, self.runs, self.ahead, self.live, self.base = [], [], [], 0, None, BASE
         self.post_result = (0, "", "")          # or a dict wf -> (rc, out, err)
         self.cut, self.approved, self.dispatchable = False, set(), True
-        saved = {k: getattr(PC, k) for k in ("sh", "sh_rc", "DRY", "cutover_done", "fork_approved")}
+        saved = {k: getattr(PC, k) for k in ("sh", "sh_rc", "DRY", "cutover_done", "cutover_state", "fork_approved")}
         PC.sh, PC.sh_rc, PC.DRY = self.sh, self.sh_rc, False
-        PC.cutover_done = lambda: self.cut
+        PC.cutover_done = lambda: self.cut is True
+        PC.cutover_state = lambda: self.cut
         PC.fork_approved = lambda n, sha: (n, sha) in self.approved
         os.environ.pop("PR_COORDINATOR_DISPATCH", None)
         self.addCleanup(lambda: [setattr(PC, k, v) for k, v in saved.items()])
@@ -239,6 +240,102 @@ class Cutover(unittest.TestCase):
         self.assertFalse(PC.cutover_done())
 
 
+class Round2(Base):
+    """PR #78 review round."""
+    def started_run(self, wf="ci.yml", created=None, **kw):
+        return {"id": 5, "path": f".github/workflows/{wf}", "status": "in_progress", "conclusion": None,
+                "created_at": created or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 5)), **kw}
+
+    def test_recheck_generation_with_started_dispatched_run_never_redispatches(self):
+        seen = {}
+        self.tick(mkpr(), seen, 1)
+        self.posts.clear()
+        self.runs = [self.started_run(w) for w in SIX]
+        for v in seen.values():
+            if isinstance(v, dict):
+                v["ts"] -= PC.DISPATCH_GRACE_SECS * 5
+        for _ in range(3):
+            _, _, att = self.tick(mkpr(), seen, 1)
+            self.assertEqual(att, [])
+        self.assertEqual(self.posts, [])
+
+    def test_recheck_generation_run_id_match(self):
+        key = PC.dispatch_key(7, "ci.yml", HEAD, "", 1)
+        seen = {key: {"ts": 1, "run_id": 5, "tries": 1}}
+        self.assertEqual(PC._decide(7, "ci.yml", HEAD, "", 1, [self.started_run()], seen, 10 ** 9), "skip")
+        self.assertEqual(PC._decide(7, "ci.yml", HEAD, "", 1, [], seen, 10 ** 9), "go")
+
+    def test_mirror_key_with_deleted_ref_recreates(self):
+        self.cut, self.approved = True, {(7, HEAD)}
+        fork, seen = mkpr(isCrossRepository=True), {f"7:fork-mirror:{HEAD}": 1}
+        real = self.sh_rc
+        PC.sh_rc = lambda *a: (1, "", "Not Found") if "git/ref/heads" in " ".join(a) else real(*a)
+        self.assertEqual(PC.mirror_fork_head(7, fork, seen, [], []), "ci/pr-7")
+        self.assertTrue(any("ref=refs/heads/ci/pr-7" in c for c in self.calls))
+
+    def test_mirror_key_with_live_ref_is_trusted(self):
+        self.cut, self.approved = True, {(7, HEAD)}
+        real = self.sh_rc
+        PC.sh_rc = lambda *a: (0, HEAD, "") if "git/ref/heads" in " ".join(a) else real(*a)
+        PC.mirror_fork_head(7, mkpr(isCrossRepository=True), {f"7:fork-mirror:{HEAD}": 1}, [], [])
+        self.assertFalse([c for c in self.calls if "git/refs" in " ".join(c)])
+
+    def test_mirror_cleanup_drops_the_key(self):
+        seen = {f"7:fork-mirror:{HEAD}": 1, f"8:fork-mirror:{HEAD}": 1}
+        PC.sh = lambda *a, **k: f"refs/heads/ci/pr-7 {HEAD}" if "matching-refs" in " ".join(a) else ""
+        PC.mirror_cleanup([], [], [], seen)
+        self.assertEqual(list(seen), [f"8:fork-mirror:{HEAD}"])
+
+    def test_unreadable_cutover_is_none_and_do_nothing(self):
+        self.cut = None
+        owned, log, _ = self.tick(mkpr(), {})
+        self.assertTrue(owned)
+        self.assertEqual(self.posts, [])
+        self.assertTrue(any("unreadable" in l for l in log))
+        PC.unpark_phase([{"number": 2, "isDraft": True, "headRefOid": HEAD, "labels": {"nodes": [{"name": "ci-parked"}]}}], [], [])
+        self.assertEqual(self.calls, [])
+
+    def test_dual_mode_dispatches_only_a_cut_over_head(self):
+        self.cut = False
+        self.dispatchable = False                      # head ci.yml still has pull_request
+        self.assertFalse(self.tick(mkpr(), {})[0])
+        self.assertEqual(self.posts, [])
+        orig = self.sh_rc
+        PC.sh_rc = lambda *a: (0, "on:\n  pull_request:\n  workflow_dispatch:\n", "") if "contents/.github" in " ".join(a) else orig(*a)
+        self.assertFalse(self.tick(mkpr(n=9, head="9" * 40), {})[0])
+        self.assertEqual(self.posts, [])
+        PC.sh_rc = lambda *a: (0, "on:\n  workflow_dispatch:\n", "") if "contents/.github" in " ".join(a) else orig(*a)
+        self.live = "8" * 40
+        self.assertTrue(self.tick(mkpr(n=10, head="8" * 40), {})[0])
+        self.assertEqual(self.dispatched(), SIX)
+
+    def test_prune_seen_old_keys(self):
+        now, old = int(time.time()), int(time.time()) - 15 * 86400
+        seen = {"7:dispatch:ci.yml:x::0": {"ts": old}, "8:dispatch:ci.yml:x::0": {"ts": now},
+                "7:ref-dispatchable:x": {"ok": True, "ts": old}, "8:ref-dispatchable:x": {"ok": True, "ts": now},
+                "queue-runaway:2020-01-01": old, "queue-runaway:2026-11-28": now, "7:other": old}
+        PC.prune_seen(seen, now)
+        self.assertEqual(sorted(seen), ["7:other", "8:dispatch:ci.yml:x::0", "8:ref-dispatchable:x", "queue-runaway:2026-11-28"])
+
+    def test_dispatch_cli_lock_held_retries_then_exits_nonzero(self):
+        saved = {k: getattr(PC, k) for k in ("take_pass_lock", "LOCK_RETRIES")}
+        PC.take_pass_lock, PC.LOCK_RETRIES = lambda: None, 3
+        self.addCleanup(lambda: [setattr(PC, k, v) for k, v in saved.items()])
+        t = PC.time.sleep
+        sleeps = []
+        PC.time.sleep = sleeps.append
+        self.addCleanup(lambda: setattr(PC.time, "sleep", t))
+        self.assertEqual(PC.dispatch_cli(7), 1)
+        self.assertEqual(len(sleeps), 3)
+
+
+class AdmissionOrder(unittest.TestCase):
+    def test_arrival_order_ignores_milestone_and_created_at(self):
+        mk = lambda n, ms, c: {"number": n, "milestone": {"title": ms}, "createdAt": c}
+        prs = [mk(30, "M1", "2026-01-01"), mk(10, "M8", "2026-12-01"), mk(20, "", "2026-06-01")]
+        self.assertEqual([p["number"] for p in sorted(prs, key=PC.admission_key)], [10, 20, 30])
+
+
 class StopParking(Base):
     def parked(self, n, draft=True):
         return {"number": n, "isDraft": draft, "headRefOid": HEAD, "labels": {"nodes": [{"name": "ci-parked"}]}}
@@ -291,6 +388,23 @@ class FindingsGate(Base):
         PC.FINDINGS_WAIT_SECS = 0
         self.addCleanup(setattr, PC, "FINDINGS_WAIT_SECS", 300)
         self.assertEqual(self.run_gate(None, "in_progress"), 1)
+
+    def test_three_cutover_states(self):
+        self.cut = None
+        self.assertEqual(self.run_gate("success"), 1)          # unreadable: no merge
+        self.assertEqual(self.posts, [])
+        self.cut = False
+        self.assertEqual(self.run_gate("success"), 3)          # readable, not cut over
+        self.cut = True
+        self.assertEqual(self.run_gate("success"), 0)          # cut over
+
+    def test_newer_failure_is_not_masked_by_an_older_success(self):
+        mk = lambda i, c, dt: {"id": i, "path": ".github/workflows/pr-blocking-findings.yml", "status": "completed",
+                               "conclusion": c, "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + dt))}
+        self.runs = [mk(2, "failure", 20), mk(1, "success", 5)]     # API order: newest first
+        self.assertEqual(PC.findings_gate_cli(7), 1)
+        self.runs = [mk(2, "failure", 20), mk(1, "success", 5)]
+        self.assertEqual(PC._wait_findings(7, HEAD, time.time(), 1), 0)   # a known run id wins
 
     def test_before_cutover_and_kill_switch_are_not_applicable(self):
         self.cut = False
