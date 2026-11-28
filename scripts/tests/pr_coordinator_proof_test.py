@@ -351,6 +351,29 @@ class PatchIdCarry(unittest.TestCase):
         a, b = self._shift_pair(lambda ls: ["new top\n", "new top2\n"] + ls)
         self.assertTrue(self.mod.review_carries(a, b))
 
+    def test_identical_hunk_at_other_position_carries_by_design(self):
+        """Accepted limit: the same +/- lines with identical context at a DIFFERENT position in the same
+        pre-existing file hash equal, so the approval carries. Accepted because every changed line is still
+        hashed (nothing new can ride along) and CI on the new head is the check."""
+        block = [f"blk{i}\n" for i in range(1, 8)]
+        lines = [f"line{i}\n" for i in range(1, 11)] + block + [f"tail{i}\n" for i in range(1, 11)] + block
+        self.git("checkout", "-q", "main")
+        c1 = self.commit("f.txt", "".join(lines))
+        first, second = lines.index(block[3]), len(lines) - len(block) + 3
+        self.git("checkout", "-q", "-b", "sa", c1)
+        a_lines = list(lines)
+        a_lines[first] = "PR CHANGE\n"
+        a = self.commit("f.txt", "".join(a_lines))
+        self.git("checkout", "-q", "-b", "sb", c1)
+        b_lines = list(lines)
+        b_lines[second] = "PR CHANGE\n"
+        b = self.commit("f.txt", "".join(b_lines))
+        self.git("update-ref", "refs/remotes/origin/main", c1)
+        self.git("push", "-q", "-f", str(self.mod.PATCH_GIT), "refs/remotes/origin/main:refs/remotes/origin/main",
+                 "sa:refs/heads/sa", "sb:refs/heads/sb")
+        self.api = {a: a}
+        self.assertTrue(self.mod.review_carries(a, b))
+
     def test_changed_context_line_in_hunk_does_not_carry(self):
         def edit(ls):
             out = list(ls)
