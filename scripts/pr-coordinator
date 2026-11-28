@@ -1708,6 +1708,9 @@ def unblocker_first(eligible, unblock):
     return [n for n in eligible if n in unblock] + [n for n in eligible if n not in unblock]
 
 
+PROOF_WHY = "proof table missing/invalid: no slot until fixed"
+
+
 def admission_why(p, r, red, deps, open_now, seen):
     """Why PR p gets no slot ("" = eligible). Arrival order is the owner goal (2026-11-28: land all PRs in order), so
     dependabot PRs are eligible like any external PR (ledger approve applies). A PARKED draft's red is not evidence:
@@ -1721,7 +1724,7 @@ def admission_why(p, r, red, deps, open_now, seen):
         p["why"] = "review BLOCKED at this head: changes requested, so no slot until a new head"
     elif r.exists(f"lg:hold:pr:{n}"):       # a session's `ledger hold pr:<n>` parks it: no slot, no merge
         p["why"] = "held: " + (r.hget(f"lg:hold:pr:{n}", "reason") or "")[:60]
-    elif p["isDraft"] and not is_parked(p):   # a parked draft is ours: it can still be admitted
+    elif p["isDraft"] and not parked:         # a parked draft is ours: it can still be admitted
         p["why"] = "draft"
     elif n in LAST:                           # release promotion: promoted by hand
         p["why"] = "parked by owner (release promotion): report only, no slot"
@@ -1741,6 +1744,8 @@ def admission_why(p, r, red, deps, open_now, seen):
         p["why"] = "red"
     elif not parked and f"{n}:red:{p['headRefOid']}" in seen:   # paged red at THIS head; a later cancel must not hide it
         p["why"] = "red at this head (owner paged); waits for a new head"
+    elif proof_status(p, seen):   # a kept slot is held until merge, so a PR that can never start CI must not take one
+        p["why"] = PROOF_WHY
     else:
         p["why"] = ""
     return p["why"]
@@ -1785,6 +1790,8 @@ def main():
             p["red"] = red = []                   # not a failure: the fork's runs wait for a maintainer to approve them
         p["owner"], p["alive"] = owner_of(r, lg, p)
         p["why"] = admission_why(p, r, red, deps, open_now, seen)
+        if p["why"] == PROOF_WHY:                 # once per head: the owner session or coordinator fixes the body
+            proof_blocked(p, seen, log, attention)
         if not p["why"]:
             eligible.append(n)
         def page(kind, key, **extra):

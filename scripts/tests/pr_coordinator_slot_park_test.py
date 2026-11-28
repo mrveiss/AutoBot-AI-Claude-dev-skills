@@ -16,7 +16,7 @@ class FakeR:
 
 
 def pr(n, draft=False, parked=False):
-    return {"number": n, "isDraft": draft, "headRefOid": HEAD, "labels": {"nodes": [{"name": "ci-parked"}] if parked else []}}
+    return {"number": n, "isDraft": draft, "headRefOid": HEAD, "labels": {"nodes": [{"name": "ci-parked"}] if parked else []}, "body": PROOF_BODY, "createdAt": "2026-11-28T00:00:00Z"}
 
 
 class Base(unittest.TestCase):
@@ -301,6 +301,9 @@ class StartCiIgnoresAdvisory(Base):
     def test_live_suite_run_still_blocks_start(self):
         self.assertEqual(self.count([{"name": "Python Suite", "status": "queued"}]), [])
 
+PROOF_BODY = ("## Requirement proofs\n\n| AC | Precondition | Postcondition | Establishing lines | Argument | Reviewer |\n"
+              "|---|---|---|---|---|---|\n| AC1 | x | y | a.py:1 | z | reviewer: holds |\n")
+
 
 class AdmissionOrder(unittest.TestCase):
     """Owner 2026-11-28: land all PRs in arrival order. A parked draft's red is by design, not evidence."""
@@ -313,10 +316,10 @@ class AdmissionOrder(unittest.TestCase):
     def mk(self, n, parked=False, branch="issue-x", author="mrveiss"):
         return {"number": n, "isDraft": parked, "headRefOid": HEAD, "headRefName": branch, "mergeable": "MERGEABLE",
                 "changedFiles": 1, "awaiting": False, "isCrossRepository": False, "author": {"login": author},
-                "labels": {"nodes": [{"name": "ci-parked"}] if parked else []}}
+                "labels": {"nodes": [{"name": "ci-parked"}] if parked else []}, "body": PROOF_BODY, "createdAt": "2026-11-28T00:00:00Z"}
 
     def why(self, p, red=("python-suite",), seen=()):
-        return PC.admission_why(p, self.R(), list(red), {}, {p["number"]}, set(seen))
+        return PC.admission_why(p, self.R(), list(red), {}, {p["number"]}, dict.fromkeys(seen, 1))
 
     def test_parked_draft_with_red_is_eligible_in_arrival_order(self):
         prs = sorted([self.mk(30), self.mk(10, parked=True), self.mk(20, parked=True)], key=PC.admission_key)
@@ -346,6 +349,19 @@ class AdmissionOrder(unittest.TestCase):
         self.assertTrue(PC.is_external(p))   # approval gate applies in could_land
         self.assertEqual(self.why(p, red=()), "")
         self.assertEqual(self.why(p), "red")
+
+    def test_proofless_pr_not_admitted_attention_once_per_head(self):
+        PC.head_is_exempt = lambda p: False
+        for author, branch in (("mrveiss", "issue-x"), ("dependabot[bot]", "dependabot/npm/x")):
+            p = self.mk(50, branch=branch, author=author); p["body"] = "no table"
+            seen, log, att = {}, [], []
+            self.assertEqual(PC.admission_why(p, self.R(), [], {}, {50}, seen), PC.PROOF_WHY)
+            for _ in range(2):
+                PC.proof_blocked(p, seen, log, att)
+            self.assertEqual([a["kind"] for a in att], ["proof-missing"])
+
+    def test_valid_proof_pr_admitted(self):
+        self.assertEqual(self.why(self.mk(51), red=()), "")
 
     def test_release_promotion_stays_excluded(self):
         self.assertIn("release promotion", self.why(self.mk(19456), red=()))
