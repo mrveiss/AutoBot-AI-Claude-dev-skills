@@ -1551,7 +1551,7 @@ def slot_ci_phase(n, p, blocked, seen, log, attention, skip_dispatch=False):
 
 
 def slot_land_phase(n, p, r, seen, log, attention):
-    """Review, threads, migration-gate, FIFO and merge for a green slot PR. Never gated by the proof gate."""
+    """Review, threads, migration-gate and merge for a green slot PR (merged at once; slots land in arrival order via land_order). Never gated by the proof gate."""
     rv = r.hgetall(f"lg:pr:{n}")
     unresolved = sum(1 for t in p["reviewThreads"]["nodes"] if not t["isResolved"])
     if is_external(p) and (rv.get("review_verdict") != "approve" or not review_carries(rv.get("review_sha", ""), p["headRefOid"], n)):

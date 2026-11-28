@@ -346,7 +346,7 @@ class AdmissionOrder(unittest.TestCase):
 
     def test_dependabot_eligible_like_any_external_pr(self):
         p = self.mk(40, branch="dependabot/npm/x", author="dependabot[bot]")
-        self.assertTrue(PC.is_external(p))   # approval gate applies in could_land
+        self.assertTrue(PC.is_external(p))   # approval gate applies in slot_land_phase
         self.assertEqual(self.why(p, red=()), "")
         self.assertEqual(self.why(p), "red")
 
