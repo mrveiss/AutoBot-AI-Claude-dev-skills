@@ -1,5 +1,5 @@
 """Requirement-proof gate of scripts/pr-coordinator (#37): table validation, cutoff exemption, main-merge syncs."""
-import importlib.machinery, importlib.util, os, subprocess, tempfile, unittest
+import importlib.machinery, importlib.util, json, os, subprocess, tempfile, time, unittest
 from pathlib import Path
 
 PATH = str(Path(__file__).resolve().parents[1] / "pr-coordinator")
@@ -268,7 +268,7 @@ class PatchIdCarry(unittest.TestCase):
     def test_identical_patch_through_human_main_merge_carries(self):
         self.api = {self.approved: self.approved}
         self.assertTrue(self.mod.review_carries(self.approved, self.merged))
-        self.assertTrue(self.mod.PATCH_CACHE.exists())   # patch-ids are cached per sha
+        self.assertTrue(self.mod.PATCH_CACHE.exists())   # diff ids are cached
 
     def test_changed_content_does_not_carry(self):
         self.git("checkout", "-q", "-b", "pr2", self.approved)
@@ -276,6 +276,67 @@ class PatchIdCarry(unittest.TestCase):
         self.git("push", "-q", str(self.mod.PATCH_GIT), "pr2:refs/heads/pr2")
         self.api = {self.approved: self.approved}
         self.assertFalse(self.mod.review_carries(self.approved, changed))
+
+    def _variant(self, branch, name, data):
+        """A sibling of the approved head, from the same base, writing `data` (bytes) to `name`."""
+        self.git("checkout", "-q", "-b", branch, self.base)
+        Path(self.work, name).write_bytes(data)
+        self.git("add", name)
+        self.git("commit", "-q", "-m", branch)
+        sha = self.git("rev-parse", "HEAD")
+        self.git("push", "-q", str(self.mod.PATCH_GIT), f"{branch}:refs/heads/{branch}")
+        return sha
+
+    def test_indentation_only_change_does_not_carry(self):
+        a = self._variant("ws1", "m.py", b"def f():\n    return 1\n")
+        b = self._variant("ws2", "m.py", b"def f():\n  return 1\n")
+        c = self._variant("ws3", "m.py", b"def f():\n\treturn 1\n")
+        self.api = {a: a}
+        self.assertFalse(self.mod.review_carries(a, b))
+        self.assertFalse(self.mod.review_carries(a, c))
+
+    def test_different_binary_content_does_not_carry(self):
+        a = self._variant("bin1", "x.bin", b"\x00\x01\x02\xff")
+        b = self._variant("bin2", "x.bin", b"\x00\x01\x03\xff")
+        self.api = {a: a}
+        self.assertFalse(self.mod.review_carries(a, b))
+
+    def test_same_diff_different_commit_carries(self):
+        a = self._variant("same1", "x.bin", b"\x00\x01\x02")
+        self.git("commit", "-q", "--amend", "-m", "reworded", "--allow-empty")
+        b = self.git("rev-parse", "HEAD")
+        self.git("push", "-q", "-f", str(self.mod.PATCH_GIT), "same1:refs/heads/same2")
+        self.api = {a: a}
+        self.assertNotEqual(a, b)
+        self.assertTrue(self.mod.review_carries(a, b))
+
+    def test_cache_key_has_merge_base_and_corrupt_cache_is_empty(self):
+        self.mod.PATCH_CACHE.write_text("{not json", encoding="utf-8")
+        self.api = {self.approved: self.approved}
+        self.assertTrue(self.mod.review_carries(self.approved, self.merged))
+        keys = list(json.loads(self.mod.PATCH_CACHE.read_text(encoding="utf-8")))
+        self.assertTrue(all(":" in k and len(k.split(":")) == 2 for k in keys), keys)
+        self.assertFalse(list(self.mod.PATCH_CACHE.parent.glob("*.tmp")))
+
+    def test_cache_prunes_old_and_excess_entries(self):
+        old = {f"k{i}": {"id": "x", "t": time.time() - 15 * 86400} for i in range(3)}
+        new = {f"n{i}": {"id": "x", "t": time.time() - i} for i in range(self.mod.PATCH_CACHE_MAX_ENTRIES + 5)}
+        self.mod._cache_store({**old, **new})
+        kept = json.loads(self.mod.PATCH_CACHE.read_text(encoding="utf-8"))
+        self.assertEqual(len(kept), self.mod.PATCH_CACHE_MAX_ENTRIES)
+        self.assertFalse(any(k.startswith("k") for k in kept))
+
+    def test_exception_in_carry_path_fails_closed(self):
+        def boom(*a, **k):
+            raise RuntimeError("boom")
+        self.mod._diff_id = boom
+        self.api = {self.approved: self.approved}
+        self.assertFalse(self.mod.review_carries(self.approved, self.merged))
+
+    def test_failed_main_fetch_fails_closed(self):
+        self.mod._MAIN_FETCHED.clear()          # origin is not configured on the cache clone: the fetch fails
+        self.api = {self.approved: self.approved}
+        self.assertFalse(self.mod.review_carries(self.approved, self.merged))
 
     def test_missing_sha_does_not_carry(self):
         gone = "f" * 40

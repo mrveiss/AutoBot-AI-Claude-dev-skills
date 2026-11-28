@@ -21,7 +21,7 @@ No active trainmaster is assumed; when one is active (ledger hold `trainmaster`)
 Prints the queue + an ATTENTION block (JSON lines) the coordinator session relays to owners.
 State: ~/.claude/state/pr-coordinator/ (notified keys, queue.md).
 """
-import datetime, fcntl, importlib.machinery, importlib.util, json, os, re, subprocess, sys, tempfile, time
+import datetime, fcntl, hashlib, importlib.machinery, importlib.util, json, os, re, subprocess, sys, tempfile, time
 from pathlib import Path
 
 REPO, WIDTH, LAST = "mrveiss/AutoBot-AI", 2, {19456}
@@ -755,15 +755,15 @@ def proof_check_cli(n):
     return 1 if reason else 0
 
 
-def review_carries(review_sha, head):
+def review_carries(review_sha, head, pr=None):
     """Owner 2026-11-18: an approval carries across auto-sync merges of main and empty start-CI commits (first-parent
     walk, the fast path). Owner 2026-11-28 ("quality only"): it also carries when the PR's own diff is unchanged
-    (same stable patch-id against each head's own merge-base with main), whatever merges moved the head."""
+    (same sha256 over the raw `git diff --binary` against each head's own merge-base with main), whatever merges moved the head."""
     if not review_sha:
         return False
     if head.startswith(review_sha) or _walk_carries(review_sha, head):
         return True
-    return _same_patch(review_sha, head)
+    return _same_patch(review_sha, head, pr)
 
 
 def _walk_carries(review_sha, head):
@@ -784,63 +784,121 @@ def _walk_carries(review_sha, head):
     return False
 
 
-PATCH_GIT = STATE / "patchid.git"           # bare cache clone: holds the commits whose patch-ids we compare
-PATCH_CACHE = STATE / "patchid-cache.json"  # sha -> stable patch-id; a sha's diff against its merge-base never changes
+PATCH_GIT = STATE / "patchid.git"           # bare cache clone: holds the commits whose diffs we compare
+PATCH_CACHE = STATE / "patchid-cache.json"  # "sha:merge_base" -> sha256 of the raw diff; both ends are immutable
+PATCH_LOCK = STATE / "patchid.lock"         # flock: serialises the clone fetch and the cache read-modify-write
+PATCH_TIMEOUT = int(os.environ.get("PR_COORDINATOR_PATCH_TIMEOUT", "120"))
+PATCH_CACHE_MAX_AGE = 14 * 86400
+PATCH_CACHE_MAX_ENTRIES = 2000
+PATCH_GC_EVERY = 50                         # `git gc --auto` once per this many cache writes
 _MAIN_FETCHED = []
 
 
+def _plog(msg):
+    print(f"review_carries: {msg}", file=sys.stderr)
+
+
 def _pgit(*args, stdin=None):
-    p = subprocess.run(["git", "--git-dir", str(PATCH_GIT), *args], input=stdin, capture_output=True, text=True,
-                       encoding="utf-8")
-    return p.returncode, p.stdout.strip()
+    """Bytes in, bytes out; a hang or a missing git is an rc!=0 result, never an exception."""
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    try:
+        p = subprocess.run(["git", "--git-dir", str(PATCH_GIT), *args], input=stdin, capture_output=True, env=env,
+                           timeout=PATCH_TIMEOUT)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return 1, b"", f"{type(e).__name__}: {e}".encode()
+    return p.returncode, p.stdout, p.stderr
 
 
 def _have_commit(sha):
     return PATCH_GIT.exists() and _pgit("cat-file", "-e", f"{sha}^{{commit}}")[0] == 0
 
 
-def _fetch_commit(sha):
-    """Make `sha` (and current main) available locally. False = unavailable: callers fail closed."""
-    if not PATCH_GIT.exists():
-        PATCH_GIT.parent.mkdir(parents=True, exist_ok=True)
-        _pgit("init", "--bare", "-q")
-        _pgit("remote", "add", "origin", f"https://github.com/{REPO}.git")
+def _pgit_ok(what, *args):
+    rc, _, err = _pgit(*args)
+    if rc:
+        _plog(f"{what} failed (rc {rc}): {err.decode('utf-8', 'replace').strip()[:200]}")
+    return rc == 0
+
+
+def _init_clone():
+    if (PATCH_GIT / "HEAD").exists():
+        return True
+    PATCH_GIT.parent.mkdir(parents=True, exist_ok=True)
+    return (_pgit_ok("git init", "init", "--bare", "-q")
+            and _pgit_ok("git remote add", "remote", "add", "origin", f"https://github.com/{REPO}.git"))
+
+
+def _fetch_commit(sha, pr=None):
+    """Make `sha` and CURRENT main available locally. False = unavailable: callers fail closed (never a stale main)."""
+    if not _init_clone():
+        return False
     cred = ["-c", "credential.helper=!gh auth git-credential"]
-    refs = [] if _MAIN_FETCHED else ["+refs/heads/main:refs/remotes/origin/main"]
+    if not _MAIN_FETCHED:
+        if not _pgit_ok("fetch main", *cred, "fetch", "-q", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main"):
+            return False
+        _MAIN_FETCHED.append(1)
     if not _have_commit(sha):
-        refs.append(sha)
-    if refs:
-        rc, _ = _pgit(*cred, "fetch", "-q", "--no-tags", "origin", *refs)
-        if rc == 0 and not _MAIN_FETCHED:
-            _MAIN_FETCHED.append(1)
+        if pr:                                # the PR head ref also covers fork heads
+            _pgit_ok(f"fetch refs/pull/{pr}/head", *cred, "fetch", "-q", "--no-tags", "origin", f"+refs/pull/{pr}/head:refs/remotes/origin/pr/{pr}")
+        if not _have_commit(sha):             # an older head (the reviewed one) is not under the PR ref after a push
+            _pgit_ok(f"fetch {sha[:10]}", *cred, "fetch", "-q", "--no-tags", "origin", sha)
     return _have_commit(sha) and _pgit("rev-parse", "--verify", "-q", "refs/remotes/origin/main")[0] == 0
 
 
-def _patch_id(sha):
-    cache = json.loads(PATCH_CACHE.read_text(encoding="utf-8")) if PATCH_CACHE.exists() else {}
-    if sha in cache:
-        return cache[sha]
-    if not _fetch_commit(sha):
-        return ""
-    rc, base = _pgit("merge-base", "refs/remotes/origin/main", sha)
-    rc2, diff = _pgit("diff", base, sha) if rc == 0 else (1, "")
-    if rc2 or not diff:
-        return ""                             # no merge-base / empty diff: nothing to compare, never carry
-    rc3, out = _pgit("patch-id", "--stable", stdin=diff + "\n")
-    pid = out.split()[0] if rc3 == 0 and out else ""
-    if pid:
-        cache[sha] = pid
-        PATCH_CACHE.parent.mkdir(parents=True, exist_ok=True)
-        PATCH_CACHE.write_text(json.dumps(cache), encoding="utf-8")
-    return pid
+def _cache_load():
+    try:
+        data = json.loads(PATCH_CACHE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):             # absent or corrupt: empty, it is only a cache
+        return {}
 
 
-def _same_patch(review_sha, head):
-    full = sh("gh", "api", f"repos/{REPO}/commits/{review_sha}", "--jq", ".sha")   # the review sha may be abbreviated
-    if not full:
+def _cache_store(cache):
+    now = time.time()
+    live = {k: v for k, v in cache.items() if isinstance(v, dict) and now - v.get("t", 0) < PATCH_CACHE_MAX_AGE}
+    for k in sorted(live, key=lambda k: live[k]["t"], reverse=True)[PATCH_CACHE_MAX_ENTRIES:]:
+        del live[k]
+    tmp = PATCH_CACHE.with_name(f"{PATCH_CACHE.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(live), encoding="utf-8")
+    os.replace(tmp, PATCH_CACHE)
+    if len(live) % PATCH_GC_EVERY == 0:
+        _pgit("gc", "--auto", "-q")
+
+
+def _diff_id(sha, pr=None):
+    """sha256 over the raw bytes of the PR's own diff (merge-base..sha), nothing stripped or normalised: any
+    whitespace or binary change is a different id. "" = unavailable or empty: never carry."""
+    PATCH_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with open(PATCH_LOCK, "a+") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        if not _fetch_commit(sha, pr):
+            return ""
+        rc, base, _ = _pgit("merge-base", "refs/remotes/origin/main", sha)
+        base = base.decode("ascii", "replace").strip()
+        if rc or not base:
+            return ""
+        key = f"{sha}:{base}"
+        cache = _cache_load()
+        if key in cache:
+            return cache[key]["id"]
+        rc, diff, _ = _pgit("diff", "--no-color", "--binary", "--full-index", base, sha)
+        if rc or not diff:
+            return ""                         # empty diff: nothing to compare
+        cache[key] = {"id": hashlib.sha256(diff).hexdigest(), "t": time.time()}
+        _cache_store(cache)
+        return cache[key]["id"]
+
+
+def _same_patch(review_sha, head, pr=None):
+    try:
+        full = sh("gh", "api", f"repos/{REPO}/commits/{review_sha}", "--jq", ".sha")   # the review sha may be abbreviated
+        if not full:
+            return False
+        old, new = _diff_id(full, pr), _diff_id(head, pr)
+        return bool(old) and old == new
+    except Exception as e:                    # a tick must never abort on the carry path: fail closed
+        _plog(f"failing closed on {type(e).__name__}: {str(e)[:200]}")
         return False
-    old, new = _patch_id(full), _patch_id(head)
-    return bool(old) and old == new
 
 
 # A red check whose log tail holds one of these is runner infrastructure, not code: it is re-run once per
@@ -956,7 +1014,7 @@ def slot_land_phase(n, p, landing_head, r, seen, log, attention):
     """Review, threads, migration-gate, FIFO and merge for a green slot PR. Never gated by the proof gate."""
     rv = r.hgetall(f"lg:pr:{n}")
     unresolved = sum(1 for t in p["reviewThreads"]["nodes"] if not t["isResolved"])
-    if rv.get("review_verdict") != "approve" or not review_carries(rv.get("review_sha", ""), p["headRefOid"]):
+    if rv.get("review_verdict") != "approve" or not review_carries(rv.get("review_sha", ""), p["headRefOid"], n):
         k = f"{n}:review:{p['headRefOid']}"
         if k not in seen:
             seen[k] = int(time.time())
@@ -1239,7 +1297,7 @@ def main():
             return False                          # it cannot be brought to 0 behind by us: it must not block newer PRs
         if any(not t["isResolved"] for t in q["reviewThreads"]["nodes"]):
             return False
-        return rv_m.get("review_verdict") == "approve" and review_carries(rv_m.get("review_sha", ""), q["headRefOid"])
+        return rv_m.get("review_verdict") == "approve" and review_carries(rv_m.get("review_sha", ""), q["headRefOid"], q.get("number"))
 
     for i, n in enumerate(slots):
         p = pmap[n]
