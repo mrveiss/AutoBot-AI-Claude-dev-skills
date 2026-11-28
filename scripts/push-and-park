@@ -12,6 +12,12 @@ set -u
 echo "== pushing =="
 PATH="$(git rev-parse --show-toplevel 2>/dev/null)/venv/bin:${AUTOBOT_VENV:-$HOME/AutoBot-Ai/AutoBot-AI/venv}/bin:$PATH" \
   git push "$@" || { echo "push failed -- not checking the queue"; exit 1; }
+# Q9: dispatch CI for the pushed head NOW when the PR holds a slot; the coordinator tick is only the safety net.
+pr=$(gh pr view --json number -q .number 2>/dev/null)
+if [ -n "$pr" ]; then
+  "$(dirname "$0")/pr-coordinator" --dispatch "$pr"; drc=$?
+  [ "$drc" -eq 0 ] || [ "$drc" -eq 3 ] || echo "push-and-park: dispatch for #$pr failed (exit $drc); the coordinator tick will retry"
+fi
 echo "== CI queue (pr-coordinator owns slots and parks non-slot runs on its next tick) =="
 "$(dirname "$0")/pr-coordinator" --dry; rc=$?
 if [ "$rc" -eq 0 ]; then echo "push-and-park: pushed; queue view above"; else echo "push-and-park: ERROR queue view failed (exit $rc); the push itself succeeded"; fi

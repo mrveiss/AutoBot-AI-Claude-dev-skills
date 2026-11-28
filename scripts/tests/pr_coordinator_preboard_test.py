@@ -1,5 +1,5 @@
 """Pre-board guard lane of scripts/pr-coordinator (#49): ADVISORY only. It never gates the suite, a slot, a merge or landing."""
-import contextlib, importlib.machinery, importlib.util, io, json, tempfile, time, unittest
+import os, contextlib, importlib.machinery, importlib.util, io, json, tempfile, time, unittest
 from pathlib import Path
 
 PATH = str(Path(__file__).resolve().parents[1] / "pr-coordinator")
@@ -144,7 +144,12 @@ class Advisory(Base):
 
 
 class NeverGates(Base):
-    """Whatever the lane says, the suite starter behaves exactly as before the lane existed."""
+    """Whatever the lane says, the suite starter behaves exactly as before the lane existed (legacy path)."""
+
+    def setUp(self):
+        super().setUp()
+        os.environ["PR_COORDINATOR_DISPATCH"] = "0"
+        self.addCleanup(os.environ.pop, "PR_COORDINATOR_DISPATCH", None)
 
     def test_suite_starts_whatever_the_lane_state(self):
         states = {"no result": ("", None), "pending": ("11\tin_progress\t", None), "cancelled": ("11\tcompleted\tcancelled", None),

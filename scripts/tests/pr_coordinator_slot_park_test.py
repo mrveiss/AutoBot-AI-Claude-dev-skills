@@ -1,5 +1,5 @@
-"""pr-coordinator: slot kept until merge (owner 2026-11-28), park = draft (AutoBot-AI#20825), start-CI vs advisory runs."""
-import importlib.machinery, importlib.util, json, shutil, subprocess, unittest
+"""pr-coordinator: slot kept until merge (owner 2026-11-28), unpark only (AutoBot-AI#20825, owner 2026-11-28), start-CI vs advisory runs."""
+import importlib.machinery, importlib.util, json, os, shutil, subprocess, unittest
 from pathlib import Path
 
 PATH = str(Path(__file__).resolve().parents[1] / "pr-coordinator")
@@ -85,55 +85,25 @@ class StuckSlot(Base):
 
 
 class ParkFailures(Base):
-    def test_park_labels_before_undo(self):
-        PC.park_phase([pr(2)], [], [])
-        flat = [" ".join(c) for c in self.calls]
-        self.assertLess(next(i for i, c in enumerate(flat) if "--add-label" in c), next(i for i, c in enumerate(flat) if "--undo" in c))
-
-    def test_label_failure_skips_undo_and_surfaces(self):
-        self.fail, log, att = ("--add-label",), [], []
-        PC.park_phase([pr(2)], [], log, {}, att)
-        self.assertFalse([c for c in self.calls if "--undo" in c])
-        self.assertTrue(any(l.startswith("ATTENTION #2 add label") for l in log))
-        self.assertEqual(att[0]["kind"], "gh-failed")
-
-    def test_label_create_failure_skips_park(self):
-        self.fail, log = ("label create",), []
-        PC.park_phase([pr(2)], [], log, {}, [])
-        self.assertFalse([c for c in self.calls if "--add-label" in c or "--undo" in c])
-        self.assertTrue(any("label create failed" in l for l in log))
-
-    def test_undo_failure_surfaces(self):
-        self.fail, log = ("--undo",), []
-        PC.park_phase([pr(2)], [], log, {}, [])
-        self.assertTrue(any("gh pr ready --undo failed" in l for l in log))
-
     def test_unpark_keeps_label_when_ready_fails(self):
         self.fail, log = ("pr ready 1",), []
-        failed = PC.park_phase([pr(1, draft=True, parked=True)], [1], log, {}, [])
+        failed = PC.unpark_phase([pr(1, draft=True, parked=True)], [1], log, {}, [])
         self.assertEqual(failed, {1})
         self.assertFalse([c for c in self.calls if "--remove-label" in c])
         self.assertTrue(any("gh pr ready failed" in l for l in log))
 
     def test_unpark_ready_before_label_removal_and_marks_unparked(self):
         p = pr(1, draft=True, parked=True)
-        PC.park_phase([p], [1], [], {}, [])
+        PC.unpark_phase([p], [1], [], {}, [])
         flat = [" ".join(c) for c in self.calls]
         self.assertLess(next(i for i, c in enumerate(flat) if "pr ready 1" in c), next(i for i, c in enumerate(flat) if "--remove-label" in c))
         self.assertTrue(p["unparked"])
 
     def test_remove_label_failure_surfaces(self):
         self.fail, log = ("--remove-label",), []
-        PC.park_phase([pr(1, draft=True, parked=True)], [1], log, {}, [])
+        PC.unpark_phase([pr(1, draft=True, parked=True)], [1], log, {}, [])
         self.assertTrue(any("remove label failed" in l for l in log))
 
-    def test_reready_parked_pr_reparked_without_label_flap_logged_once(self):
-        seen, log = {}, []
-        for _ in range(2):
-            PC.park_phase([pr(2, parked=True)], [], log, seen, [])
-        self.assertFalse([c for c in self.calls if "--add-label" in c or "label" in c and "create" in c])
-        self.assertEqual(len([c for c in self.calls if "--undo" in c]), 2)
-        self.assertEqual(len([l for l in log if l.startswith("park #2")]), 1)
 
 
 class ApproveForkRuns(Base):
@@ -193,6 +163,8 @@ class FetchParkedDetails(Base):
 class UnparkedSkipsStartCi(Base):
     def test_unparked_pr_not_started(self):
         started = []
+        os.environ["PR_COORDINATOR_DISPATCH"] = "0"
+        self.addCleanup(os.environ.pop, "PR_COORDINATOR_DISPATCH", None)
         old = PC.start_ci_or_report
         PC.start_ci_or_report = lambda *a: started.append(a)
         self.addCleanup(lambda: setattr(PC, "start_ci_or_report", old))
@@ -206,25 +178,28 @@ class UnparkedSkipsStartCi(Base):
         self.assertEqual(len(started), 1)
 
 
-class Park(Base):
-    def test_parks_non_slot_ready_pr_only(self):
-        log = []
-        PC.park_phase([pr(1), pr(2), pr(3, draft=True), pr(4, draft=True, parked=True)], [1], log)
-        self.assertIn(("gh", "pr", "ready", "--undo", "2", "--repo", PC.REPO), self.calls)
-        self.assertEqual(len([c for c in self.calls if c[:3] == ("gh", "pr", "ready")]), 1)   # not #3 (author draft), not #4
-        self.assertTrue(any("--add-label" in c and "2" in c for c in self.calls))
+class Unpark(Base):
+    def setUp(self):
+        super().setUp()
+        self._cut = PC.cutover_done
+        self.addCleanup(lambda: setattr(PC, "cutover_done", self._cut))
+        PC.cutover_done = lambda: False
+
+    def test_never_parks_a_ready_pr(self):
+        PC.unpark_phase([pr(1), pr(2), pr(3, draft=True)], [1], [])
+        self.assertEqual(self.calls, [])
 
     def test_unparks_admitted_labelled_pr(self):
-        PC.park_phase([pr(1, draft=True, parked=True), pr(2, draft=True)], [1, 2], [])
+        PC.unpark_phase([pr(1, draft=True, parked=True), pr(2, draft=True)], [1, 2], [])
         self.assertIn(("gh", "pr", "ready", "1", "--repo", PC.REPO), self.calls)
         self.assertTrue(any("--remove-label" in c and "ci-parked" in c for c in self.calls))
         self.assertFalse([c for c in self.calls if c[:4] == ("gh", "pr", "ready", "2")])   # author's draft untouched
 
     def test_dry_only_logs(self):
         PC.DRY, log = True, []
-        PC.park_phase([pr(1), pr(2, draft=True, parked=True)], [2], log)
+        PC.unpark_phase([pr(1), pr(2, draft=True, parked=True)], [2], log)
         self.assertEqual(self.calls, [])
-        self.assertEqual(len(log), 2)
+        self.assertEqual(len(log), 1)
 
 
 @unittest.skipUnless(shutil.which("jq"), "jq not installed")

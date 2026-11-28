@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # safe-merge PR... — merge ONLY if, at the exact current head SHA:
 #   ci-gate says GREEN, and behind-ok says OK (behind=0 or disjoint from main's new commits).
+# Immediately before the merge it dispatches pr-blocking-findings and waits for it (pr-coordinator --findings-gate).
 # Uses --match-head-commit so a head that moves between check and merge is refused by GitHub.
 set -u
 REPO=mrveiss/AutoBot-AI; S=~/.claude/scripts
@@ -8,6 +9,10 @@ for p in "$@"; do
   sha=$(gh pr view "$p" --repo $REPO --json headRefOid -q .headRefOid) || { echo "#$p ? no PR"; continue; }
   g=$($S/ci-gate "$p"); case "$g" in *" ${sha:0:9} GREEN") ;; *) echo "#$p SKIP gate: $g"; continue;; esac
   b=$($S/behind-ok "$p"); case "$b" in "#$p OK"*) ;; *) echo "#$p SKIP behind: $b"; continue;; esac
+  # Owner 2026-11-28 (Q8): a blocking issue can be filed after CI ran, so re-dispatch pr-blocking-findings for this head
+  # and wait (bounded) right before the merge. Exit 3 = dual mode before cutover: keep today's behaviour.
+  f=$($S/pr-coordinator --findings-gate "$p" 2>&1); frc=$?
+  case $frc in 0|3) ;; *) echo "#$p SKIP findings gate: $f"; continue;; esac
   if gh pr merge "$p" --repo $REPO --admin --merge --match-head-commit "$sha" >/dev/null 2>&1; then
     gh pr edit "$p" --repo $REPO --remove-label land-next >/dev/null 2>&1
     echo "#$p MERGED at ${sha:0:9} ($b)"; merged=1
