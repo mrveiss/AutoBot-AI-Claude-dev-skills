@@ -340,7 +340,7 @@ class StopParking(Base):
     def parked(self, n, draft=True):
         return {"number": n, "isDraft": draft, "headRefOid": HEAD, "labels": {"nodes": [{"name": "ci-parked"}]}}
 
-    def test_no_new_parks_ever(self):
+    def test_after_cutover_no_new_parks(self):
         self.cut = True
         PC.unpark_phase([{"number": 1, "isDraft": False, "headRefOid": HEAD, "labels": {"nodes": []}}], [], [])
         self.assertEqual(self.calls, [])

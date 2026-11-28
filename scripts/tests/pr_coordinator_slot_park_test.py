@@ -24,11 +24,13 @@ class Base(unittest.TestCase):
 
     def setUp(self):
         self.calls = []
-        self._sh, self._rc, self._dry = PC.sh, PC.sh_rc, PC.DRY
+        self._sh, self._rc, self._dry, self._cs = PC.sh, PC.sh_rc, PC.DRY, PC.cutover_state
+        self.cut = False
+        PC.cutover_state = lambda: self.cut
         PC.sh = lambda *a, **k: self.calls.append(a) or ""
         PC.sh_rc = self._fake_rc
         PC.DRY = False
-        self.addCleanup(lambda: (setattr(PC, "sh", self._sh), setattr(PC, "sh_rc", self._rc), setattr(PC, "DRY", self._dry)))
+        self.addCleanup(lambda: (setattr(PC, "sh", self._sh), setattr(PC, "sh_rc", self._rc), setattr(PC, "DRY", self._dry), setattr(PC, "cutover_state", self._cs)))
 
     def _fake_rc(self, *a):
         self.calls.append(a)
@@ -181,13 +183,55 @@ class UnparkedSkipsStartCi(Base):
 class Unpark(Base):
     def setUp(self):
         super().setUp()
-        self._cut = PC.cutover_done
-        self.addCleanup(lambda: setattr(PC, "cutover_done", self._cut))
-        PC.cutover_done = lambda: False
 
-    def test_never_parks_a_ready_pr(self):
+    def flat(self):
+        return [" ".join(c) for c in self.calls]
+
+    def test_before_cutover_parks_non_slot_ready_pr_only(self):
+        log = []
+        PC.unpark_phase([pr(1), pr(2), pr(3, draft=True), pr(4, draft=True, parked=True)], [1], log)
+        flat = self.flat()
+        self.assertEqual([c for c in flat if "--undo" in c], ["gh pr ready --undo 2 --repo " + PC.REPO])
+        self.assertTrue(any("--add-label ci-parked" in c and " 2 " in c for c in flat))
+        self.assertTrue(any(l.startswith("park #2") for l in log))
+
+    def test_after_cutover_never_parks(self):
+        self.cut = True
         PC.unpark_phase([pr(1), pr(2), pr(3, draft=True)], [1], [])
         self.assertEqual(self.calls, [])
+
+    def test_unreadable_cutover_does_nothing(self):
+        self.cut = None
+        PC.unpark_phase([pr(2), pr(5, draft=True, parked=True)], [], [])
+        self.assertEqual(self.calls, [])
+
+    def test_park_labels_before_undo(self):
+        PC.unpark_phase([pr(2)], [], [])
+        flat = self.flat()
+        self.assertLess(next(i for i, c in enumerate(flat) if "--add-label" in c), next(i for i, c in enumerate(flat) if "--undo" in c))
+
+    def test_label_failure_skips_undo_and_surfaces(self):
+        self.fail, log, att = ("--add-label",), [], []
+        PC.unpark_phase([pr(2)], [], log, {}, att)
+        self.assertFalse([c for c in self.calls if "--undo" in c])
+        self.assertTrue(any(l.startswith("ATTENTION #2 add label") for l in log))
+        self.assertEqual(att[0]["kind"], "gh-failed")
+
+    def test_label_create_failure_skips_park(self):
+        self.fail, log = ("label create",), []
+        PC.unpark_phase([pr(2)], [], log, {}, [])
+        self.assertFalse([c for c in self.calls if "--add-label" in c or "--undo" in c])
+        self.assertTrue(any("label create failed" in l for l in log))
+
+    def test_undo_failure_surfaces(self):
+        self.fail, log = ("--undo",), []
+        PC.unpark_phase([pr(2)], [], log, {}, [])
+        self.assertTrue(any("gh pr ready --undo failed" in l for l in log))
+
+    def test_parked_ready_pr_is_redrafted_without_relabel(self):
+        PC.unpark_phase([pr(2, parked=True)], [], [], {}, [])
+        self.assertFalse([c for c in self.calls if "--add-label" in c])
+        self.assertEqual(len([c for c in self.calls if "--undo" in c]), 1)
 
     def test_unparks_admitted_labelled_pr(self):
         PC.unpark_phase([pr(1, draft=True, parked=True), pr(2, draft=True)], [1, 2], [])
@@ -199,7 +243,7 @@ class Unpark(Base):
         PC.DRY, log = True, []
         PC.unpark_phase([pr(1), pr(2, draft=True, parked=True)], [2], log)
         self.assertEqual(self.calls, [])
-        self.assertEqual(len(log), 1)
+        self.assertEqual([l.split()[0] for l in log], ["park", "unpark"])
 
 
 @unittest.skipUnless(shutil.which("jq"), "jq not installed")
