@@ -1550,8 +1550,8 @@ def slot_ci_phase(n, p, blocked, seen, log, attention, skip_dispatch=False):
     return True
 
 
-def slot_land_phase(n, p, landing_head, r, seen, log, attention):
-    """Review, threads, migration-gate, FIFO and merge for a green slot PR. Never gated by the proof gate."""
+def slot_land_phase(n, p, r, seen, log, attention):
+    """Review, threads, migration-gate and merge for a green slot PR (merged at once; slots land in arrival order via land_order). Never gated by the proof gate."""
     rv = r.hgetall(f"lg:pr:{n}")
     unresolved = sum(1 for t in p["reviewThreads"]["nodes"] if not t["isResolved"])
     if is_external(p) and (rv.get("review_verdict") != "approve" or not review_carries(rv.get("review_sha", ""), p["headRefOid"], n)):
@@ -1575,15 +1575,15 @@ def slot_land_phase(n, p, landing_head, r, seen, log, attention):
         if k not in seen:                                        # without Postgres, so the gate must RUN
             seen[k] = int(time.time())
             log.append(f"#{n} green but run-migration-gate did not succeed at this head: no merge")
-    elif not landing_head:
-        k = f"{n}:fifo-wait:{p['headRefOid']}"
-        if k not in seen:
-            seen[k] = int(time.time())
-            log.append(f"#{n} green, waits for an older slot PR (FIFO)")
     else:
         log.append(f"merge #{n}")
         if not DRY:
             log.append(sh(str(S / "safe-merge"), str(n)))
+
+
+def land_order(slots):
+    """Arrival order: when several slot PRs are green in one tick the lower PR number merges first."""
+    return sorted(slots)
 
 
 def is_parked(p):
@@ -1861,19 +1861,10 @@ def main():
                slot_heads, "rule2: branch has no open PR and no CI slot", log)
 
     pmap = {p["number"]: p for p in prs}
-    def could_land(m):
-        """An older slot PR blocks a newer one only if it could land itself (owner: a not-ready PR keeps its
-        place but does not block): approved at a head the approval carries to, and 0 unresolved threads."""
-        q, rv_m = pmap[m], r.hgetall(f"lg:pr:{m}")
-        if fork_stuck_behind(q):
-            return False                          # it cannot be brought to 0 behind by us: it must not block newer PRs
-        if any(not t["isResolved"] for t in q["reviewThreads"]["nodes"]):
-            return False
-        if not is_external(q):
-            return True                           # own PRs need no per-head approval (owner 2026-11-28)
-        return rv_m.get("review_verdict") == "approve" and review_carries(rv_m.get("review_sha", ""), q["headRefOid"], q.get("number"))
-
-    for i, n in enumerate(slots):
+    # owner 2026-11-28: a green slot PR that passes every gate merges now, never held for the other slot (the
+    # second merger re-syncs and re-runs anyway). Both green in one tick: lower PR number (arrival order) first.
+    # The unblocker lane affects ADMISSION only.
+    for n in land_order(slots):
         p = pmap[n]
         if n in held and held[n].get("by") != ME:
             continue                              # another session drives its own slot
@@ -1884,8 +1875,7 @@ def main():
             preboard_advisory(n, p, seen, log, attention)  # advisory only: never changes what happens next (#49)
         if slot_ci_phase(n, p, blocked, seen, log, attention, skip_dispatch=n in unpark_failed):
             continue
-        landing_head = n in unblock or not any(could_land(m) for m in slots[:i] if m in open_nums)
-        slot_land_phase(n, p, landing_head, r, seen, log, attention)
+        slot_land_phase(n, p, r, seen, log, attention)
 
     if not DRY:
         prune_seen(seen)

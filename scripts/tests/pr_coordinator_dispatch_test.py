@@ -438,13 +438,22 @@ class OwnPrApproval(Base):
         PC.review_carries = lambda *a: False
         self.addCleanup(lambda: setattr(PC, "proof_status", saved))
         p.update(reviewThreads={"nodes": []})
-        PC.slot_land_phase(p["number"], p, True, self.R(), seen, log, att)
+        PC.slot_land_phase(p["number"], p, self.R(), seen, log, att)
         return log, att
 
     def test_own_pr_without_ledger_review_merges_when_green(self):
         log, att = self.land(mkpr())
         self.assertIn("merge #7", log)
         self.assertEqual(att, [])
+
+    def test_green_slot_pr_merges_while_other_slot_is_mid_suite(self):
+        # owner 2026-11-28: no FIFO wait; slot_land_phase takes no landing_head, the unblocker lane is admission only
+        log, att = self.land(mkpr(22342))
+        self.assertIn("merge #22342", log)
+        self.assertFalse([l for l in log if "waits for an older" in l])
+
+    def test_both_green_lower_number_merges_first(self):
+        self.assertEqual(PC.land_order([22380, 22342]), [22342, 22380])
 
     def test_external_pr_without_approval_does_not_merge(self):
         for extra in ({"isCrossRepository": True}, {"author": {"login": "someone"}}):
@@ -457,7 +466,7 @@ class OwnPrApproval(Base):
         PC.proof_status = lambda *a: "table missing"
         self.addCleanup(lambda: setattr(PC, "proof_status", PC.proof_status))
         log = []
-        PC.slot_land_phase(7, p, True, self.R(), {}, log, [])
+        PC.slot_land_phase(7, p, self.R(), {}, log, [])
         self.assertNotIn("merge #7", log)
 
 

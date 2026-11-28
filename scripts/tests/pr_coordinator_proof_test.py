@@ -217,7 +217,7 @@ class Gating(unittest.TestCase):
         log, att, seen = [], [], {}
         self.assertTrue(PC.proof_blocked(self.p, seen, log, att))
         self.assertFalse(PC.slot_ci_phase(7, self.p, True, seen, log, att))
-        PC.slot_land_phase(7, self.p, True, self.R(), seen, log, att)
+        PC.slot_land_phase(7, self.p, self.R(), seen, log, att)
         self.assertIn("merge #7", log)
         self.assertTrue(any(c[0].endswith("safe-merge") for c in self.calls))
 
