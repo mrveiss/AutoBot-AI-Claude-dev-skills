@@ -756,12 +756,17 @@ def proof_check_cli(n):
 
 
 def review_carries(review_sha, head):
-    """Owner 2026-11-18: an approval carries forward across commits that are ONLY auto-sync merges of main
-    or empty (0-file) start-CI commits. Any real commit, or a rewritten history, needs a new review."""
+    """Owner 2026-11-18: an approval carries across auto-sync merges of main and empty start-CI commits (first-parent
+    walk, the fast path). Owner 2026-11-28 ("quality only"): it also carries when the PR's own diff is unchanged
+    (same stable patch-id against each head's own merge-base with main), whatever merges moved the head."""
     if not review_sha:
         return False
-    if head.startswith(review_sha):
+    if head.startswith(review_sha) or _walk_carries(review_sha, head):
         return True
+    return _same_patch(review_sha, head)
+
+
+def _walk_carries(review_sha, head):
     cur = head                                # walk FIRST parents only: main's commits merged in are not the PR's
     for _ in range(40):
         if cur.startswith(review_sha) or review_sha.startswith(cur):
@@ -777,6 +782,65 @@ def review_carries(review_sha, head):
             return False
         cur = parents[0]
     return False
+
+
+PATCH_GIT = STATE / "patchid.git"           # bare cache clone: holds the commits whose patch-ids we compare
+PATCH_CACHE = STATE / "patchid-cache.json"  # sha -> stable patch-id; a sha's diff against its merge-base never changes
+_MAIN_FETCHED = []
+
+
+def _pgit(*args, stdin=None):
+    p = subprocess.run(["git", "--git-dir", str(PATCH_GIT), *args], input=stdin, capture_output=True, text=True,
+                       encoding="utf-8")
+    return p.returncode, p.stdout.strip()
+
+
+def _have_commit(sha):
+    return PATCH_GIT.exists() and _pgit("cat-file", "-e", f"{sha}^{{commit}}")[0] == 0
+
+
+def _fetch_commit(sha):
+    """Make `sha` (and current main) available locally. False = unavailable: callers fail closed."""
+    if not PATCH_GIT.exists():
+        PATCH_GIT.parent.mkdir(parents=True, exist_ok=True)
+        _pgit("init", "--bare", "-q")
+        _pgit("remote", "add", "origin", f"https://github.com/{REPO}.git")
+    cred = ["-c", "credential.helper=!gh auth git-credential"]
+    refs = [] if _MAIN_FETCHED else ["+refs/heads/main:refs/remotes/origin/main"]
+    if not _have_commit(sha):
+        refs.append(sha)
+    if refs:
+        rc, _ = _pgit(*cred, "fetch", "-q", "--no-tags", "origin", *refs)
+        if rc == 0 and not _MAIN_FETCHED:
+            _MAIN_FETCHED.append(1)
+    return _have_commit(sha) and _pgit("rev-parse", "--verify", "-q", "refs/remotes/origin/main")[0] == 0
+
+
+def _patch_id(sha):
+    cache = json.loads(PATCH_CACHE.read_text(encoding="utf-8")) if PATCH_CACHE.exists() else {}
+    if sha in cache:
+        return cache[sha]
+    if not _fetch_commit(sha):
+        return ""
+    rc, base = _pgit("merge-base", "refs/remotes/origin/main", sha)
+    rc2, diff = _pgit("diff", base, sha) if rc == 0 else (1, "")
+    if rc2 or not diff:
+        return ""                             # no merge-base / empty diff: nothing to compare, never carry
+    rc3, out = _pgit("patch-id", "--stable", stdin=diff + "\n")
+    pid = out.split()[0] if rc3 == 0 and out else ""
+    if pid:
+        cache[sha] = pid
+        PATCH_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        PATCH_CACHE.write_text(json.dumps(cache), encoding="utf-8")
+    return pid
+
+
+def _same_patch(review_sha, head):
+    full = sh("gh", "api", f"repos/{REPO}/commits/{review_sha}", "--jq", ".sha")   # the review sha may be abbreviated
+    if not full:
+        return False
+    old, new = _patch_id(full), _patch_id(head)
+    return bool(old) and old == new
 
 
 # A red check whose log tail holds one of these is runner infrastructure, not code: it is re-run once per

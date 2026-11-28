@@ -1,5 +1,5 @@
 """Requirement-proof gate of scripts/pr-coordinator (#37): table validation, cutoff exemption, main-merge syncs."""
-import importlib.machinery, importlib.util, unittest
+import importlib.machinery, importlib.util, os, subprocess, tempfile, unittest
 from pathlib import Path
 
 PATH = str(Path(__file__).resolve().parents[1] / "pr-coordinator")
@@ -225,6 +225,65 @@ class Gating(unittest.TestCase):
         PC.sh = lambda *a, **k: (self.calls.append(a), "RED" if a[0].endswith("ci-gate") else "")[1]
         self.assertTrue(PC.slot_ci_phase(7, self.p, True, {}, [], []))
         self.assertFalse(any(c[:2] in (("gh", "run"), ("gh", "workflow")) for c in self.calls))
+
+
+class PatchIdCarry(unittest.TestCase):
+    """Owner 2026-11-28: an approval carries when the PR's own diff (vs its merge-base with main) is unchanged."""
+    def git(self, *a):
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+        return subprocess.run(["git", "-C", self.work, *a], check=True, capture_output=True, text=True, env=env).stdout.strip()
+
+    def commit(self, name, text):
+        Path(self.work, name).write_text(text, encoding="utf-8")
+        self.git("add", name)
+        self.git("commit", "-q", "-m", name)
+        return self.git("rev-parse", "HEAD")
+
+    def setUp(self):
+        self.mod = load()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.work, bare = str(Path(tmp.name, "work")), Path(tmp.name, "cache.git")
+        self.git_init(bare)
+        self.base = self.commit("base.txt", "base\n")
+        self.git("checkout", "-q", "-b", "pr")
+        self.approved = self.commit("pr.txt", "own change\n")
+        self.git("checkout", "-q", "main")
+        self.main2 = self.commit("main.txt", "later main\n")
+        self.git("checkout", "-q", "pr")
+        self.git("merge", "-q", "--no-ff", "-m", "Merge branch 'main' into pr", "main")   # a hand-made main merge
+        self.merged = self.git("rev-parse", "HEAD")
+        self.git("update-ref", "refs/remotes/origin/main", self.main2)
+        self.git("push", "-q", str(bare), "refs/remotes/origin/main:refs/remotes/origin/main", "pr:refs/heads/pr")
+        self.mod.PATCH_GIT, self.mod.PATCH_CACHE = bare, Path(tmp.name, "cache.json")
+        self.mod._MAIN_FETCHED.append(1)
+        self.mod.sh = lambda *a, **k: self.api.get(a[2].rsplit("/", 1)[-1], "")
+        self.api = {}
+
+    def git_init(self, bare):
+        subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+        os.makedirs(self.work)
+        self.git("init", "-q", "-b", "main")
+
+    def test_identical_patch_through_human_main_merge_carries(self):
+        self.api = {self.approved: self.approved}
+        self.assertTrue(self.mod.review_carries(self.approved, self.merged))
+        self.assertTrue(self.mod.PATCH_CACHE.exists())   # patch-ids are cached per sha
+
+    def test_changed_content_does_not_carry(self):
+        self.git("checkout", "-q", "-b", "pr2", self.approved)
+        changed = self.commit("pr.txt", "different change\n")
+        self.git("push", "-q", str(self.mod.PATCH_GIT), "pr2:refs/heads/pr2")
+        self.api = {self.approved: self.approved}
+        self.assertFalse(self.mod.review_carries(self.approved, changed))
+
+    def test_missing_sha_does_not_carry(self):
+        gone = "f" * 40
+        self.api = {gone: gone}
+        self.assertFalse(self.mod.review_carries(gone, self.merged))
+
+    def test_unresolvable_review_sha_does_not_carry(self):
+        self.assertFalse(self.mod.review_carries("abc1234", self.merged))
 
 
 class CutoffEnv(unittest.TestCase):
