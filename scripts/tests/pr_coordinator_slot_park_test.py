@@ -136,6 +136,40 @@ class ParkFailures(Base):
         self.assertEqual(len([l for l in log if l.startswith("park #2")]), 1)
 
 
+class ApproveForkRuns(Base):
+    rc_list = (0, "11\n12\n", "")
+
+    def _fake_rc(self, *a):
+        self.calls.append(a)
+        if "--paginate" in a:
+            return self.rc_list
+        return (1, "", "boom") if any(f in " ".join(a) for f in self.fail) else (0, "", "")
+
+    def run_approve(self):
+        seen, log, att = {}, [], []
+        PC.approve_fork_runs(5, pr(5), seen, log, att)
+        return seen, log, att
+
+    def test_list_failure_stays_unseen_and_pages(self):
+        self.rc_list = (1, "", "api down")
+        seen, log, att = self.run_approve()
+        self.assertEqual(seen, {})
+        self.assertEqual(att[0]["kind"], "gh-failed")
+        self.assertFalse([c for c in self.calls if "POST" in c])
+
+    def test_approve_failure_stays_unseen(self):
+        self.fail = ("runs/12/approve",)
+        seen, log, att = self.run_approve()
+        self.assertEqual(seen, {})
+        self.assertTrue(any("approve run 12 failed" in l for l in log))
+
+    def test_full_success_marks_seen(self):
+        seen, _, att = self.run_approve()
+        self.assertEqual(list(seen), [f"5:fork-approved:{HEAD}"])
+        self.assertEqual(att, [])
+        self.assertTrue(any("--paginate" in c for c in self.calls))
+
+
 class FetchParkedDetails(Base):
     def test_parked_draft_gets_details_author_draft_does_not(self):
         base = {"updatedAt": "t", "mergeable": "MERGEABLE", "changedFiles": 1}

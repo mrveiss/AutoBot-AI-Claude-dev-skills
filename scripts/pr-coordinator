@@ -954,21 +954,30 @@ def stuck_slot_pages(prs, slots, seen, log, attention, now=None):
                               "branch": p.get("headRefName"), "head": p["headRefOid"][:9], "title": p.get("title", "")[:70]})
 
 
-def approve_fork_runs(n, p, seen, log):
-    """A fork's runs wait for a maintainer approval: the coordinator approves them (owner 2026-11-27), once per head."""
+def approve_fork_runs(n, p, seen, log, attention):
+    """A fork's runs wait for a maintainer approval: the coordinator approves them (owner 2026-11-27), once per head.
+    The dedupe key is set only after the run list AND every approve succeeded, so a failure is retried next tick."""
     k = f"{n}:fork-approved:{p['headRefOid']}"
     if k in seen:
         return
-    seen[k] = int(time.time())
     log.append(f"approve fork runs #{n}")
     if DRY:
         return
-    ids = sh("gh", "api", f"repos/{REPO}/actions/runs?head_sha={p['headRefOid']}&per_page=100", "--jq",
-             '.workflow_runs[]|select(.conclusion=="action_required")|.id').split()
-    for rid in ids:
+    rc, out, err = sh_rc("gh", "api", "--paginate", f"repos/{REPO}/actions/runs?head_sha={p['headRefOid']}&per_page=100",
+                         "--jq", '.workflow_runs[]|select(.conclusion=="action_required")|.id')
+    if rc:
+        log.append(f"ATTENTION #{n} list fork runs failed rc={rc}: {err[:120]}")
+        attention.append({"pr": n, "kind": "gh-failed", "step": "list fork runs", "rc": rc, "owner": p.get("owner"),
+                          "head": p.get("headRefOid", "")[:9]})
+        return
+    failed = False
+    for rid in out.split():
         rc, _, err = sh_rc("gh", "api", "-X", "POST", f"repos/{REPO}/actions/runs/{rid}/approve")
         if rc:
+            failed = True
             log.append(f"ATTENTION #{n} approve run {rid} failed rc={rc}: {err[:120]}")
+    if not failed:
+        seen[k] = int(time.time())
 
 
 def _gh(n, p, what, attention, log, *cmd):
@@ -1173,7 +1182,7 @@ def main():
         if n in held and held[n].get("by") != ME:
             continue                              # another session drives its own slot
         if p["awaiting"]:
-            approve_fork_runs(n, p, seen, log)
+            approve_fork_runs(n, p, seen, log, attention)
         blocked = proof_blocked(p, seen, log, attention)   # gates ONLY the CI starters; every other page still runs
         if not blocked:
             preboard_advisory(n, p, seen, log, attention)  # advisory only: never changes what happens next (#49)

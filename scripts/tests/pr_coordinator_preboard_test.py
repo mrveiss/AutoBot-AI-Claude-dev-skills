@@ -26,6 +26,8 @@ class Base(unittest.TestCase):
     `dispatch_rc` is what `gh workflow run` returns as (rc, stdout, stderr)."""
 
     def setUp(self):
+        saved = dict(vars(PC))   # tests monkeypatch PC freely (ci_state, sh, RECHECK ...): restore all of it so no test leaks into the next
+        self.addCleanup(lambda: (PC.__dict__.clear(), PC.__dict__.update(saved)))
         PC.DRY = False
         self.calls, self.dispatched = [], []
         self.runs, self.runs_by_head, self.artifact, self.dispatch_rc = "", {}, None, (0, "", "")
